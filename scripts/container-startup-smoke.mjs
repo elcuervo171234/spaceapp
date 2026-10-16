@@ -69,9 +69,14 @@ async function executeDocker(args, { timeout = 30_000, signal } = {}) {
   return new Promise((resolveOutput, reject) => {
     execFile("docker", args, { encoding: "utf8", timeout, signal, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) reject(new Error(`docker ${args[0]} failed: ${stderr || error.message}`));
-      else resolveOutput(stdout.trim());
+      else resolveOutput(dockerCommandOutput(args, stdout, stderr));
     });
   });
+}
+
+/** Keeps successful container stderr in logs while leaving inspect/probe output machine-readable. */
+export function dockerCommandOutput(args, stdout, stderr) {
+  return args[0] === "logs" ? [stdout, stderr].filter(Boolean).join("\n").trim() : stdout.trim();
 }
 
 /** Exercises the real image entrypoint and removes only resources bearing this invocation's label. */
@@ -149,7 +154,8 @@ export async function runContainerStartupSmoke({ target, image, arch, root = rep
       "SPACE_PUBLIC_DISTRIBUTION=true", "SPACE_TELEMETRY_ENABLED=false", "SPACE_DEV_LOGIN=false",
       "SPACE_RUNTIME_STORE=postgres", "SPACEAPP_WORKFLOWS_ENABLED=false", "SPACE_CLI_ENABLED=false",
       "SPACE_API_HOST=127.0.0.1", "SPACE_API_PORT=4910", "SPACE_WEB_HOST=0.0.0.0", "SPACE_WEB_PORT=4911",
-      "SPACE_API_ORIGIN=http://127.0.0.1:4910", "SPACE_DATABASE_URL_FILE=/run/secrets/database-url",
+      "SPACE_API_ORIGIN=http://127.0.0.1:4910",
+      "SPACE_DATABASE_URL_FILE=" + (target === "core" ? "/run/spaceapp/database-url" : "/run/secrets/database-url"),
       "SPACE_DATABASE_URL_SOURCE_FILE=/run/secrets/database-url", "SPACE_SESSION_SECRET_FILE=/run/secrets/session-secret",
       "SPACE_SETUP_TOKEN_SOURCE_FILE=/run/secrets/setup-token", "SPACE_ARTIFACT_ROOT=/var/lib/spaceapp/artifacts",
       "SPACE_MEMORY_ROOT=/var/lib/spaceapp/memory", "SPACE_MEMORY_GRAPH_ROOT=/var/lib/spaceapp/memory-graph",

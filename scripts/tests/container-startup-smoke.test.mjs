@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { browserSchemaSql, postgresImageFromCompose, redactSmokeSecrets, runContainerStartupSmoke } from "../container-startup-smoke.mjs";
+import { browserSchemaSql, dockerCommandOutput, postgresImageFromCompose, redactSmokeSecrets, runContainerStartupSmoke } from "../container-startup-smoke.mjs";
 
 const pinnedPostgres = `pgvector/pgvector:test@sha256:${"a".repeat(64)}`;
 
@@ -65,6 +65,13 @@ test("diagnostics redact generated secrets including their occurrence inside a c
   assert.equal(output, "failed [REDACTED]; password=[REDACTED]");
 });
 
+test("successful Docker logs preserve stderr without mixing it into machine-readable commands", () => {
+  assert.equal(dockerCommandOutput(["logs", "container"], "normal output\n", "Node startup error\n"), "normal output\n\nNode startup error");
+  assert.equal(dockerCommandOutput(["logs", "container"], "", "Node startup error\n"), "Node startup error");
+  assert.equal(dockerCommandOutput(["inspect", "container"], "true\n", "warning\n"), "true");
+  assert.equal(dockerCommandOutput(["exec", "container", "node"], "ok\n", "warning\n"), "ok");
+});
+
 for (const target of ["core", "browser", "cli"]) {
   test(`${target} orchestration invokes its real entrypoint/probes and cleans only labelled resources`, async (t) => {
     const fixture = await smokeFixture(t);
@@ -76,8 +83,14 @@ for (const target of ["core", "browser", "cli"]) {
     assert.ok(serviceRun.includes("SPACEAPP_WORKFLOWS_ENABLED=false"));
     assert.equal(fixture.resources.size, 0);
     assert.ok(fixture.calls.filter((args) => args[0] === "rm").every((args) => args.includes("-v") && args.at(-1).startsWith("spaceapp-smoke-")));
-    if (target === "core") assert.ok(fixture.calls.some((args) => args.includes("SELECT count(*) FROM space_schema_migrations")));
+    if (target === "core") {
+      assert.ok(fixture.calls.some((args) => args.includes("SELECT count(*) FROM space_schema_migrations")));
+      assert.ok(serviceRun.includes("SPACE_DATABASE_URL_FILE=/run/spaceapp/database-url"));
+      assert.ok(serviceRun.includes("SPACE_DATABASE_URL_SOURCE_FILE=/run/secrets/database-url"));
+      assert.ok(!serviceRun.includes("SPACE_DATABASE_URL_FILE=/run/secrets/database-url"));
+    }
     if (target === "browser") {
+      assert.ok(serviceRun.includes("SPACE_DATABASE_URL_FILE=/run/secrets/database-url"));
       assert.ok(fixture.calls.some((args) => args[0] === "cp" && args.at(-1).endsWith(":/tmp/spaceapp-smoke-schema.sql")));
       assert.ok(fixture.calls.some((args) => args.includes("/usr/bin/chromium") && args.includes("10001:10001")));
       assert.ok(fixture.calls.some((args) => args.includes("--input-type=module")));
