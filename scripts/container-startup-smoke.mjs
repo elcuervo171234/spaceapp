@@ -32,6 +32,54 @@ const workflowBundleProbe = `
   assert.ok(typeof code === 'string' && code.length > 0, 'production workflow bundle is empty');
   console.log(JSON.stringify({ workflowsPath, bundleBytes: Buffer.byteLength(code), serverUsed: false }));
 `;
+const xvfbDisplayProbe = `
+  import assert from 'node:assert/strict';
+  import { spawn } from 'node:child_process';
+  import { lstat, mkdir, readFile, unlink } from 'node:fs/promises';
+  import { setTimeout as delay } from 'node:timers/promises';
+  // Keep the probe outside the managed browser's 100..107 display pool.
+  const display = 199;
+  const socketPath = '/tmp/.X11-unix/X' + display;
+  const lockPath = '/tmp/.X' + display + '-lock';
+  const missing = error => { if (error.code === 'ENOENT') return undefined; throw error; };
+  assert.ok(!await lstat(socketPath).catch(missing) && !await lstat(lockPath).catch(missing), 'smoke display is already occupied');
+  await mkdir('/tmp/.X11-unix', { recursive: true, mode: 0o1777 });
+  const child = spawn('/usr/bin/Xvfb', [':' + display, '-screen', '0', '1280x720x24', '-nolisten', 'tcp', '-ac'],
+    { stdio: ['ignore', 'ignore', 'pipe'] });
+  let spawnError, stderr = '', ready = false;
+  child.once('error', error => { spawnError = error; });
+  child.stderr.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-1000); });
+  const closed = new Promise(resolve => child.once('close', resolve));
+  const running = () => child.pid && child.exitCode === null && child.signalCode === null;
+  try {
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      if (spawnError) throw spawnError;
+      if (!running()) throw new Error('Xvfb exited before its display was ready: ' + stderr);
+      const socket = await lstat(socketPath).catch(missing);
+      const lock = await readFile(lockPath, 'utf8').catch(missing);
+      if (socket?.isSocket() && Number(lock?.trim()) === child.pid) { ready = true; break; }
+      await delay(100);
+    }
+    assert.ok(ready, 'Xvfb did not create its owned socket and display lock');
+  } finally {
+    if (running()) {
+      child.kill('SIGTERM');
+      await Promise.race([closed, delay(5000, undefined, { ref: false })]);
+    }
+    if (running()) {
+      child.kill('SIGKILL');
+      await Promise.race([closed, delay(5000, undefined, { ref: false })]);
+    }
+    assert.ok(!running(), 'smoke Xvfb process did not stop');
+    const remainingLock = await readFile(lockPath, 'utf8').catch(missing);
+    if (Number(remainingLock?.trim()) === child.pid) {
+      await unlink(socketPath).catch(missing);
+      await unlink(lockPath).catch(missing);
+    }
+  }
+  console.log(JSON.stringify({ check: 'xvfb-display-ready-and-stopped', display, uid: process.getuid(), stopped: true }));
+`;
 const browserProbe = `
   import { BrowserHostClient } from '@space/browser-host';
   const client = new BrowserHostClient({
@@ -196,6 +244,9 @@ export async function runContainerStartupSmoke({ target, image, arch, root = rep
       checks.push("real CLI entrypoint accepted a Unix socket connection as uid10001");
     } else {
       await waitFor("Browser Host health", () => execNode(browserProbe, true));
+      // The managed browser uses a headed display by default. A headless-only
+      // Chromium probe cannot detect a missing Xvfb runtime dependency.
+      await execNode(xvfbDisplayProbe, true, 180_000);
       const dom = await run([
         "exec", "--user", "10001:10001", "-e", "HOME=/var/lib/spaceapp-cli", service,
         "/usr/bin/chromium", "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
@@ -203,7 +254,8 @@ export async function runContainerStartupSmoke({ target, image, arch, root = rep
         "--dump-dom", "data:text/html,<title>spaceapp-startup-smoke</title>"
       ], { timeout: 120_000 });
       if (!dom.includes("<title>spaceapp-startup-smoke</title>")) throw new Error("Chromium did not render the synthetic smoke page.");
-      checks.push("real Browser Host entrypoint answered health", "headless Chromium rendered a synthetic page as uid10001");
+      checks.push("real Browser Host entrypoint answered health", "Xvfb created its owned display and stopped as uid10001",
+        "headless Chromium rendered a synthetic page as uid10001");
     }
   } catch (error) {
     for (const name of containers) {

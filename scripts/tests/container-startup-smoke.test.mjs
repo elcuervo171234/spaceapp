@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,6 +85,8 @@ for (const target of ["core", "browser", "cli"]) {
     assert.ok(serviceRun.includes("SPACEAPP_WORKFLOWS_ENABLED=false"));
     const bundleCalls = fixture.calls.filter((args) => args[0] === "exec" && args.at(-1).includes("bundleWorkflowCode"));
     assert.equal(bundleCalls.length, target === "core" ? 1 : 0);
+    const displayCalls = fixture.calls.filter((args) => args[0] === "exec" && args.at(-1).includes("xvfb-display-ready-and-stopped"));
+    assert.equal(displayCalls.length, target === "browser" ? 1 : 0);
     assert.equal(fixture.resources.size, 0);
     assert.ok(fixture.calls.filter((args) => args[0] === "rm").every((args) => args.includes("-v") && args.at(-1).startsWith("spaceapp-smoke-")));
     if (target === "core") {
@@ -104,6 +107,12 @@ for (const target of ["core", "browser", "cli"]) {
       assert.ok(fixture.calls.some((args) => args[0] === "cp" && args.at(-1).endsWith(":/tmp/spaceapp-smoke-schema.sql")));
       assert.ok(fixture.calls.some((args) => args.includes("/usr/bin/chromium") && args.includes("10001:10001")));
       assert.ok(fixture.calls.some((args) => args.includes("--input-type=module")));
+      const displayCall = displayCalls[0];
+      assert.ok(displayCall.includes("10001:10001"));
+      assert.ok(displayCall.includes(serviceRun[serviceRun.indexOf("--name") + 1]));
+      assert.equal(fixture.commandOptions[fixture.calls.indexOf(displayCall)].timeout, 180_000);
+      execFileSync(process.execPath, ["--input-type=module", "--check"], { input: displayCall.at(-1) });
+      assert.ok(result.checks.includes("Xvfb created its owned display and stopped as uid10001"));
     }
     if (target === "cli") assert.equal(fixture.calls.filter((args) => args[0] === "run").length, 1);
     const mountedFile = serviceRun.find((arg) => arg.startsWith("type=bind,src="));
@@ -138,6 +147,19 @@ test("a failed core workflow bundle check fails smoke and still removes its owne
   await assert.rejects(runContainerStartupSmoke({ target: "core", image: "spaceapp-test:image", arch: "amd64", root: fixture.root }, { docker }), /packaged workflow module missing/);
   assert.equal(fixture.resources.size, 0);
   assert.ok(fixture.calls.some((args) => args[0] === "network" && args[1] === "rm"));
+});
+
+test("a failed browser Xvfb check fails smoke and still removes its owned resources", async (t) => {
+  const fixture = await smokeFixture(t, { arch: "arm64" });
+  const docker = async (args, options) => {
+    const result = await fixture.docker(args, options);
+    if (args[0] === "exec" && args.at(-1).includes("xvfb-display-ready-and-stopped")) throw new Error("synthetic Xvfb unavailable");
+    return result;
+  };
+  await assert.rejects(runContainerStartupSmoke({ target: "browser", image: "spaceapp-test:image", arch: "arm64", root: fixture.root }, { docker }), /Xvfb unavailable/);
+  assert.equal(fixture.resources.size, 0);
+  assert.ok(fixture.calls.some((args) => args[0] === "network" && args[1] === "rm"));
+  assert.ok(!fixture.calls.some((args) => args.includes("/usr/bin/chromium")));
 });
 
 test("cleanup refuses to delete a container whose ownership label does not match", async (t) => {
