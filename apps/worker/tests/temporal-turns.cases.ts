@@ -154,7 +154,10 @@ export function registerTurnCases(): void {
         // is a WorkflowClient.result option, not a WorkflowHandle.result option.
         await expect(client.workflow.result(handle.workflowId, handle.firstExecutionRunId, {
           followRuns: false
-        })).rejects.toMatchObject({ name: "WorkflowContinuedAsNewError" });
+        })).rejects.toMatchObject({
+          message: "Workflow execution continued as new",
+          newExecutionRunId: expect.any(String)
+        });
         const history = await firstRunHistory(handle);
         const continued = history.events?.find((event) =>
           event.workflowExecutionContinuedAsNewEventAttributes

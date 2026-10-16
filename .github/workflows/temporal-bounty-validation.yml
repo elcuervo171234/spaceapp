@@ -29,6 +29,8 @@ jobs:
         run: npm run check
       - name: Install ripgrep for the complete public suite
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - name: Diagnose isolated polling boundaries
+        run: npm exec -w @space/worker -- vitest run tests/temporal-sandbox.integration.test.ts -t 'continues after 250 one-second polls'
       - name: Measure ordinary integration and replay suite
         run: |
           started=$(date +%s)

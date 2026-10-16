@@ -56,7 +56,7 @@ async function firstContinue(client: Client, handle: any) {
   // the client's pinned first-run request, not as an ignored handle argument.
   await expect(client.workflow.result(handle.workflowId, handle.firstExecutionRunId, { followRuns: false }))
     .rejects.toBeInstanceOf(WorkflowContinuedAsNewError);
-  const history = await firstRunHistory(handle);
+  const history = await firstRunHistory(handle, client);
   const event = history.events?.find((entry: any) => entry.workflowExecutionContinuedAsNewEventAttributes);
   const attrs = event?.workflowExecutionContinuedAsNewEventAttributes;
   expect(attrs?.input?.payloads).toHaveLength(1);
@@ -229,34 +229,25 @@ export function registerSupervisorCases(): void {
           const activities = simpleActivities();
           activities.prepareRoomAgentBackgroundContinuation.mockResolvedValue({ state: "WAITING" });
           activities.settleRoomAgentBackgroundMission.mockResolvedValue(false);
-          await withTemporalWorker(activities, async ({ env, client, taskQueue }) => {
+          await withTemporalWorker(activities, async ({ client, taskQueue }) => {
             const handle = await client.workflow.start("roomAgentSupervisorWorkflow", {
               workflowId: `supervisor:${randomUUID()}`, taskQueue,
               args: [roomAgentSupervisorInputSchema.parse({ roomId: "room:250-polls",
                 monitoringMissionIds: ["mission:still-running"], processedCount: 7 })]
             });
+            let waiting: ReturnType<typeof firstContinue> | undefined;
+            let deadline: ReturnType<typeof setTimeout> | undefined;
             try {
-              // This is a long-lived supervisor, not a workflow expected to
-              // finish. Advance the genuine test server explicitly, without
-              // .result()'s automatic skipping scope competing with the many
-              // short timers and activity boundaries. Read the first run after
-              // its actual terminal event, then assert all 250 real polls.
-              await eventually(async () => timers(await firstRunHistory(handle)).length > 0);
-              const advance = env.sleep("5 minutes");
-              let deadline: ReturnType<typeof setTimeout> | undefined;
-              try {
-                await Promise.race([advance, new Promise<never>((_, reject) => {
-                  deadline = setTimeout(() => reject(new Error("The Temporal test clock did not advance five minutes within 30 seconds.")), 30_000);
-                })]);
-              } finally {
-                clearTimeout(deadline);
-                // If the bounded clock advance failed, termination below lets
-                // the server finish it; retain a rejection handler for cleanup.
-                void advance.catch(() => undefined);
-              }
-              await eventually(async () => (await firstRunHistory(handle)).events?.some((event: any) =>
-                event.workflowExecutionContinuedAsNewEventAttributes));
-              const { carried, history } = await firstContinue(client, handle);
+              // A fresh genuine server isolates this long polling run from any
+              // previous case's clock locks. Use automatic time skipping only.
+              await eventually(async () => timers(await firstRunHistory(handle, client)).length > 0);
+              waiting = firstContinue(client, handle);
+              const { carried, history } = await Promise.race([waiting, new Promise<never>((_, reject) => {
+                deadline = setTimeout(() => {
+                  const poll = legacy ? activities.settleRoomAgentBackgroundMission : activities.prepareRoomAgentBackgroundContinuation;
+                  reject(new Error(`The isolated supervisor did not continue within 30 seconds; ${poll.mock.calls.length} poll activities executed.`));
+                }, 30_000);
+              })]);
               expect(carried).toEqual(roomAgentSupervisorInputSchema.parse({ roomId: "room:250-polls",
                 pending: [], interrupted: [], monitoringMissionIds: ["mission:still-running"],
                 // This is the actual legacy contract, not a changed workflow.
@@ -265,8 +256,14 @@ export function registerSupervisorCases(): void {
               expect(timers(history).every((event: any) =>
                 Number(event.timerStartedEventAttributes.startToFireTimeout.seconds) === 1)).toBe(true);
               expect(activityEvents(history, legacy ? "settleRoomAgentBackgroundMission" : "prepareRoomAgentBackgroundContinuation")).toHaveLength(250);
-            } finally { await stop(handle); }
-          }, { legacy });
+            } finally {
+              clearTimeout(deadline);
+              await stop(handle);
+              // Release result()'s time-skipping scope before isolated teardown,
+              // including when the bounded diagnostic guard terminates the run.
+              await waiting?.catch(() => undefined);
+            }
+          }, { legacy, isolated: true });
         }, timeout);
       });
     }

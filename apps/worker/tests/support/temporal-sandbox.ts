@@ -116,18 +116,24 @@ async function terminateStartedWorkflows(client: Client, workflowIds: Set<string
 export async function withTemporalWorker<T>(
   activities: Activities,
   run: (context: TemporalSandboxContext) => Promise<T>,
-  options: { legacy?: boolean; memory?: boolean } = {}
+  options: { legacy?: boolean; memory?: boolean; isolated?: boolean } = {}
 ): Promise<T> {
-  const env = sandboxEnvironment();
+  // Long polling cases need their own server clock: an unfinished result scope
+  // from another case must not hold this environment's time-skipping lock.
+  const env = options.isolated
+    ? await TestWorkflowEnvironment.createTimeSkipping()
+    : sandboxEnvironment();
   const taskQueue = `space-temporal-test-${randomUUID()}`;
   const workflowIds = new Set<string>();
   const client = trackedClient(env.client, workflowIds);
-  const workflowBundle = await getTemporalWorkflowBundle({ legacy: options.legacy });
   const queues = options.memory
     ? [taskQueue, MEMORY_MAINTENANCE_TASK_QUEUE, MEMORY_MUTATION_TASK_QUEUE]
     : [taskQueue];
   const workers: Worker[] = [];
+  let executions: Promise<unknown>[] = [];
+  let result: Promise<T> | undefined;
   try {
+    const workflowBundle = await getTemporalWorkflowBundle({ legacy: options.legacy });
     for (const queue of new Set(queues)) {
       workers.push(await Worker.create({
         connection: env.nativeConnection,
@@ -144,7 +150,7 @@ export async function withTemporalWorker<T>(
     // The microtask starts only after all real workers have been constructed
     // and their runUntil calls registered. Secondary memory queues stay alive
     // for the same callback, so production executeChild/taskQueue routing runs.
-    const result = Promise.resolve().then(async () => {
+    result = Promise.resolve().then(async () => {
       let callbackFailure: unknown;
       try {
         return await run({ env, client, taskQueue });
@@ -162,33 +168,44 @@ export async function withTemporalWorker<T>(
         }
       }
     });
-    const executions = workers.map((worker) => worker.runUntil(result));
+    const caseResult = result;
+    executions = workers.map((worker) => worker.runUntil(caseResult));
+    await Promise.all(executions);
+    return await result;
+  } finally {
     try {
-      await Promise.all(executions);
-      return await result;
-    } finally {
+      // A failed SDK worker can leave the callback waiting for a result.
+      // Terminate first to release that wait before joining the callback.
+      await terminateStartedWorkflows(env.client, workflowIds);
+      if (result) await Promise.allSettled([result]);
       for (const worker of workers) if (worker.getState() === "RUNNING") worker.shutdown();
+      // If a later Worker.create failed, release earlier initialized workers
+      // through the same real SDK lifecycle, without starting any test work.
+      for (const worker of workers) {
+        if (worker.getState() === "INITIALIZED") executions.push(worker.runUntil(Promise.resolve()));
+      }
       await Promise.allSettled(executions);
+    } finally {
+      // A dedicated server is torn down only after workflow and worker cleanup.
+      // The shared environment remains owned by the suite's afterAll hook.
+      if (options.isolated) await env.teardown();
     }
-  } catch (error) {
-    for (const worker of workers) if (worker.getState() === "RUNNING") worker.shutdown();
-    throw error;
   }
 }
 
-export async function firstRunHistory(handle: HistoryHandle): Promise<WorkflowHistory> {
+export async function firstRunHistory(handle: HistoryHandle, client?: Client): Promise<WorkflowHistory> {
   if (!handle.firstExecutionRunId) throw new Error(`Missing first execution run ID for ${handle.workflowId}.`);
-  return sandboxEnvironment().client.workflow.getHandle(handle.workflowId, handle.firstExecutionRunId).fetchHistory();
+  return (client ?? sandboxEnvironment().client).workflow.getHandle(handle.workflowId, handle.firstExecutionRunId).fetchHistory();
 }
 
 export async function recordWorkflowHistory(
   label: string,
   handle: HistoryHandle,
-  options: { firstRun?: boolean } = {}
+  options: { firstRun?: boolean; client?: Client } = {}
 ): Promise<void> {
   if (!recordingWorkflowHistories) return;
   if (!/^[A-Za-z][A-Za-z0-9.-]*$/.test(label)) throw new Error(`Invalid synthetic history label: ${label}`);
-  const history = options.firstRun ? await firstRunHistory(handle) : await handle.fetchHistory();
+  const history = options.firstRun ? await firstRunHistory(handle, options.client) : await handle.fetchHistory();
   const workflowType = history.events?.find((event) => event.workflowExecutionStartedEventAttributes)
     ?.workflowExecutionStartedEventAttributes?.workflowType?.name;
   if (!workflowType) throw new Error(`No workflow start event in history for ${label}.`);
