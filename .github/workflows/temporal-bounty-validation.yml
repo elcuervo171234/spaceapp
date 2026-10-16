@@ -1,0 +1,55 @@
+name: Temporal bounty validation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporal-bounty-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Install exact locked dependencies
+        run: npm ci
+      - name: Check all source types and architecture
+        run: npm run check
+      - name: Record synthetic Temporal histories
+        run: npm run temporal:record-histories -w @space/worker
+      - name: Export synthetic histories through public logs
+        if: always()
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdirSync, readFileSync } from 'node:fs';
+          import { gzipSync } from 'node:zlib';
+          const dir = 'apps/worker/tests/fixtures/workflow-histories';
+          const files = Object.fromEntries(readdirSync(dir).filter(n => n.endsWith('.json')).sort().map(n => [n, readFileSync(`${dir}/${n}`, 'utf8')]));
+          const data = gzipSync(JSON.stringify(files)).toString('base64');
+          console.log('SYNTHETIC_TEMPORAL_FIXTURES_BEGIN');
+          for (let i = 0; i < data.length; i += 1000) console.log(data.slice(i, i + 1000));
+          console.log('SYNTHETIC_TEMPORAL_FIXTURES_END');
+          NODE
+      - name: Measure ordinary integration and replay suite
+        run: |
+          started=$(date +%s)
+          npm exec -w @space/worker -- vitest run tests/temporal-sandbox.integration.test.ts
+          elapsed=$(( $(date +%s) - started ))
+          echo "Temporal integration and replay elapsed seconds: $elapsed"
+          test "$elapsed" -lt 180
+      - name: Run complete public test suite
+        run: npm test
+      - name: Build all workspaces
+        run: npm run build
+      - name: Contributor hygiene preflight
+        run: npm run hygiene:preflight
