@@ -115,6 +115,7 @@ function storedActivities(c: ReturnType<typeof continuationFixture>) {
     discardRoomAgentSupervisorTurn: vi.fn(({ item: turn, reason }: { item: RoomAgentSupervisorQueueItem; reason: string }) => discardSupervisorTurn(turn, reason, c.store)),
     finishRoomAgentSupervisorTurn: vi.fn((input: Parameters<typeof finishSupervisorTurn>[0]) => finishSupervisorTurn(input, c.store)),
     runCodexAppServerTurn: vi.fn(async (turn: DummyTurnInput) => {
+      if (!turn.agentRunId) throw new Error("The synthetic supervisor turn must identify its persisted agent run.");
       c.store.updateSpaceAgentRun(turn.agentRunId, { status: "COMPLETED" });
       return verified(undefined, turn);
     })
@@ -323,6 +324,7 @@ export function registerSupervisorCases(): void {
       const c = continuationFixture();
       const activities = storedActivities(c);
       activities.runCodexAppServerTurn.mockImplementationOnce(async (turn) => {
+        if (!turn.agentRunId) throw new Error("The synthetic allocation turn must identify its persisted agent run.");
         expect(turn.prompt).toContain("Open CLI and Chat, then send a story");
         c.store.createRoomAgentAction({ ...c.action, actionId: "action:send", idempotencyKey: "send-once", actionType: "SEND",
           evidence: { cli: "Story complete", chat: "Story complete" }, statusReason: "Both tasks completed." });
@@ -422,7 +424,9 @@ export function registerSupervisorCases(): void {
       const firstRunChecks: RoomAgentSupervisorQueueItem[] = [];
       activities.checkRoomAgentSupervisorTurn.mockImplementation(async (turn: any) => {
         const handle = await started.promise;
-        if (Context.current().info.workflowExecution.runId !== handle.firstExecutionRunId) {
+        const execution = Context.current().info.workflowExecution;
+        if (!execution) throw new Error("The synthetic supervisor check must run inside a workflow execution.");
+        if (execution.runId !== handle.firstExecutionRunId) {
           await waitForCancellation();
           return "SKIP";
         }
@@ -435,7 +439,7 @@ export function registerSupervisorCases(): void {
             const events = (await firstRunHistory(handle)).events ?? [];
             const signals = events.filter((event: any) => event.workflowExecutionSignaledEventAttributes);
             const last = signals[signals.length - 1];
-            return signals.length === 105 && events.some((event: any) =>
+            return signals.length === 105 && last !== undefined && events.some((event: any) =>
               event.workflowTaskCompletedEventAttributes && Number(event.eventId) > Number(last.eventId));
           });
         }
