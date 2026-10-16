@@ -1,0 +1,67 @@
+name: Temporal history recorder validation
+
+on:
+  push:
+    branches: [test/temporal-sandbox-replay]
+    paths: [.github/workflows/temporal-record-validation.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+      - name: Install exact locked dependencies
+        run: npm ci
+      - name: Check all source types and build workspace dependencies
+        run: npm run check
+      - name: Remove synthetic histories in this temporary checkout
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdir, unlink } from "node:fs/promises";
+          import { join } from "node:path";
+          const directory = "apps/worker/tests/fixtures/workflow-histories";
+          const names = (await readdir(directory)).filter((name) => name.endsWith(".json"));
+          for (const name of names) await unlink(join(directory, name));
+          console.log(`Removed ${names.length} synthetic JSON histories before recording.`);
+          NODE
+      - name: Run the explicit production history recorder
+        run: npm run temporal:record-histories -w @space/worker
+      - name: Verify every canonical history was freshly recorded
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+          const directory = "apps/worker/tests/fixtures/workflow-histories";
+          const labels = [
+            "dotGoalWorkflow", "dummyTurnWorkflow", "codexAppServerTurnWorkflow",
+            "roomAgentSupervisorWorkflow", "roomAgentSupervisorWorkflow.pre-patch",
+            "roomAgentActionWorkflow", "memoryMaintenanceWorkflow",
+            "memoryConsolidationWorkflow", "memoryMutationWorkflow"
+          ];
+          for (const label of labels) {
+            const filename = `${directory}/${label}.json`;
+            const fixture = JSON.parse(await readFile(filename, "utf8"));
+            const workflowType = label.split(".")[0];
+            assert.equal(fixture.format, 1, `${filename}: format`);
+            assert.equal(fixture.label, label, `${filename}: label`);
+            assert.equal(fixture.workflowType, workflowType, `${filename}: workflow type`);
+            assert.ok(fixture.workflowId, `${filename}: workflow ID`);
+            assert.ok(Array.isArray(fixture.history?.events) && fixture.history.events.length,
+              `${filename}: nonempty real event history`);
+            const started = fixture.history.events.find((event) => event.workflowExecutionStartedEventAttributes)
+              ?.workflowExecutionStartedEventAttributes?.workflowType?.name;
+            assert.equal(started, workflowType, `${filename}: workflow start event`);
+            console.log(`${label}: ${fixture.history.events.length} recorded events`);
+          }
+          assert.equal(labels.length, 9);
+          console.log("All nine canonical histories were produced by the explicit recorder.");
+          NODE

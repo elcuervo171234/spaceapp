@@ -3,6 +3,9 @@ name: Temporal bounty validation
 on:
   push:
     branches: [test/temporal-sandbox-replay]
+    paths:
+      - apps/worker/**
+      - package-lock.json
   workflow_dispatch:
 
 permissions:
