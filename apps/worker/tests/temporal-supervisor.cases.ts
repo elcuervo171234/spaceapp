@@ -19,6 +19,7 @@ import { withTemporalWorker, recordWorkflowHistory, firstRunHistory } from "./su
 // cancellation, timers, patch selection and continue-as-new use Temporal itself.
 const timeout = 60_000;
 
+/** Creates a host-side barrier that tests release after a real activity or signal reaches the required state. */
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -26,6 +27,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+/** Builds a schema-validated synthetic queue item with distinct mission, run and trace identities. */
 function item(roomId: string, suffix: string): RoomAgentSupervisorQueueItem {
   return roomAgentSupervisorQueueItemSchema.parse({ missionId: `mission:${suffix}`, turn: {
     roomId, paneId: "pane:synthetic", prompt: `Synthetic operator request ${suffix}`,
@@ -34,6 +36,7 @@ function item(roomId: string, suffix: string): RoomAgentSupervisorQueueItem {
   } });
 }
 
+/** Returns a completed, verified activity result that preserves the supplied turn's workflow and room identities. */
 function verified(message = "Synthetic room evidence verified.", turn?: DummyTurnInput) {
   return { workflowId: turn ? buildCodexAppServerTurnWorkflowId(turn) : "workflow:synthetic-turn",
     roomId: turn?.roomId ?? "room:synthetic", paneId: turn?.paneId ?? "pane:synthetic",
@@ -42,15 +45,18 @@ function verified(message = "Synthetic room evidence verified.", turn?: DummyTur
   } };
 }
 
+/** Polls a host or history observation with a bounded wait while the genuine Temporal worker progresses. */
 async function eventually(predicate: () => unknown | Promise<unknown>) {
   await expect.poll(predicate, { timeout: 20_000, interval: 20 }).toBeTruthy();
 }
 
+/** Terminates the workflow's current execution chain during cleanup, tolerating an already closed execution. */
 async function stop(handle: any) {
   // A start handle targets the execution chain, including a continued run.
   await handle.terminate("Synthetic Temporal test cleanup.").catch(() => undefined);
 }
 
+/** Requires the first run to continue as new, then decodes and validates its carried supervisor state. */
 async function firstContinue(client: Client, handle: any) {
   // Handle.result follows the execution chain by default. Set followRuns on
   // the client's pinned first-run request, not as an ignored handle argument.
@@ -64,15 +70,18 @@ async function firstContinue(client: Client, handle: any) {
   return { history, carried, nextRunId: attrs!.newExecutionRunId! };
 }
 
+/** Selects scheduled activity events of one type so assertions remain scoped to the inspected workflow run. */
 function activityEvents(history: any, activityType: string) {
   return (history.events ?? []).filter((event: any) =>
     event.activityTaskScheduledEventAttributes?.activityType?.name === activityType);
 }
 
+/** Selects actual timer-start events for checking polling duration and continue-as-new boundaries. */
 function timers(history: any) {
   return (history.events ?? []).filter((event: any) => event.timerStartedEventAttributes);
 }
 
+/** Sends a real signal and waits for a completed workflow task after its persisted history event. */
 async function signalHandled(handle: any, name: string, value: unknown) {
   await handle.signal(name, value);
   // Signal acknowledgement means persisted, not necessarily processed. Keep an
@@ -94,6 +103,7 @@ async function waitForCancellation() {
   finally { clearInterval(heartbeat); }
 }
 
+/** Supplies activity-boundary spies for both supervisor contracts while leaving workflow execution real. */
 function simpleActivities() {
   return {
     checkRoomAgentSupervisorTurn: vi.fn(async (_input: any): Promise<"READY" | "PAUSED" | "SKIP"> => "READY"),
@@ -108,6 +118,7 @@ function simpleActivities() {
   };
 }
 
+/** Runs the real continuation activities against the fixture store and substitutes only the external Codex turn. */
 function storedActivities(c: ReturnType<typeof continuationFixture>) {
   return {
     prepareRoomAgentBackgroundContinuation: vi.fn((input: Parameters<typeof prepareBackgroundContinuation>[0]) => prepareBackgroundContinuation(input, c.store)),
@@ -122,6 +133,7 @@ function storedActivities(c: ReturnType<typeof continuationFixture>) {
   };
 }
 
+/** Registers sequential real-server cases for supervisor signals, cancellation, legacy behavior and carried state. */
 export function registerSupervisorCases(): void {
   describe.sequential("Room Agent supervisor in the real Temporal sandbox", () => {
     for (const legacy of [false, true]) {

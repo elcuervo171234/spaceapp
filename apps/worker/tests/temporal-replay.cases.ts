@@ -18,6 +18,7 @@ const requiredLabels = [
 ] as const;
 const productionWorkflowTypes = new Set(requiredLabels.map((label) => label.split(".")[0]!));
 
+/** Loads every golden history, requiring all workflow labels and validating their start events. */
 async function histories() {
   let names: string[];
   try {
@@ -49,6 +50,7 @@ async function histories() {
   }));
 }
 
+/** Searches the error cause chain for a determinism violation without revisiting objects. */
 function hasDeterminismViolation(error: unknown): boolean {
   const seen = new Set<unknown>();
   let current = error;
@@ -60,6 +62,7 @@ function hasDeterminismViolation(error: unknown): boolean {
   return false;
 }
 
+/** Registers replay compatibility and extra-timer rejection cases outside explicit recording mode. */
 export function registerReplayCases(): void {
   describe("recorded production workflow compatibility", () => {
     // Recording bootstrap runs real scenarios first; it may create absent

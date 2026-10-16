@@ -41,6 +41,11 @@ const { markRoomAgentMissionStarted, markRoomAgentMissionFinished, markRoomAgent
 const enqueueRoomAgentMissionSignal = defineSignal<[RoomAgentSupervisorQueueItem]>(ROOM_AGENT_ENQUEUE_SIGNAL);
 const stopRoomAgentMissionSignal = defineSignal<[{ missionId: string | null; reason: string }]>(ROOM_AGENT_STOP_SIGNAL);
 
+/**
+ * Executes the preserved production supervisor body without the newer patch
+ * marker, producing historical input for replay against the current workflow.
+ * Its queue, signals, activities and continuation behavior remain unchanged.
+ */
 export async function roomAgentSupervisorWorkflow(rawInput: RoomAgentSupervisorInput): Promise<never> {
   const input = roomAgentSupervisorInputSchema.parse(rawInput);
   let pending = [...input.pending];

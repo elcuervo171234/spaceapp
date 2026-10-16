@@ -38,6 +38,10 @@ export type RecordedWorkflowHistory = {
 let environment: TestWorkflowEnvironment | undefined;
 const bundles = new Map<string, Promise<WorkflowBundle>>();
 
+/**
+ * Bundles the real production, preserved legacy, or deliberately incompatible
+ * test entry point, caching each bundle for the lifetime of the suite.
+ */
 export function getTemporalWorkflowBundle(options: { legacy?: boolean; negative?: boolean } = {}): Promise<WorkflowBundle> {
   const name = options.negative
     ? "temporal-negative-workflow.ts"
@@ -50,6 +54,7 @@ export function getTemporalWorkflowBundle(options: { legacy?: boolean; negative?
   return bundle;
 }
 
+/** Starts the suite-owned time-skipping server and prepares its production bundle. */
 export async function startTemporalSandbox(): Promise<void> {
   if (environment) throw new Error("The Temporal sandbox is already running.");
   environment = await TestWorkflowEnvironment.createTimeSkipping();
@@ -57,6 +62,7 @@ export async function startTemporalSandbox(): Promise<void> {
   await getTemporalWorkflowBundle();
 }
 
+/** Tears down the shared test server and clears bundles even when teardown fails. */
 export async function stopTemporalSandbox(): Promise<void> {
   const current = environment;
   environment = undefined;
@@ -67,6 +73,7 @@ export async function stopTemporalSandbox(): Promise<void> {
   }
 }
 
+/** Returns the initialized shared environment, failing if suite setup was omitted. */
 function sandboxEnvironment(): TestWorkflowEnvironment {
   if (!environment) throw new Error("Initialize the Temporal sandbox in beforeAll before running a case.");
   return environment;
@@ -75,8 +82,13 @@ function sandboxEnvironment(): TestWorkflowEnvironment {
 // Bind every ordinary method to the genuine SDK object. Only start/execute are
 // wrapped to remember IDs for cleanup; signals, results, histories and timers
 // still cross the real Temporal client/server boundary.
+/**
+ * Preserves the genuine SDK client while recording workflow IDs started or
+ * executed by a case so cleanup can terminate their latest executions.
+ */
 function trackedClient(client: Client, workflowIds: Set<string>): Client {
   const workflows = new Proxy(client.workflow, {
+    /** Binds workflow methods to their SDK receiver and tracks start/execute IDs. */
     get(target, property) {
       const value = Reflect.get(target, property, target);
       if ((property === "start" || property === "execute") && typeof value === "function") {
@@ -90,6 +102,7 @@ function trackedClient(client: Client, workflowIds: Set<string>): Client {
     }
   });
   return new Proxy(client, {
+    /** Supplies the tracked workflow client while preserving other SDK receivers. */
     get(target, property) {
       if (property === "workflow") return workflows;
       const value = Reflect.get(target, property, target);
@@ -98,6 +111,10 @@ function trackedClient(client: Client, workflowIds: Set<string>): Client {
   });
 }
 
+/**
+ * Terminates the current run of each tracked workflow, including continued runs.
+ * Already-closed executions are harmless; other cleanup errors fail the case.
+ */
 async function terminateStartedWorkflows(client: Client, workflowIds: Set<string>): Promise<void> {
   const failures: unknown[] = [];
   for (const workflowId of workflowIds) {
@@ -113,6 +130,12 @@ async function terminateStartedWorkflows(client: Client, workflowIds: Set<string
   if (failures.length) throw new AggregateError(failures, "Could not clean up synthetic workflow executions.");
 }
 
+/**
+ * Runs a case against real workers with stub activities and the selected workflow
+ * bundle. Optional memory queues exercise child routing; an isolated server gives
+ * polling cases an independent clock. Synthetic executions and workers are joined
+ * before an isolated server is torn down.
+ */
 export async function withTemporalWorker<T>(
   activities: Activities,
   run: (context: TemporalSandboxContext) => Promise<T>,
@@ -193,11 +216,20 @@ export async function withTemporalWorker<T>(
   }
 }
 
+/**
+ * Fetches the initial execution's history without following continue-as-new.
+ * Supply the case's client for an isolated server; otherwise use the shared one.
+ */
 export async function firstRunHistory(handle: HistoryHandle, client?: Client): Promise<WorkflowHistory> {
   if (!handle.firstExecutionRunId) throw new Error(`Missing first execution run ID for ${handle.workflowId}.`);
   return (client ?? sandboxEnvironment().client).workflow.getHandle(handle.workflowId, handle.firstExecutionRunId).fetchHistory();
 }
 
+/**
+ * Writes a portable synthetic history only in explicit recording mode, preserving
+ * protobuf event IDs and payloads. Normal tests return without rewriting goldens;
+ * firstRun selects the original execution when a scenario continues as new.
+ */
 export async function recordWorkflowHistory(
   label: string,
   handle: HistoryHandle,

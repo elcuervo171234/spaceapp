@@ -1,6 +1,7 @@
 import { buildCodexAppServerTurnWorkflowId, roomAgentSupervisorQueueItemSchema } from "@space/contracts";
 import { InMemorySpaceStore } from "@space/runtime";
 
+/** Creates in-memory mission state with completed pane allocation and a reusable turn enqueuer. */
 export function continuationFixture(actionType: "OPEN_TYPES" | "CONFIGURE_PANE" = "OPEN_TYPES") {
   const store = new InMemorySpaceStore();
   const room = store.createRoom({ name: "Continuation regression", initialPaneCount: 0 });
@@ -8,6 +9,7 @@ export function continuationFixture(actionType: "OPEN_TYPES" | "CONFIGURE_PANE" 
   const session = store.createSpaceAgentSession({ paneId: pane.id, roomId: room.id, title: "Room Agent",
     selectedProviderId: null, selectedModelId: null, selectedModelConfigId: null,
     selectedProviderName: null, selectedModelName: null, selectedReasoningKey: null, selectedToolIds: null });
+  /** Enqueues a synthetic mission turn with suffix-derived identities and an optional prompt. */
   function enqueue(suffix: string, prompt = "Open CLI and Chat, then send a story to both.") {
     const item = roomAgentSupervisorQueueItemSchema.parse({ missionId: "mission:continuation", turn: {
       roomId: room.id, paneId: pane.id, prompt, roomAgentOperatorRequest: prompt,

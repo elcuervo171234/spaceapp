@@ -9,6 +9,7 @@ import { firstRunHistory, recordWorkflowHistory, withTemporalWorker } from "./su
 type History = Awaited<ReturnType<typeof firstRunHistory>>;
 type RoomActionInput = Parameters<typeof activities.runRoomAgentBackgroundAction>[0];
 
+/** Builds a synthetic turn input, applying only the overrides needed by each case. */
 function turn(overrides: Partial<DummyTurnInput> = {}): DummyTurnInput {
   return {
     roomId: "room:temporal-turn",
@@ -22,6 +23,7 @@ function turn(overrides: Partial<DummyTurnInput> = {}): DummyTurnInput {
   };
 }
 
+/** Returns a successful stub activity result with the input turn's room, pane and trace IDs. */
 function completedTurn(input: DummyTurnInput): TurnWorkflowResult {
   return {
     workflowId: `workflow:synthetic:${input.traceId}`,
@@ -33,6 +35,7 @@ function completedTurn(input: DummyTurnInput): TurnWorkflowResult {
   };
 }
 
+/** Finds a named activity's scheduling attributes and asserts that the history contains them. */
 function activityScheduled(history: History, name: string) {
   const scheduled = history.events?.find((event) =>
     event.activityTaskScheduledEventAttributes?.activityType?.name === name
@@ -41,10 +44,12 @@ function activityScheduled(history: History, name: string) {
   return scheduled!;
 }
 
+/** Converts protobuf duration seconds to a number for assertions on recorded timeouts. */
 function seconds(duration: { seconds?: unknown } | null | undefined): number {
   return Number(String(duration?.seconds ?? 0));
 }
 
+/** Bounds a host-side synchronization promise to ten seconds and always clears its timer. */
 async function deadline<T>(promise: Promise<T>, description: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -59,6 +64,7 @@ async function deadline<T>(promise: Promise<T>, description: string): Promise<T>
   }
 }
 
+/** Decodes recorded marker payloads to find the patch ID exercised by a workflow case. */
 function containsPatchMarker(history: History, patchId: string): boolean {
   return (history.events ?? []).some((event) => {
     const marker = event.markerRecordedEventAttributes;
@@ -377,6 +383,7 @@ export function registerTurnCases(): void {
   });
 }
 
+/** Builds a synthetic room-action bridge, supplying an explicit action ID only when requested. */
 function roomActionInput(actionId?: string): RoomActionInput {
   return {
     ...(actionId ? { actionId } : {}),

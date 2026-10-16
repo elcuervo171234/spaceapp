@@ -24,6 +24,7 @@ const mutation: MemoryMutationWorkflowResult = {
   status: "APPLIED", changeSetId, resultingSourceHash: "b".repeat(64), reason: null
 };
 
+/** Registers real maintenance, child-consolidation and mutation workflow retry cases. */
 export function registerMemoryCases(): void {
   describe.sequential("real Temporal sandbox: memory workflows", () => {
     it("continues after both optional maintenance failures and completes its real child workflow", async () => {
