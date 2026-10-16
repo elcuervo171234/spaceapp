@@ -10,6 +10,10 @@ on:
       - "starter-memory/**"
       - "Dockerfile"
       - "package-lock.json"
+      - "scripts/stage-container-runtime.mjs"
+      - "scripts/container-startup-smoke.mjs"
+      - "scripts/tests/stage-container-runtime.test.mjs"
+      - "scripts/tests/container-startup-smoke.test.mjs"
   push:
     branches:
       - main
@@ -21,6 +25,10 @@ on:
       - "starter-memory/**"
       - "Dockerfile"
       - "package-lock.json"
+      - "scripts/stage-container-runtime.mjs"
+      - "scripts/container-startup-smoke.mjs"
+      - "scripts/tests/stage-container-runtime.test.mjs"
+      - "scripts/tests/container-startup-smoke.test.mjs"
   workflow_dispatch:
 
 permissions:
@@ -70,4 +78,12 @@ jobs:
         run: >-
           node scripts/container-image-size-budget.mjs
           --target "${{ matrix.target }}"
+          --image "spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}"
+
+      - name: Start image and exercise its service
+        timeout-minutes: 10
+        run: >-
+          node scripts/container-startup-smoke.mjs
+          --target "${{ matrix.target }}"
+          --arch "${{ matrix.arch }}"
           --image "spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}"
