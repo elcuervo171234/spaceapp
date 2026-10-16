@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: spaceapp64-validation-${{ github.ref }}
+  group: spaceapp64-validation-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:

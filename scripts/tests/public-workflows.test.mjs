@@ -51,6 +51,8 @@ test("launcher and container matrices cover the declared operating systems and a
   }
   assert.match(containers, /- amd64/);
   assert.match(containers, /- arm64/);
+  assert.match(containers, /runs-on: \$\{\{ matrix\.arch == 'arm64' && 'ubuntu-24\.04-arm' \|\| 'ubuntu-latest' \}\}/);
+  assert.doesNotMatch(containers, /docker\/setup-qemu-action/);
   assert.match(containers, /push: false/);
 });
 

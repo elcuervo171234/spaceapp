@@ -16,9 +16,10 @@ async function smokeFixture(t, { arch = "amd64", failStartup = false, foreignOwn
   await writeFile(join(root, "packages/run-spaceapp/templates/compose.yml"), `services:\n  postgres:\n    image: ${pinnedPostgres}\nnetworks:\n`);
   await writeFile(join(root, "packages/db/migrations/0001_first.sql"), "SELECT 1;");
   await writeFile(join(root, "packages/db/migrations/0002_second.sql"), "SELECT 2;");
-  const calls = [], resources = new Map();
-  const docker = async (args) => {
+  const calls = [], commandOptions = [], resources = new Map();
+  const docker = async (args, options = {}) => {
     calls.push([...args]);
+    commandOptions.push(options);
     if (args[0] === "image") return arch;
     if (args[0] === "network" && args[1] === "create") {
       resources.set(args.at(-1), args[args.indexOf("--label") + 1].split("=")[1]); return "created";
@@ -38,7 +39,7 @@ async function smokeFixture(t, { arch = "amd64", failStartup = false, foreignOwn
     if (args.includes("/usr/bin/chromium")) return "<html><title>spaceapp-startup-smoke</title></html>";
     return "ok";
   };
-  return { root, docker, calls, resources };
+  return { root, docker, calls, commandOptions, resources };
 }
 
 test("startup smoke uses the Compose pgvector digest and rejects an unpinned database", () => {
@@ -81,6 +82,8 @@ for (const target of ["core", "browser", "cli"]) {
     const serviceRun = fixture.calls.find((args) => args[0] === "run" && args.at(-1) === "spaceapp-test:image");
     assert.ok(serviceRun); assert.ok(!serviceRun.includes("--entrypoint"));
     assert.ok(serviceRun.includes("SPACEAPP_WORKFLOWS_ENABLED=false"));
+    const bundleCalls = fixture.calls.filter((args) => args[0] === "exec" && args.at(-1).includes("bundleWorkflowCode"));
+    assert.equal(bundleCalls.length, target === "core" ? 1 : 0);
     assert.equal(fixture.resources.size, 0);
     assert.ok(fixture.calls.filter((args) => args[0] === "rm").every((args) => args.includes("-v") && args.at(-1).startsWith("spaceapp-smoke-")));
     if (target === "core") {
@@ -88,6 +91,13 @@ for (const target of ["core", "browser", "cli"]) {
       assert.ok(serviceRun.includes("SPACE_DATABASE_URL_FILE=/run/spaceapp/database-url"));
       assert.ok(serviceRun.includes("SPACE_DATABASE_URL_SOURCE_FILE=/run/secrets/database-url"));
       assert.ok(!serviceRun.includes("SPACE_DATABASE_URL_FILE=/run/secrets/database-url"));
+      const bundleCall = bundleCalls[0];
+      assert.ok(bundleCall.includes("--input-type=module"));
+      assert.ok(bundleCall.includes("10001:10001"));
+      assert.ok(bundleCall.includes(serviceRun[serviceRun.indexOf("--name") + 1]));
+      assert.ok(bundleCall.at(-1).includes("/app/apps/worker/dist/workflows.js"));
+      assert.equal(fixture.commandOptions[fixture.calls.indexOf(bundleCall)].timeout, 180_000);
+      assert.ok(result.checks.includes("production Temporal workflow bundle built without a server"));
     }
     if (target === "browser") {
       assert.ok(serviceRun.includes("SPACE_DATABASE_URL_FILE=/run/secrets/database-url"));
@@ -105,6 +115,27 @@ for (const target of ["core", "browser", "cli"]) {
 test("failed startup still attempts cleanup and preserves the failure", async (t) => {
   const fixture = await smokeFixture(t, { failStartup: true });
   await assert.rejects(runContainerStartupSmoke({ target: "cli", image: "spaceapp-test:image", arch: "amd64", root: fixture.root }, { docker: fixture.docker }), /exited before becoming ready/);
+  assert.equal(fixture.resources.size, 0);
+  assert.ok(fixture.calls.some((args) => args[0] === "network" && args[1] === "rm"));
+});
+
+test("arm64 core workflow bundling receives its own 180-second timeout", async (t) => {
+  const fixture = await smokeFixture(t, { arch: "arm64" });
+  await runContainerStartupSmoke({ target: "core", image: "spaceapp-test:arm64", arch: "arm64", root: fixture.root }, { docker: fixture.docker });
+  const index = fixture.calls.findIndex((args) => args[0] === "exec" && args.at(-1).includes("bundleWorkflowCode"));
+  assert.ok(index >= 0);
+  assert.equal(fixture.commandOptions[index].timeout, 180_000);
+  assert.equal(fixture.resources.size, 0);
+});
+
+test("a failed core workflow bundle check fails smoke and still removes its owned resources", async (t) => {
+  const fixture = await smokeFixture(t);
+  const docker = async (args, options) => {
+    const result = await fixture.docker(args, options);
+    if (args[0] === "exec" && args.at(-1).includes("bundleWorkflowCode")) throw new Error("synthetic packaged workflow module missing");
+    return result;
+  };
+  await assert.rejects(runContainerStartupSmoke({ target: "core", image: "spaceapp-test:image", arch: "amd64", root: fixture.root }, { docker }), /packaged workflow module missing/);
   assert.equal(fixture.resources.size, 0);
   assert.ok(fixture.calls.some((args) => args[0] === "network" && args[1] === "rm"));
 });

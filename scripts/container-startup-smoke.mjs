@@ -24,6 +24,14 @@ const readyProbe = `
       console.log('core-readyz-ok');
     }).catch(() => { process.exitCode = 1; });
 `;
+const workflowBundleProbe = `
+  import assert from 'node:assert/strict';
+  import { bundleWorkflowCode } from '@temporalio/worker';
+  const workflowsPath = '/app/apps/worker/dist/workflows.js';
+  const { code } = await bundleWorkflowCode({ workflowsPath });
+  assert.ok(typeof code === 'string' && code.length > 0, 'production workflow bundle is empty');
+  console.log(JSON.stringify({ workflowsPath, bundleBytes: Buffer.byteLength(code), serverUsed: false }));
+`;
 const browserProbe = `
   import { BrowserHostClient } from '@space/browser-host';
   const client = new BrowserHostClient({
@@ -102,10 +110,10 @@ export async function runContainerStartupSmoke({ target, image, arch, root = rep
     if (source.includes(",")) throw new Error("Smoke temporary path cannot contain commas.");
     return ["--mount", `type=bind,src=${source},dst=${destination},readonly`];
   };
-  const execNode = (code, esm = false) => run([
+  const execNode = (code, esm = false, timeout = 15_000) => run([
     "exec", "--user", "10001:10001", "-e", "HOME=/var/lib/spaceapp-cli", service,
     "node", ...(esm ? ["--input-type=module"] : []), "-e", code
-  ], { timeout: 15_000 });
+  ], { timeout });
   const waitFor = async (description, probe) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -178,7 +186,11 @@ export async function runContainerStartupSmoke({ target, image, arch, root = rep
       const applied = await run(["exec", database, "psql", "-U", "spaceapp", "-d", "spaceapp", "-Atc", "SELECT count(*) FROM space_schema_migrations"]);
       const expected = (await readdir(join(root, "packages/db/migrations"))).filter((name) => name.endsWith(".sql")).length;
       if (Number(applied) !== expected || expected === 0) throw new Error("Core entrypoint did not apply every source migration.");
-      checks.push("real core entrypoint applied migrations", "/readyz returned ok:true", "Temporal explicitly disabled for this startup smoke only");
+      // Exercise the packaged SDK's workflow resolution while no Temporal
+      // server is configured. QEMU arm64 needs a separate bounded build budget.
+      await execNode(workflowBundleProbe, true, 180_000);
+      checks.push("real core entrypoint applied migrations", "/readyz returned ok:true",
+        "production Temporal workflow bundle built without a server", "Temporal explicitly disabled for this startup smoke only");
     } else if (target === "cli") {
       await waitFor("CLI host socket", () => execNode(socketProbe));
       checks.push("real CLI entrypoint accepted a Unix socket connection as uid10001");
