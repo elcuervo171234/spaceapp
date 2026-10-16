@@ -228,13 +228,33 @@ export function registerSupervisorCases(): void {
           const activities = simpleActivities();
           activities.prepareRoomAgentBackgroundContinuation.mockResolvedValue({ state: "WAITING" });
           activities.settleRoomAgentBackgroundMission.mockResolvedValue(false);
-          await withTemporalWorker(activities, async ({ client, taskQueue }) => {
+          await withTemporalWorker(activities, async ({ env, client, taskQueue }) => {
             const handle = await client.workflow.start("roomAgentSupervisorWorkflow", {
               workflowId: `supervisor:${randomUUID()}`, taskQueue,
               args: [roomAgentSupervisorInputSchema.parse({ roomId: "room:250-polls",
                 monitoringMissionIds: ["mission:still-running"], processedCount: 7 })]
             });
             try {
+              // This is a long-lived supervisor, not a workflow expected to
+              // finish. Advance the genuine test server explicitly, without
+              // .result()'s automatic skipping scope competing with the many
+              // short timers and activity boundaries. Read the first run after
+              // its actual terminal event, then assert all 250 real polls.
+              await eventually(async () => timers(await firstRunHistory(handle)).length > 0);
+              const advance = env.sleep("5 minutes");
+              let deadline: ReturnType<typeof setTimeout> | undefined;
+              try {
+                await Promise.race([advance, new Promise<never>((_, reject) => {
+                  deadline = setTimeout(() => reject(new Error("The Temporal test clock did not advance five minutes within 30 seconds.")), 30_000);
+                })]);
+              } finally {
+                clearTimeout(deadline);
+                // If the bounded clock advance failed, termination below lets
+                // the server finish it; retain a rejection handler for cleanup.
+                void advance.catch(() => undefined);
+              }
+              await eventually(async () => (await firstRunHistory(handle)).events?.some((event: any) =>
+                event.workflowExecutionContinuedAsNewEventAttributes));
               const { carried, history } = await firstContinue(client, handle);
               expect(carried).toEqual(roomAgentSupervisorInputSchema.parse({ roomId: "room:250-polls",
                 pending: [], interrupted: [], monitoringMissionIds: ["mission:still-running"],

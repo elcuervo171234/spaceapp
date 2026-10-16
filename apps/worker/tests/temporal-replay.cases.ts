@@ -16,6 +16,7 @@ const requiredLabels = [
   "roomAgentActionWorkflow", "memoryMaintenanceWorkflow",
   "memoryConsolidationWorkflow", "memoryMutationWorkflow"
 ] as const;
+const productionWorkflowTypes = new Set(requiredLabels.map((label) => label.split(".")[0]!));
 
 async function histories() {
   let names: string[];
@@ -28,17 +29,23 @@ async function histories() {
     if (!names.includes(`${label}.json`)) throw new Error(`Missing required golden history: ${label}.json`);
   }
   return Promise.all(names.map(async (filename) => {
-    const fixture = JSON.parse(await readFile(join(workflowHistoryDirectory, filename), "utf8")) as RecordedWorkflowHistory;
-    if (fixture.format !== 1 || fixture.label !== filename.slice(0, -5) || !fixture.workflowId || !fixture.workflowType) {
-      throw new Error(`Invalid recorded-history envelope: ${filename}`);
+    const expectedWorkflowType = filename.split(/[.-]/)[0]!;
+    try {
+      const fixture = JSON.parse(await readFile(join(workflowHistoryDirectory, filename), "utf8")) as RecordedWorkflowHistory;
+      if (fixture.format !== 1 || fixture.label !== filename.slice(0, -5) || !fixture.workflowId ||
+          fixture.workflowType !== expectedWorkflowType || !productionWorkflowTypes.has(fixture.workflowType)) {
+        throw new Error("Invalid recorded-history envelope or workflow type.");
+      }
+      const history = temporal.api.history.v1.History.fromObject(fixture.history);
+      const started = history.events?.find((event) => event.workflowExecutionStartedEventAttributes)
+        ?.workflowExecutionStartedEventAttributes?.workflowType?.name;
+      if (!history.events?.length || started !== fixture.workflowType) {
+        throw new Error("Missing or mismatched workflow start event.");
+      }
+      return { filename, fixture, history };
+    } catch (cause) {
+      throw new Error(`Cannot load ${filename} (${expectedWorkflowType}).`, { cause });
     }
-    const history = temporal.api.history.v1.History.fromObject(fixture.history);
-    const started = history.events?.find((event) => event.workflowExecutionStartedEventAttributes)
-      ?.workflowExecutionStartedEventAttributes?.workflowType?.name;
-    if (!history.events?.length || started !== fixture.workflowType) {
-      throw new Error(`Missing/mismatched workflow start in ${filename} (${fixture.workflowType}).`);
-    }
-    return { filename, fixture, history };
   }));
 }
 

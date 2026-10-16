@@ -3,6 +3,7 @@ import { Context } from "@temporalio/activity";
 import { DOT_GOAL_SIGNAL, type DummyTurnInput, type DummyTurnResult, type TurnWorkflowResult } from "@space/contracts";
 import { describe, expect, it, vi } from "vitest";
 import type * as activities from "../src/activities.js";
+import { NATIVE_CHAT_TURN_ACTIVITY_TIMEOUT } from "../src/turn-runtime-policy.js";
 import { firstRunHistory, recordWorkflowHistory, withTemporalWorker } from "./support/temporal-sandbox.js";
 
 type History = Awaited<ReturnType<typeof firstRunHistory>>;
@@ -149,9 +150,11 @@ export function registerTurnCases(): void {
         const handle = await client.workflow.start("dotGoalWorkflow", {
           taskQueue, workflowId: `turn-goal-continue-${randomUUID()}`, args: [{ goalId }]
         });
-        // TestWorkflowEnvironment advances durable timers; the workflow is unchanged.
-        expect(await handle.result()).toEqual({ goalStatus: "COMPLETED" });
-        expect(dotGoalStep).toHaveBeenCalledTimes(301);
+        // Observe the first execution's terminal event explicitly. followRuns
+        // is a WorkflowClient.result option, not a WorkflowHandle.result option.
+        await expect(client.workflow.result(handle.workflowId, handle.firstExecutionRunId, {
+          followRuns: false
+        })).rejects.toMatchObject({ name: "WorkflowContinuedAsNewError" });
         const history = await firstRunHistory(handle);
         const continued = history.events?.find((event) =>
           event.workflowExecutionContinuedAsNewEventAttributes
@@ -160,9 +163,12 @@ export function registerTurnCases(): void {
         const payload = continued?.input?.payloads?.[0]?.data;
         expect(payload && JSON.parse(Buffer.from(payload).toString("utf8"))).toEqual({ goalId });
         if (!continued?.newExecutionRunId) throw new Error("Goal did not expose a continued execution run id");
+        expect(await client.workflow.result(handle.workflowId, continued.newExecutionRunId)).toEqual({ goalStatus: "COMPLETED" });
+        expect(dotGoalStep).toHaveBeenCalledTimes(301);
         const nextHistory = await client.workflow.getHandle(handle.workflowId, continued.newExecutionRunId).fetchHistory();
         expect(nextHistory.events?.some((event) => event.workflowExecutionCompletedEventAttributes)).toBe(true);
-        await recordWorkflowHistory("dotGoalWorkflow-continued", handle, { firstRun: true });
+        // The canonical goal fixture covers the timeout branch. This larger
+        // history is asserted live rather than committed as a redundant golden.
       });
     }, 60_000);
 
@@ -265,7 +271,18 @@ export function registerTurnCases(): void {
           expect(stub).toHaveBeenCalledTimes(name === activity ? 1 : 0);
         }
         const scheduled = activityScheduled(await firstRunHistory(handle), activity);
-        expect(seconds(scheduled.startToCloseTimeout)).toBe(timeout);
+        if (branch === "native") {
+          // Production deliberately requests a 100-year horizon. The SDK
+          // 1.24.0 time-skipping test server records a normalized 10-year
+          // ceiling (315360000 seconds), observed in its genuine history.
+          // Guard BOTH values: do not shorten the production policy to make
+          // a test-server assertion pass, or accept an arbitrary short timeout.
+          expect(NATIVE_CHAT_TURN_ACTIVITY_TIMEOUT).toBe("36500 days");
+          expect(timeout).toBe(36_500 * 86_400);
+          expect(seconds(scheduled.startToCloseTimeout)).toBe(3_650 * 86_400);
+        } else {
+          expect(seconds(scheduled.startToCloseTimeout)).toBe(timeout);
+        }
         expect(seconds(scheduled.heartbeatTimeout)).toBe(15);
         expect(scheduled.retryPolicy?.maximumAttempts).toBe(maximumAttempts);
         if (branch === "room") await recordWorkflowHistory("codexAppServerTurnWorkflow", handle);
