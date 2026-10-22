@@ -23,6 +23,7 @@ import {
 export { roomToolbarNeedsSecondRow, paneHeaderNeedsSecondRow, resolvePaneGridPlacements, calculatePaneGridBaseRows } from "./features/pane-grid/pane-grid-layout.js";
 export type { PaneColumnAnchor, PaneColumnAnchorMap } from "./features/pane-grid/pane-grid-layout.js";
 import { LoginScreen } from "./features/auth/LoginScreen.js";
+import { InviteAcceptScreen, readInviteToken } from "./features/auth/InviteAcceptScreen.js";
 // Evaluated at its old position so the stylesheet order is unchanged; the Settings dock renders it.
 import "./features/voice-input/VoiceSettingsCard.js";
 import { clearLegacyCliShortcutUsage } from "./features/terminal-pane/CliShortcutsMenu.js";
@@ -31,6 +32,7 @@ import { useSpaceControlClient } from "./features/room-agent/space-control-clien
 import { useRailOrder } from "./features/ui-theme/use-rail-order.js";
 import { syncRailScale } from "./features/ui-theme/rail-dynamic-scaling.js";
 import { useTouchContextMenu } from "./features/ui-theme/use-touch-context-menu.js";
+import { MobilePaneSwitcher } from "./features/ui-theme/MobilePaneSwitcher.js";
 import { LiveSessionProvider } from "./features/live-pane/LiveSessionProvider.js";
 import { LiveRailSession } from "./features/live-pane/LiveRailSession.js";
 import { useLiveRail } from "./features/live-pane/useLiveRail.js";
@@ -56,7 +58,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Chrome,
-  Eye,
+  Globe,
   Grid2X2,
   Loader2,
   MessageSquare,
@@ -171,10 +173,11 @@ import {
 } from "./features/browser-pane/events.js";
 import { AppVersionMeta, DemoVersionMeta } from "./features/app-version/AppVersionMeta.js";
 import type { CopilotLaunchChoice } from "./features/copilot-kit/CopilotLaunchDialog.js";
-import { JOB_COPILOT_KIND, MAIL_COPILOT_KIND, MARKETING_COPILOT_KIND, type CopilotKind } from "./features/copilot-kit/copilot-kind.js";
+import { APP_STUDIO_KIND, DESIGN_KIND, FREELANCE_COPILOT_KIND, JOB_COPILOT_KIND, MAIL_COPILOT_KIND, MARKETING_COPILOT_KIND, type CopilotKind } from "./features/copilot-kit/copilot-kind.js";
 import { resolveCopilotLaunch } from "./features/copilot-kit/copilot-runtimes.js";
 import { rememberNewPaneAccount } from "./features/cli-accounts/cli-account-memory.js";
 import { forwardCopilotStreamEvents } from "./features/copilot-kit/copilot-stream.js";
+import { forwardNousFocusEvents, useNousFocus } from "./features/nous-focus/NousFocus.js";
 import { HealthDock } from "./features/health/HealthDock.js";
 import {
   AppDiagnosticsGlobalIndicators,
@@ -189,6 +192,7 @@ import { GitBranch } from "./features/ui-theme/app-icons.js";
 import { SettingsDisclosure, SettingsSections } from "./features/settings/SettingsDisclosure.js";
 import { useRoomAgentAttention } from "./features/room-agent/use-room-agent-attention.js";
 import { dispatchNotificationStreamEvent, useNotificationBootstrap } from "./features/notifications/useNotifications.js";
+import { pushNotificationsEnabled, setPushNotifications } from "./features/notifications/desktop-notifications.js";
 import { useNotificationStore, type NotificationNavigator } from "./features/notifications/notification-store.js";
 import { NotificationToastHost } from "./features/notifications/NotificationToastHost.js";
 import { useDocksVisibility } from "./features/docks/use-docks-visibility.js";
@@ -202,6 +206,8 @@ import { usePanesVisibility } from "./features/pane-visibility/use-panes-visibil
 // Evaluated at its old position so the stylesheet order is unchanged; the room toolbar and rail render it.
 import "./features/ui-theme/DesktopNavigation.js";
 import { WorkspaceRoomSettings } from "./features/ui-theme/WorkspaceRoomSettings.js";
+import { LiquidGlassLens } from "./features/ui-theme/LiquidGlassLens.js";
+import { useLiquidGlassTint } from "./features/ui-theme/use-liquid-glass-tint.js";
 import { WorkspacePortalMount } from "./features/ui-theme/WorkspaceSurface.js";
 import "./features/ui-theme/workspace-chrome.css";
 import {
@@ -257,6 +263,8 @@ import { paneRuntimeBlockedReason, roomPaneLimit } from "./pane-runtime-availabi
 import type { OnScreenKeyboardInput } from "./features/osk-keyboard/OnScreenKeyboard.js";
 import { useVibeMusicMount } from "./features/vibe-music/vibe-music-session.js";
 import { StickyNoteLayer, StickyNoteWindow, useStickyNoteWindows } from "./features/clipboard-dock/StickyNoteWindow.js";
+import { usePaneOpener } from "./features/pane-card/pane-opener.js";
+import { useYouTubeFloatRequest } from "./features/pane-card/use-youtube-float-request.js";
 import {
   DesktopWidgetsLayer,
   useDesktopWidgets,
@@ -297,6 +305,7 @@ import {
   warmRoomLimits,
   WARM_ROOM_RUNTIME_POLL_INTERVAL_MS
 } from "./room-runtime-cache.js";
+import { MOBILE_WARM_ROOM_CONNECTED_PANE_LIMIT } from "./warm-room-settings.js";
 import {
   hydrateWarmRoomsWithinWindow,
   readRoomMru,
@@ -307,6 +316,7 @@ import {
 } from "./warm-room-startup.js";
 import { reuseVersionedItems, useStableCallback } from "./render-performance.js";
 import { lazyWithPreload } from "./lazy-with-preload.js";
+import { LazyTaskDock, LazyVaultDock } from "./features/docks/lazy-docks.js";
 import { useUserPreferenceWriteThrough, useUserPreferences } from "./features/user-settings/useUserPreferences.js";
 import { readStoredBoolean } from "./stored-boolean.js";
 import { readStoredSessionString } from "./session-string-storage.js";
@@ -314,6 +324,7 @@ import { useSnipTool } from "./features/snip-tool/useSnipTool.js";
 import { useToolbarPopovers } from "./features/room-toolbar/useToolbarPopovers.js";
 import { buildRoomToolbarActions } from "./features/room-toolbar/room-toolbar-actions.js";
 import { CollapsedRoomRail, type WorkspaceNavigationBinding } from "./features/room-toolbar/CollapsedRoomRail.js";
+import { roomActionFilter, roomRailVisibility } from "./features/rooms-dock/room-share-view.js";
 import { RoomTitleBar } from "./features/room-toolbar/RoomTitleBar.js";
 import { useRoomRename } from "./features/room-toolbar/useRoomRename.js";
 import { useMinimizedPaneBar } from "./features/pane-float/useMinimizedPaneBar.js";
@@ -323,6 +334,7 @@ import { AgentSettingsDock, settingsCardLoadingFallback, type AgentSettingsCards
 import { RoomToolbarActions } from "./features/room-toolbar/RoomToolbarActions.js";
 import { scheduleT3BundlePrefetch } from "./features/t3code-pane/t3code-prefetch.js";
 import { useGatewayCompressionToggle } from "./features/space-gateway/useGatewayCompressionToggle.js";
+import { scheduleSetupOverviewProbe, scheduleStartupBackground } from "./startup-background.js";
 
 const ROOM_PRESENTATION_FAILURE_TIMEOUT_MS = 8_000;
 
@@ -545,12 +557,10 @@ const LazySharedChatDock = lazyWithPreload(() =>
   import("./features/shared-chat/SharedChatDock.js").then((module) => ({ default: module.SharedChatDock })),
   { idle: true }
 );
+const LazyNousDock = lazyWithPreload(() =>
+  import("./features/nous/NousDock.js").then((module) => ({ default: module.NousDock })), { idle: true });
 const LazyClipboardDock = lazyWithPreload(() =>
   import("./features/clipboard-dock/ClipboardDock.js").then((module) => ({ default: module.ClipboardDock })),
-  { idle: true }
-);
-const LazyTaskDock = lazyWithPreload(() =>
-  import("./features/task-dock/TaskDock.js").then((module) => ({ default: module.TaskDock })),
   { idle: true }
 );
 const LazyUiThemeSettingsCard = lazyWithPreload(() =>
@@ -658,11 +668,11 @@ const LazyJobCopilotSettingsCard = lazyWithPreload(() =>
   import("./features/job-apply-pane/JobCopilotSettingsCard.js").then((module) => ({ default: module.JobCopilotSettingsCard })),
   { idle: true }
 );
-const LazyMailCopilotSettingsCard = lazyWithPreload(() =>
-  import("./features/mail-copilot-pane/MailCopilotSettingsCard.js").then((module) => ({ default: module.MailCopilotSettingsCard })),
-  { idle: true }
-);
+const LazyMailCopilotSettingsCard = lazyWithPreload(() => import("./features/mail-copilot-pane/MailCopilotSettingsCard.js").then((module) => ({ default: module.MailCopilotSettingsCard })), { idle: true });
 const LazyMarketingCopilotSettingsCard = lazyWithPreload(() => import("./features/marketing-copilot-pane/MarketingCopilotSettingsCard.js").then((module) => ({ default: module.MarketingCopilotSettingsCard })), { idle: true });
+const LazyFreelanceCopilotSettingsCard = lazyWithPreload(() => import("./features/freelance-copilot-pane/FreelanceCopilotSettingsCard.js").then((module) => ({ default: module.FreelanceCopilotSettingsCard })), { idle: true });
+const LazyDesignSettingsCard = lazyWithPreload(() => import("./features/design-pane/DesignSettingsCard.js").then((module) => ({ default: module.DesignSettingsCard })), { idle: true });
+const LazyAppStudioSettingsCard = lazyWithPreload(() => import("./features/app-studio-pane/AppStudioSettingsCard.js").then((module) => ({ default: module.AppStudioSettingsCard })), { idle: true });
 const sideSurfaceLoadingFallback = <div className="dock-muted-text" role="status">Loading panel…</div>;
 /** The Settings dock's cards, in the dock's order; their declarations above keep the idle preload order. */
 const agentSettingsCards: AgentSettingsCards = {
@@ -685,7 +695,7 @@ const agentSettingsCards: AgentSettingsCards = {
   Dots: LazyDotsSettingsCard,
   JobCopilot: LazyJobCopilotSettingsCard,
   MailCopilot: LazyMailCopilotSettingsCard,
-  MarketingCopilot: LazyMarketingCopilotSettingsCard
+  MarketingCopilot: LazyMarketingCopilotSettingsCard, FreelanceCopilot: LazyFreelanceCopilotSettingsCard, Design: LazyDesignSettingsCard, AppStudio: LazyAppStudioSettingsCard
 };
 
 const toolbarMenuLoadingFallback = <span className="sr-only" role="status">Loading menu…</span>;
@@ -855,10 +865,11 @@ export function App() {
   const [modernAppearance] = useState<ModernAppearance>(() => readModernAppearance(runtime.platform.localStorage));
   const [modernIconPack] = useState<ModernIconPack>(() => readModernIconPack(runtime.platform.localStorage));
   const [uiBackground] = useState<UiBackground>(() => readUiBackground(runtime.platform.localStorage));
+  const [liquidGlassTint, changeLiquidGlassTint] = useLiquidGlassTint(runtime.platform.localStorage);
   const [systemPrefersDark, setSystemPrefersDark] = useState(
     () => typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: dark)").matches
   );
-  const modernColorMode = uiTheme === "codex" || uiTheme === "motion" || uiTheme === "aurora" ? "dark" : resolveModernColorMode(modernAppearance, systemPrefersDark);
+  const modernColorMode = uiTheme === "codex" || uiTheme === "motion" || uiTheme === "aurora" || uiTheme === "jarvis" || uiTheme === "aira" ? "dark" : resolveModernColorMode(modernAppearance, systemPrefersDark);
   useEffect(() => {
     document.documentElement.dataset.interfaceTheme = uiTheme;
     document.documentElement.dataset.uiBackground = uiBackground;
@@ -897,7 +908,7 @@ export function App() {
       html.removeAttribute("data-ui-background");
     };
   }, [modernColorMode, modernIconPack, uiTheme, uiBackground]);
-  const [auth, setAuth] = useState<AuthMe | null>(null);
+  const [auth, setAuth] = useState<AuthMe | null>(null); const [startupReady, setStartupReady] = useState(false);
   const [adminModeRequested, setAdminModeRequestedState] = useState(() => readStoredBoolean(ADMIN_MODE_REQUESTED_STORAGE_KEY));
   const setAdminModeRequested = useCallback((next: boolean | ((current: boolean) => boolean)) => {
     setAdminModeRequestedState((current) => {
@@ -914,15 +925,14 @@ export function App() {
   const [isDemoModeActive, setIsDemoModeActive] = useState(false);
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const voiceSettingsAuthUserIdRef = useRef<string | null>(null);
-
   const toolbarVpn = useToolbarVpn({
-    isAuthenticated: auth?.isAuthenticated,
+    isAuthenticated: Boolean(auth?.isAuthenticated && startupReady),
     onRuntimeSettings: (settings) => setCliRuntimeSettings(settings)
   });
   const { toolbarVpnRoute, vpnCityPending, vpnCityNotice, setVpnCityNotice, vpnCityNoticeRef, rotateVpnCityFromToolbar } = toolbarVpn;
 
   useEffect(() => {
-    const authenticatedUserId = auth?.isAuthenticated ? auth.user?.id ?? "authenticated" : null;
+    const authenticatedUserId = auth?.isAuthenticated && startupReady ? auth.user?.id ?? "authenticated" : null;
     if (!authenticatedUserId) {
       voiceSettingsAuthUserIdRef.current = null;
       return;
@@ -930,7 +940,7 @@ export function App() {
     if (voiceSettingsAuthUserIdRef.current === authenticatedUserId) return;
     voiceSettingsAuthUserIdRef.current = authenticatedUserId;
     void ensureServerSettings();
-  }, [auth?.isAuthenticated, auth?.user?.id, ensureServerSettings]);
+  }, [auth?.isAuthenticated, auth?.user?.id, ensureServerSettings, startupReady]);
   const [authBootstrapError, setAuthBootstrapError] = useState<string | null>(null);
   const [rooms, setRooms] = useState<Room[]>([]);
 
@@ -939,7 +949,7 @@ export function App() {
     if (auth?.user?.role === "ADMIN") scheduleT3BundlePrefetch();
   }, [auth?.user?.role]);
 
-  const adminUsers = useAdminUsers(auth?.user?.role, rooms);
+  const adminUsers = useAdminUsers(auth?.user?.role, rooms, startupReady);
 
   const [roomPaneCounts, setRoomPaneCounts] = useState<Record<string, number>>({});
   const [roomCliActivityCounts, setRoomCliActivityCounts] = useState<Record<string, number>>({});
@@ -1010,7 +1020,6 @@ export function App() {
   }, []);
 
   const isBrowserFullscreen = useBrowserFullscreen();
-  const [isMobilePaneFocusMode, setIsMobilePaneFocusMode] = useState(false);
   const userPreferences = useUserPreferences({ isAuthenticated: auth?.isAuthenticated, restoredDesktopOpen: restoredDock?.desktopOpen, uiTheme });
   const {
     terminalFontSize, setTerminalFontSize, cliImagePreviewLimit, warmRoomEnabled, warmConnectedPaneLimit, suppressNotifications,
@@ -1018,6 +1027,7 @@ export function App() {
     isRoomFocusMode, setIsRoomFocusMode, isRoomToolbarHidden, isDesktopSideSurfaceOpen, setIsDesktopSideSurfaceOpen, projectPresets,
     roomExtraEmptySlots, updateRoomExtraEmptySlots, isRoomWorktreeEnabled, toggleCliFloats, toggleMaskSensitiveData, toggleRoomFocusMode
   } = userPreferences;
+  const deviceWarmPaneLimit = shellMode === "mobile" ? Math.min(warmConnectedPaneLimit, MOBILE_WARM_ROOM_CONNECTED_PANE_LIMIT) : warmConnectedPaneLimit;
   const sideSurfaces = useSideSurfaces({
     shellMode, restoredDock, isDesktopSideSurfaceOpen, setIsDesktopSideSurfaceOpen, runtimeKind,
     isAuthenticated: auth?.isAuthenticated, role: auth?.user?.role, isDockHidden
@@ -1051,7 +1061,7 @@ export function App() {
       setDebugModePending(false);
     }
   }, [debugModePending, isDebugModeActive]);
-  const gatewayCompression = useGatewayCompressionToggle({ enabled: auth?.user?.role === "ADMIN" });
+  const gatewayCompression = useGatewayCompressionToggle({ enabled: auth?.user?.role === "ADMIN" && startupReady });
   const toolbarPopovers = useToolbarPopovers();
   const {
     isThemeMenuOpen, setIsThemeMenuOpen, isPaneLayoutMenuOpen, setIsPaneLayoutMenuOpen, isCollapsedPaneLayoutMenuOpen,
@@ -1137,7 +1147,6 @@ export function App() {
   const [activeRoomEventStreamStatus, setActiveRoomEventStreamStatus] = useState<ActiveRoomEventStreamStatus>("idle");
   const cliMemorySaveModelId = useMemo(() => pickCliMemorySaveModelId(models), [models]);
   const previousShellModeRef = useRef<ShellMode | null>(null);
-  const mobilePaneFocusRoomIdRef = useRef(selectedRoomId);
   const previousSelectedRoomIdRef = useRef<string | null>(null);
   const previousSelectedPaneIdRef = useRef<string | null>(null);
   const selectedRoomIdRef = useRef(selectedRoomId);
@@ -1247,13 +1256,8 @@ export function App() {
       const nextRoom = nextRooms[0] ?? null;
       activateRoom(nextRoom?.id ?? null);
       removeRoomRuntime(missingRoomId);
-      if (nextRoom) {
-        await loadRoomRuntimeRef.current(nextRoom.id);
-        if (!appMountedRef.current) return;
-        setError(`Room ${missingRoomId} no longer exists; switched to ${nextRoom.name}.`);
-        return;
-      }
-      setError(`Room ${missingRoomId} no longer exists.`);
+      // A vanished room switches silently (operator request 2026-10-14): no "no longer exists" notice.
+      if (nextRoom) await loadRoomRuntimeRef.current(nextRoom.id);
     });
 
   useSpaceClipboardCapture(Boolean(auth?.isAuthenticated));
@@ -2099,15 +2103,15 @@ export function App() {
       activeRoomId: selectedRoomId,
       preferredRoomIds,
       previousRoomId: previousWarmRoomIdRef.current,
-      maxAttachedPanes: warmConnectedPaneLimit,
+      maxAttachedPanes: deviceWarmPaneLimit,
       candidates
     });
-  }, [panes, roomRuntimes, rooms, selectedRoomId, warmConnectedPaneLimit, warmRoomEnabled]);
+  }, [panes, roomRuntimes, rooms, selectedRoomId, deviceWarmPaneLimit, warmRoomEnabled]);
   warmRoomIdsRef.current = warmRoomIds;
 
   const warmRoomLimitsForDevice = useMemo(() => warmRoomLimits(
-    warmConnectedPaneLimit
-  ), [warmConnectedPaneLimit]);
+    deviceWarmPaneLimit
+  ), [deviceWarmPaneLimit]);
 
   const warmConnectedPaneTotal = useMemo(() => {
     let total = 0;
@@ -2195,14 +2199,13 @@ export function App() {
     if (ready) notifyRoomTerminalPrefillBarrier(roomId);
   }
 
-  async function recoverMissingRoom(missingRoomId: string) {
+  async function recoverMissingRoom() {
     const roomPayload = await api.rooms({ all: true });
     const nextRoomId = roomPayload.data[0]?.id ?? null;
     setRooms(sortRoomsByOrder(roomPayload.data));
     activateRoom(nextRoomId, { preserveOutgoing: false });
     if (nextRoomId) {
       await loadRoomRuntime(nextRoomId);
-      setError(`Room ${missingRoomId} no longer exists; switched to ${roomPayload.data[0]?.name ?? "the next room"}.`);
       return;
     }
     setPanes([]);
@@ -2210,7 +2213,6 @@ export function App() {
     setTurns([]);
     setRoomEvents([]);
     setSwarmState(await api.swarm());
-    setError(`Room ${missingRoomId} no longer exists.`);
   }
 
   async function refreshRoomEvents(roomId: string) {
@@ -2230,7 +2232,7 @@ export function App() {
     setRoomEvents((current) => mergeSpaceEvents(current, event));
   }, []);
 
-  async function refresh() {
+  async function refresh() { setStartupReady(false);
     try {
       const search = window.location.search;
       if (search) {
@@ -2311,7 +2313,7 @@ export function App() {
       };
     }
     setRooms(sortRoomsByOrder(roomPayload.data));
-    const myRooms = roomPayload.data.filter((room) => !room.ownerUserId || room.ownerUserId === me.user?.id);
+    const myRooms = roomPayload.data.filter((room) => me.user?.role === "USER" || !room.ownerUserId || room.ownerUserId === me.user?.id); // a USER's list is own + shared rooms
     const selectedRoomIsMine = userSelectedRoomId ? myRooms.some((room) => room.id === userSelectedRoomId) : false;
     const selectedRoomStillExists = userSelectedRoomId ? roomPayload.data.some((room) => room.id === userSelectedRoomId) : false;
     const starterRoom = myRooms.find((room) => room.name.toLowerCase() === "getting started")
@@ -2321,26 +2323,24 @@ export function App() {
       ? userSelectedRoomId
       : (defaultFirstRoom?.id ?? null);
     activateRoom(nextRoomId, { preserveOutgoing: selectedRoomStillExists });
-    if (userSelectedRoomId && !selectedRoomStillExists && nextRoomId && roomPayload.data.length > 0) {
-      setError(`Room ${userSelectedRoomId} no longer exists; switched to ${roomPayload.data[0]?.name ?? "the next room"}.`);
-    }
     if (nextRoomId) {
-      // User-approved 2026-08-14: background warm starts IMMEDIATELY (in
-      // parallel with the active room load, after any service restart the
-      // refresh is the trigger) and never blocks the bootstrap — the shell
-      // becomes interactive without waiting for warm hydration.
-      const startBackgroundWarm = () => {
+      // Give the active room its existing attachment/PREFILL barriers before
+      // background terminals compete for its initial render and session reads.
+      const startBackgroundWarm = async () => {
+        if (!(me.settings?.warmRoomEnabled ?? warmRoomEnabled)) return;
         const activeRoom = roomPayload.data.find((room) => room.id === nextRoomId);
         if (activeRoom?.kind === "AGENT_PROOF") {
           return;
         }
+        await waitForRoomTerminalPrefillBarrier(nextRoomId);
+        if (!appMountedRef.current) return;
         const candidateRooms = roomPayload.data.filter((room) => room.kind !== "AGENT_PROOF");
         const validRoomIds = new Set(candidateRooms.map((room) => room.id));
         const hydrationRoomIds = selectWarmHydrationRoomIds({
           roomIds: candidateRooms.map((room) => room.id),
           activeRoomId: nextRoomId,
           mruRoomIds: readRoomMru(runtime.platform.sessionStorage, validRoomIds),
-          maxWarmRooms: warmRoomLimits(warmConnectedPaneLimit).maxRooms
+          maxWarmRooms: warmRoomLimits(me.settings?.warmRoomConnectedPaneLimit ?? warmConnectedPaneLimit).maxRooms
         });
         const hydrateRoomIfNotEmpty = async (roomId: string) => {
           try {
@@ -2364,22 +2364,13 @@ export function App() {
           hydrateRoomIfNotEmpty,
           undefined,
           WARM_ROOM_STARTUP_HYDRATION_CONCURRENCY
-        ).catch(() => undefined).finally(() => {
-          if (!appMountedRef.current) return;
-          const otherRoomIds = candidateRooms
-            .map((room) => room.id)
-            .filter((roomId) => roomId !== nextRoomId);
-          void runWithConcurrency(
-            otherRoomIds.map((roomId) => () => hydrateRoomIfNotEmpty(roomId)),
-            4
-          ).catch(() => undefined);
-        });
+        ).catch(() => undefined);
       };
-      startBackgroundWarm();
       await loadRoomRuntime(nextRoomId);
       if (!appMountedRef.current) return;
       await waitForRoomTerminalBarrier(nextRoomId);
       if (!appMountedRef.current) return;
+      void startBackgroundWarm();
     } else {
       setPanes([]);
       setSelectedPaneId(null);
@@ -2388,32 +2379,31 @@ export function App() {
       setSwarmState(await api.swarm());
     }
 
+    setStartupReady(true);
     // Keep only shell-critical status reads in the startup path. Provider and
     // health catalogs load when their dock is opened.
     setError((current) => (isTransientUpstreamErrorMessage(current) ? null : current));
 
-    void Promise.allSettled([api.readyz(), api.admin()]).then(([readyResult, adminResult]) => {
-      if (!appMountedRef.current) return;
-      if (readyResult.status === "fulfilled") setReadiness(readyResult.value);
-      if (adminResult.status === "fulfilled") {
-        notices.applyStorageWarning(adminResult.value.storageWarning);
-      }
-    });
+    scheduleStartupBackground(() => {
+      void Promise.allSettled([api.readyz(), api.admin()]).then(([readyResult, adminResult]) => {
+        if (!appMountedRef.current) return;
+        if (readyResult.status === "fulfilled") setReadiness(readyResult.value);
+        if (adminResult.status === "fulfilled") {
+          notices.applyStorageWarning(adminResult.value.storageWarning);
+        }
+      });
+    }, () => appMountedRef.current);
 
     if (me.user?.role === "ADMIN") {
-      void api.setupOverview()
-        .then((overview) => {
-          if (appMountedRef.current && !overview.isComplete) {
-            setupFromWorkspace.current = false;
-            setIsSetupConnectionsOpen(true);
-          }
-        })
-        .catch(() => {
-          // Onboarding discovery must not delay or block room hydration, but the
-          // owner should know setup status is unknown rather than see nothing.
-          // It never replaces an error from an action the owner just took.
-          if (appMountedRef.current) setError((current) => current ?? "Setup status could not be loaded. Open Setup wizard from the room toolbar to finish setup.");
-        });
+      scheduleSetupOverviewProbe({
+        isMounted: () => appMountedRef.current,
+        loadOverview: api.setupOverview,
+        onIncomplete: () => {
+          setupFromWorkspace.current = false;
+          setIsSetupConnectionsOpen(true);
+        },
+        onError: () => setError((current) => current ?? "Setup status could not be loaded. Open Setup wizard from the room toolbar to finish setup.")
+      });
     }
   }
 
@@ -2672,7 +2662,7 @@ export function App() {
           if (!appMountedRef.current) return;
           if (isRoomNotFoundError(err, roomId)) {
             if (roomId === selectedRoomIdRef.current) {
-              recoverMissingRoom(roomId).catch((recoveryError: unknown) =>
+              recoverMissingRoom().catch((recoveryError: unknown) =>
                 setError(recoveryError instanceof Error ? recoveryError.message : "Room recovery failed")
               );
             } else {
@@ -2732,7 +2722,17 @@ export function App() {
   }
 
   async function signOut() {
-    await api.logout();
+    // The unlocked Vault keys go with the session (they live for the tab, not the dock); loaded only with the Vault.
+    await import("./features/vault/vault-session.js").then((vault) => vault.lockVaultSession("SIGN_OUT")).catch(() => undefined);
+    // A signed-out phone must not keep showing this account's pushes.
+    if (pushNotificationsEnabled()) await setPushNotifications(false, api).catch(() => undefined);
+    try {
+      await api.logout();
+    } catch (error) {
+      // The server ended the session but could not save the logout (LOGOUT_NOT_SAVED): say so instead of reloading.
+      setError(error instanceof Error ? error.message : "The logout could not be saved.");
+      return;
+    }
     if (runtimeKind === "demo") {
       setAuth(await api.me());
       setAppView("workspace");
@@ -2896,7 +2896,7 @@ export function App() {
     await addRoomPanes(selectedRoomId, { panes: newPanes });
   }
 
-  // Copilot panes (Job, Mail, Marketing): the operator picks the agent and account once (Claude Code recommended); later panes
+  // Copilot panes (Job, Mail, Marketing, Freelance): the operator picks the agent and account once (Claude Code recommended); later panes
   // open with it on every device. The dialog shows again when "ask every time" is on or the saved CLI is not ready.
   function copilotPaneItems(kind: CopilotKind, count: number, choice: CopilotLaunchChoice) {
     return Array.from({ length: count }, () => ({
@@ -3220,7 +3220,7 @@ export function App() {
   });
 
   useEffect(() => {
-    if (!isAdminMode && selectedRoomId && rooms.length > 0) {
+    if (!isAdminMode && selectedRoomId && rooms.length > 0 && auth?.user?.role !== "USER") {
       const currentRoom = rooms.find((r) => r.id === selectedRoomId);
       if (currentRoom && currentRoom.ownerUserId && currentRoom.ownerUserId !== auth?.user?.id) {
         const myFirstRoom = rooms.find((r) => !r.ownerUserId || r.ownerUserId === auth?.user?.id);
@@ -3264,7 +3264,7 @@ export function App() {
     const deletedIds = new Set(roomIds);
     const deletedRooms = rooms.filter((room) => deletedIds.has(room.id));
     const nextRooms = rooms.filter((room) => !deletedIds.has(room.id));
-    const candidateRooms = !isAdminMode ? nextRooms.filter((r) => !r.ownerUserId || r.ownerUserId === auth?.user?.id) : nextRooms;
+    const candidateRooms = !isAdminMode && auth?.user?.role !== "USER" ? nextRooms.filter((r) => !r.ownerUserId || r.ownerUserId === auth?.user?.id) : nextRooms;
     const selectedDeleted = selectedRoomId !== null && deletedIds.has(selectedRoomId);
     const nextSelectedRoomId = selectedDeleted ? candidateRooms[0]?.id ?? null : selectedRoomId;
     setDeletePendingRoomId(roomIds[0]!);
@@ -3327,17 +3327,18 @@ export function App() {
     setPaneMoveDialog((current) => (current?.pending ? current : null));
   }
 
+  async function movePaneToRoom(paneId: string, targetRoomId: string) {
+    const move = await api.movePane(paneId, targetRoomId);
+    if (selectedRoomId === move.sourceRoomId) await loadRoomRuntime(move.sourceRoomId);
+    setPaneMoveNotice(`Moved "${move.sourcePane.title}" to "${rooms.find((room) => room.id === targetRoomId)?.name ?? "the selected room"}".`);
+  }
+
   async function submitPaneMove() {
     if (!paneMoveDialog || paneMoveDialog.pending) return;
-    const targetRoomName = rooms.find((room) => room.id === paneMoveDialog.targetRoomId)?.name ?? "the selected room";
     setPaneMoveDialog((current) => (current ? { ...current, pending: true, error: null } : current));
     try {
-      const move = await api.movePane(paneMoveDialog.pane.id, paneMoveDialog.targetRoomId);
-      if (selectedRoomId === move.sourceRoomId) {
-        await loadRoomRuntime(move.sourceRoomId);
-      }
+      await movePaneToRoom(paneMoveDialog.pane.id, paneMoveDialog.targetRoomId);
       setPaneMoveDialog(null);
-      setPaneMoveNotice(`Moved "${move.sourcePane.title}" to "${targetRoomName}".`);
     } catch (err) {
       setPaneMoveDialog((current) =>
         current
@@ -3351,7 +3352,7 @@ export function App() {
     }
   }
 
-  async function addPane(mode: Pane["mode"], youtubeUrl?: string, count = 1) {
+  async function addPane(mode: Pane["mode"], youtubeUrl?: string, count = 1, float = false) {
     const roomId = selectedRoomIdRef.current;
     if (
       !roomId ||
@@ -3415,6 +3416,8 @@ export function App() {
         if (mode === "YOUTUBE" && youtubeUrl) {
           registerYouTubeBrowseIntent(pane.id, youtubeUrl);
         }
+        // Batched with setPanes below, so the pane's first frame is already the float.
+        if (mode === "YOUTUBE" && float) toggleYouTubeFloating(pane.id, true);
         if (selectedRoomIdRef.current === roomId) {
           setPanes((current) => [...current.filter((candidate) => candidate.id !== pane.id), pane]);
           setSelectedPaneId(pane.id);
@@ -3703,7 +3706,6 @@ export function App() {
       candidate.id === pane.id ? { isMinimized: true, isMaximized: false } : null
     );
     setSelectedPaneId(nextPane?.id ?? null);
-    setIsMobilePaneFocusMode(false);
     // With the bar parked behind the float toggle, focus goes to whichever affordance is visible.
     window.requestAnimationFrame(() => {
       const restoreChip = minimizedPaneRestoreRefs.current.get(pane.id);
@@ -3733,7 +3735,6 @@ export function App() {
     });
     pendingPaneHeaderFocusIdRef.current = pane.id;
     setSelectedPaneId(pane.id);
-    setIsMobilePaneFocusMode(false);
     const results = await Promise.allSettled([
       api.updatePane(pane.id, { isMinimized: false, isMaximized: false }),
       ...otherMaximized.map((candidate) => api.updatePane(candidate.id, { isMaximized: false }))
@@ -3778,7 +3779,6 @@ export function App() {
       if (allWereMinimized) return optimisticVisible[0]?.id ?? null;
       return optimisticVisible.some((pane) => pane.id === current) ? current : optimisticVisible[0]?.id ?? null;
     });
-    setIsMobilePaneFocusMode(false);
     const results = await Promise.allSettled(
       candidates.map((pane) => api.updatePane(pane.id, { isMinimized: false, isMaximized: false }))
     );
@@ -3817,7 +3817,6 @@ export function App() {
       candidateIds.has(pane.id) ? { isMinimized: true, isMaximized: false } : null
     );
     setSelectedPaneId(null);
-    setIsMobilePaneFocusMode(false);
     const results = await Promise.allSettled(
       candidates.map((pane) => api.updatePane(pane.id, { isMinimized: true }))
     );
@@ -3907,13 +3906,13 @@ export function App() {
       return new Set();
     }
   });
-  const toggleYouTubeFloating = useCallback((paneId: string) => {
+  const toggleYouTubeFloating = useCallback((paneId: string, float?: boolean) => {
     setFloatingYouTubePaneIds((prev) => {
       const next = new Set(prev);
-      if (next.has(paneId)) {
-        next.delete(paneId);
-      } else {
+      if (float ?? !next.has(paneId)) {
         next.add(paneId);
+      } else {
+        next.delete(paneId);
       }
       try {
         localStorage.setItem("space.youtube.floating.panes.v1", JSON.stringify(Array.from(next)));
@@ -3921,6 +3920,8 @@ export function App() {
       return next;
     });
   }, []);
+  useYouTubeFloatRequest({ panes, activeRoomId: activeRoom?.id ?? null, floatingIds: floatingYouTubePaneIds, toggle: toggleYouTubeFloating,
+    open: () => void addPane("YOUTUBE", undefined, 1, true) });
   const visiblePanes = useMemo(() => {
     const unfiltered = panes.filter((pane) => (shellMode === "mobile" || !pane.isMinimized) && !floatingYouTubePaneIds.has(pane.id));
     return activeRoomCategoryFilter
@@ -3928,7 +3929,7 @@ export function App() {
       : unfiltered;
   }, [panes, activeRoomCategoryFilter, floatingYouTubePaneIds, shellMode]);
   const minimizedPaneBar = useMinimizedPaneBar({ panes, shellMode, paneCompletionLifecycle });
-  const { minimizedPanes, minimizedPaneRunningCount, showMinimizedBar, showMinimizedBarToggle, setMinimizedBarExpanded } = minimizedPaneBar;
+  const { minimizedCount, minimizedPaneRunningCount, showMinimizedBar, showMinimizedBarToggle, setMinimizedBarExpanded } = minimizedPaneBar;
 
   const activePane = useMemo(
     () => {
@@ -3990,7 +3991,7 @@ export function App() {
   }
 
   function routeCliShortcut(command: OskCliCommand): boolean {
-    if (activePane?.mode === "CHAT" && (command.id === "plan_progress" || command.id === "deploy" || command.id === "clean_worktree" || command.id === "scroll_top" || command.id === "scroll_bottom")) {
+    if (activePane?.mode === "CHAT" && (command.id === "plan_progress" || command.id === "deploy" || command.id === "promote" || command.id === "clean_worktree" || command.id === "scroll_top" || command.id === "scroll_bottom")) {
       setIsOskKeyboardOpen(false);
       dispatchAgentPaneActionEvent({ paneId: activePane.id, action: command.id });
       return true;
@@ -4087,7 +4088,7 @@ export function App() {
       void requestRoomRefreshRef.current(activeRoom.id, category, reason).catch((refreshError: unknown) => {
         if (!appMountedRef.current || selectedRoomIdRef.current !== activeRoom.id) return;
         if (isRoomNotFoundError(refreshError, activeRoom.id)) {
-          void recoverMissingRoom(activeRoom.id);
+          void recoverMissingRoom();
           return;
         }
         if (!isTransientUpstreamRuntimeError(refreshError)) {
@@ -4104,7 +4105,9 @@ export function App() {
       if (event.type === "PANE_UPDATED" && event.payload.roomPaneLayoutChanged === true) {
         void requestRoomCatalogRefreshRef.current();
       }
-      if (event.type === "ROOM_WATCHDOG_ALERT") {
+      // A replayed alert is history: every room switch or reconnect replays the room's last 50 events, which brought a
+      // dismissed alert back again and again. Its URGENT notification stays in the Notifications dock.
+      if (event.type === "ROOM_WATCHDOG_ALERT" && !replaying) {
         notices.addWatchdogAlert({ id: event.id, message: event.message, timestamp: event.createdAt });
       }
       for (const category of roomRefreshCategoriesForEvent(event.type)) {
@@ -4171,7 +4174,7 @@ export function App() {
       } catch (refreshError) {
         if (disposed || !appMountedRef.current || selectedRoomIdRef.current !== activeRoom.id) return;
         if (isRoomNotFoundError(refreshError, activeRoom.id)) {
-          void recoverMissingRoom(activeRoom.id);
+          void recoverMissingRoom();
           return;
         }
         if (!isTransientUpstreamRuntimeError(refreshError)) {
@@ -4233,14 +4236,14 @@ export function App() {
       if (handledBrowserHandoffEventIdsRef.current.size > 500) handledBrowserHandoffEventIdsRef.current.clear();
       void api.browserHandoff(event.paneId)
         .then(async ({ handoff }) => {
-          if (handoff.status !== "REQUESTED") return;
+          if (handoff?.status !== "REQUESTED") return;
           activateRoom(handoff.roomId);
           await loadRoomRuntimeRef.current(handoff.roomId);
           setSelectedPaneId(handoff.paneId);
           setPendingBrowserHandoffPaneId(handoff.paneId);
         })
         .catch((error: unknown) => {
-          // A closed pane (409) or a handoff that no longer exists (404) never comes back; only retry transient failures.
+          // A closed (409) or deleted (404) pane never comes back; only retry transient failures.
           if (error instanceof SpaceApiError && (error.status === 404 || error.status === 409)) return;
           handledBrowserHandoffEventIdsRef.current.delete(event.id);
         });
@@ -4259,8 +4262,8 @@ export function App() {
     source.addEventListener("ROOM_CREATED", handleRoomCreated as EventListener);
     source.addEventListener("BROWSER_HANDOFF_REQUESTED", handleBrowserHandoff as EventListener);
     source.addEventListener("CAPABILITY_STATUS_CHANGED", handleCapabilityStatusChanged as EventListener);
-    // Job, Mail and Marketing Copilot activity reaches its pane through a window event (copilot-kit/copilot-stream.ts).
-    const stopCopilotStreams = forwardCopilotStreamEvents(source);
+    // Copilot activity (copilot-kit/copilot-stream.ts) and Nous focus requests (nous-focus) reach the page as window events.
+    const stopWindowStreams = [forwardCopilotStreamEvents(source), forwardNousFocusEvents(source)];
     // Notifications travel as ids only; the store reads the owner's records and delivers the new ones.
     const handleNotification = (message: MessageEvent<string>) => {
       const event = parseStreamEvent(message.data);
@@ -4275,7 +4278,7 @@ export function App() {
       source.removeEventListener("ROOM_CREATED", handleRoomCreated as EventListener);
       source.removeEventListener("BROWSER_HANDOFF_REQUESTED", handleBrowserHandoff as EventListener);
       source.removeEventListener("CAPABILITY_STATUS_CHANGED", handleCapabilityStatusChanged as EventListener);
-      stopCopilotStreams();
+      for (const stop of stopWindowStreams) stop();
       source.removeEventListener("NOTIFICATION_CREATED", handleNotification as EventListener);
       source.removeEventListener("NOTIFICATION_UPDATED", handleNotification as EventListener);
       source.close();
@@ -4341,7 +4344,7 @@ export function App() {
   }, [panes, pendingBrowserHandoffPaneId]);
   const userNavigableRooms = useMemo(() => {
     if (!isAdminMode || adminRoomFilterMode === "mine") {
-      return rooms.filter((r) => !r.ownerUserId || r.ownerUserId === auth?.user?.id);
+      return rooms.filter((r) => auth?.user?.role === "USER" || !r.ownerUserId || r.ownerUserId === auth?.user?.id);
     }
     if (adminRoomFilterMode === "user" && adminSelectedUserId) {
       return rooms.filter((r) => r.ownerUserId === adminSelectedUserId);
@@ -4541,7 +4544,7 @@ export function App() {
     window.addEventListener("space-pane-control-action", handlePaneControlAction);
     return () => window.removeEventListener("space-pane-control-action", handlePaneControlAction);
   }, [panes, selectedRoomId]);
-  useRailOrder(collapsedToolbarRef, Boolean(auth?.isAuthenticated && setupStatus) && appView === "workspace" && !(shellMode === "mobile" && isMobilePaneFocusMode && activePane) && isRoomToolbarHidden && !showOverlaySideSurface && !systemAnalyticsTab);
+  useRailOrder(collapsedToolbarRef, Boolean(auth?.isAuthenticated && setupStatus) && appView === "workspace" && isRoomToolbarHidden && !showOverlaySideSurface && !systemAnalyticsTab);
   useLayoutEffect(() => {
     const element = collapsedToolbarRef.current;
     if (!element) return;
@@ -4593,7 +4596,7 @@ export function App() {
     && isSideSurfaceOpen;
 
   useEffect(() => {
-    if (!isRoomsSurfaceVisible) return;
+    if (!isRoomsSurfaceVisible || !startupReady) return;
     let disposed = false;
     let requestPending = false;
 
@@ -4634,9 +4637,9 @@ export function App() {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [isRoomsSurfaceVisible]);
+  }, [isRoomsSurfaceVisible, startupReady]);
 
-  useSideSurfaceEffects(sideSurfaces, { runtimeKind, isAuthenticated: auth?.isAuthenticated, role: auth?.user?.role, userId: auth?.user?.id });
+  useSideSurfaceEffects(sideSurfaces, { runtimeKind, isAuthenticated: auth?.isAuthenticated, role: auth?.user?.role, userId: auth?.user?.id, startupReady });
 
   async function growPaneColumnSpan(pane: Pane) {
     if (shellMode === "mobile") return;
@@ -4862,7 +4865,7 @@ export function App() {
   }
 
   // Room Agent attention keeps the toolbar count; its desktop alerts arrive as Space notifications now.
-  const roomAgentAttention = useRoomAgentAttention(Boolean(auth?.user));
+  const roomAgentAttention = useRoomAgentAttention(Boolean(auth?.user) && startupReady);
   // Space notifications: a click opens the room, the pane and the surface the notification points at; panes get the target.
   const notificationStore = useNotificationStore();
   const navigateToNotification = useCallback<NotificationNavigator>((link) => {
@@ -4877,7 +4880,8 @@ export function App() {
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activateRoom, sideSurfaces.openSideSurface]);
-  useNotificationBootstrap(auth?.user?.id ?? null, navigateToNotification);
+  useNotificationBootstrap(startupReady ? auth?.user?.id ?? null : null, navigateToNotification);
+  const nousFocus = useNousFocus({ userId: auth?.user?.id ?? null, rooms, panes, selectedRoomId, selectedPaneId, selectRoom, selectPane: setSelectedPaneId, toggleMaximize, restorePane, sideSurfaces });
   const roomToolbarActions = useMemo<IconToolbarAction[]>(
     () => {
       return buildRoomToolbarActions({
@@ -4894,7 +4898,7 @@ export function App() {
         },
         create: {
           isCodexEnabled, cliPaneCreationPending, toggleChatLauncher, toggleCliLauncher, addRootAdminPane, addPane, addFilesPane,
-          addDatabasesPane, addDemosPane, addT3CodePane, addJobApplyPane, addMailCopilotPane, addMarketingCopilotPane: () => addCopilotPane(MARKETING_COPILOT_KIND), addLivePane
+          addDatabasesPane, addDemosPane, addT3CodePane, addJobApplyPane, addMailCopilotPane, addMarketingCopilotPane: () => addCopilotPane(MARKETING_COPILOT_KIND), addFreelanceCopilotPane: () => addCopilotPane(FREELANCE_COPILOT_KIND), addDesignPane: () => addCopilotPane(DESIGN_KIND), addAppStudioPane: () => addCopilotPane(APP_STUDIO_KIND), addLivePane
         },
         tools: { desktopWidgets, openStickyNote, isBrowserFullscreen, snip: snipTool, captureRoomScreen, reloadRoomWindow, vpn: toolbarVpn },
         workspace: {
@@ -4972,12 +4976,12 @@ export function App() {
     hiddenStorageKey: roomToolbarStorageKeys.hidden,
     orderStorageKey: roomToolbarStorageKeys.order
   });
-  const roomToolbarRenderedActions = shellMode === "mobile"
+  const roomToolbarRenderedActions = (shellMode === "mobile"
     ? roomToolbar.visibleActions.filter((action) => action.id !== "pane-layout" && action.id !== "pane-span-all")
-    : roomToolbar.visibleActions;
-  const availableRoomActions = shellMode === "mobile"
+    : roomToolbar.visibleActions).filter(roomActionFilter(presentationRoom));
+  const availableRoomActions = (shellMode === "mobile"
     ? roomToolbar.orderedActions.filter((action) => action.id !== "pane-layout" && action.id !== "pane-span-all" && action.id !== "sticky-note" && !action.id.startsWith("widget-"))
-    : roomToolbar.orderedActions;
+    : roomToolbar.orderedActions).filter(roomActionFilter(presentationRoom));
   const roomToolbarTouchContext = useTouchContextMenu(
     (source) => source instanceof Element && !source.closest(".desktop-menu-drag-handle, .cli-launcher-drag-handle")
       ? source.closest<HTMLElement>("button[data-action-id]")
@@ -5068,7 +5072,7 @@ export function App() {
       setIsServerActionsMenuOpen(false);
       if (isAdminMode && ["health", "streaming"].includes(activeSideSurface)) setIsDesktopSideSurfaceOpen(false);
     }
-  }] as IconToolbarAction[] : []));
+  }] as IconToolbarAction[] : [])).filter(roomActionFilter(presentationRoom));
   const workspaceNavigationActions: IconToolbarAction[] = [...desktopToolbarActions, {
     id: "workspace-room", label: "Room", title: "Room settings", ariaLabel: "Room", icon: PanelTopOpen,
     onClick: () => undefined
@@ -5135,7 +5139,7 @@ export function App() {
       else if (action.id === "add-t3code") void addT3CodePane(count);
       else if (action.id === "add-jobs") void addJobApplyPane(count);
       else if (action.id === "add-mail") void addMailCopilotPane(count);
-      else if (action.id === "add-marketing") void addCopilotPane(MARKETING_COPILOT_KIND, count);
+      else if (action.id === "add-marketing" || action.id === "add-freelance" || action.id === "add-design" || action.id === "add-app-studio") void addCopilotPane(action.id === "add-marketing" ? MARKETING_COPILOT_KIND : action.id === "add-design" ? DESIGN_KIND : action.id === "add-app-studio" ? APP_STUDIO_KIND : FREELANCE_COPILOT_KIND, count);
       else if (action.id === "add-harness") void addHarnessPane(count);
       else action.onClick();
     }
@@ -5342,16 +5346,6 @@ export function App() {
       window.removeEventListener("resize", measureToolbar);
     };
   }, [activeRoom?.name, isRoomRenameOpen, isRoomToolbarHidden, roomToolbarRenderedActions.length, shellMode, uiTheme]);
-  function updateMobilePaneFocusMode(nextFocused: boolean) {
-    if (shellMode !== "mobile") return;
-    setIsCompactSideSurfaceOpen(false);
-    setIsThemeMenuOpen(false);
-    setIsPaneLayoutMenuOpen(false);
-    setIsPaneSpanAllMenuOpen(false);
-    setIsWorkspaceTextSizePickerOpen(false);
-    roomToolbar.closeMenus();
-    setIsMobilePaneFocusMode(nextFocused);
-  }
   useDismissibleToolbarLayer({
     containerRef: boardToolbarRef,
     active: !isRoomToolbarHidden && (isThemeMenuOpen || isPaneLayoutMenuOpen || isPaneSpanAllMenuOpen || roomToolbar.isOverflowOpen || Boolean(roomToolbar.actionMenu)),
@@ -5393,14 +5387,7 @@ export function App() {
     if (!selectedRoomId && isRoomFocusMode) setIsRoomFocusMode(false);
   }, [isRoomFocusMode, selectedRoomId]);
   useEffect(() => {
-    const didRoomChange = mobilePaneFocusRoomIdRef.current !== selectedRoomId;
-    mobilePaneFocusRoomIdRef.current = selectedRoomId;
-    if ((didRoomChange || shellMode !== "mobile" || !activePane) && isMobilePaneFocusMode) {
-      setIsMobilePaneFocusMode(false);
-    }
-  }, [activePane, isMobilePaneFocusMode, selectedRoomId, shellMode]);
-  useEffect(() => {
-    if (!auth?.isAuthenticated) {
+    if (!auth?.isAuthenticated || !startupReady) {
       setCodexEnvironmentSummary(null);
       return;
     }
@@ -5429,17 +5416,18 @@ export function App() {
     const handleAppResumed = () => {
       void loadCodexEnvironmentSummary();
     };
-    void loadCodexEnvironmentSummary();
+    const startupTimer = scheduleStartupBackground(() => void loadCodexEnvironmentSummary());
     const interval = window.setInterval(() => void loadCodexEnvironmentSummary(), 30000);
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("space:app-resumed", handleAppResumed);
     return () => {
       disposed = true;
+      window.clearTimeout(startupTimer);
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("space:app-resumed", handleAppResumed);
     };
-  }, [auth?.isAuthenticated]);
+  }, [auth?.isAuthenticated, startupReady]);
   useEffect(() => {
     if (previousShellModeRef.current === null) {
       previousShellModeRef.current = shellMode;
@@ -5510,21 +5498,17 @@ export function App() {
       await restorePane(pane);
     } else {
       setSelectedPaneId(pane.id);
-      setIsMobilePaneFocusMode(false);
       pendingPaneHeaderFocusIdRef.current = pane.id;
     }
   });
-  const roomAgentOnOpenPane = useStableCallback((paneId: string) => {
-    const pane = panes.find((candidate) => candidate.id === paneId);
-    if (pane) void paneCardOnOpenExisting(pane);
-  });
+  // Room Agent links and a plan's "Open pane" (Clipboard dock, Open plans) open like an Agents Dashboard entry.
+  const roomAgentOnOpenPane = usePaneOpener(() => panesRef.current, paneCardOnOpenExisting, setError);
   const paneCardOnClose = useStableCallback(closePane);
   const paneCardOnMaximize = useStableCallback(toggleMaximize);
   const paneCardOnRestoreLayout = useStableCallback(() => {
     void applyPaneLayoutPreset(null);
   });
   const paneCardOnMinimize = useStableCallback(minimizePane);
-  const paneCardOnMobilePaneFocusChange = useStableCallback(updateMobilePaneFocusMode);
   const paneCardOnGrowColumnSpan = useStableCallback(growPaneColumnSpan);
   const paneCardOnResetColumnSpan = useStableCallback(resetPaneColumnSpan);
   const paneCardOnToggleColumnSpan = useStableCallback(togglePaneColumnSpan);
@@ -5556,6 +5540,7 @@ export function App() {
     [visiblePanes, selectedPaneId]
   );
   const paneCardOnFullscreenNavigate = useStableCallback(navigateFullscreenPane);
+  const selectMobilePane = useStableCallback((paneId: string) => { setSelectedPaneId(paneId); commitPaneCompletionLifecycle(acknowledgePaneCompletion(paneCompletionLifecycleRef.current, paneId)); });
 
   async function captureRoomScreen() {
     if (!activeRoom || isCapturingScreenRef.current) return;
@@ -5783,7 +5768,7 @@ export function App() {
 
   const { entries: filteredRoomEntries, isRoomListFiltered } = selectRoomEntries({
     rooms, selectedRoomId, panes, roomRuntimes, completions: paneCompletionLifecycle.panes, roomCliActivityCounts,
-    isAdminMode, userId: auth?.user?.id, dock: roomsDock, userEmailById: adminUsers.userEmailById, notificationRooms: notificationStore.pending.byRoom });
+    isAdminMode, userId: auth?.user?.id, dock: roomsDock, userEmailById: adminUsers.userEmailById, notificationRooms: notificationStore.pending.byRoom, listsEveryRoom: auth?.user?.role === "USER" });
   const roomsSurfaceContent = (
     <RoomsDockPanel
       dock={roomsDock}
@@ -5795,16 +5780,11 @@ export function App() {
       actions={{
         createRoom, roomCreationPending, selectRoom, requestRoomDelete, requestTestRoomsDelete, deletePendingRoomId, setSelectedPaneId, addFilesPane, addRootAdminPane,
         isRoomWorktreeEnabled, setRoomWorktreeEnabled: userPreferences.setRoomWorktreeEnabled, projectPresets, reportError: setError,
-        roomDeleteConfirmDialog: roomDeleteConfirm.confirmDialog
+        roomDeleteConfirmDialog: roomDeleteConfirm.confirmDialog, movePaneToRoom
       }}
-      composer={{ preparingRoomId, presentationPanes, presentationRoom, addRoomPanes, openSettingsSurface, modernColorMode }}
+      composer={{ preparingRoomId, presentationPanes, presentationRoom, addRoomPanes, openSettingsSurface }}
     />
   );
-
-  function resumeAgentSessionCodexThread(threadId: string) {
-    if (!activePane || !isCodexEnabled) return;
-    dispatchAgentPaneAction(activePane.id, { action: "open_thread", threadId });
-  }
 
   async function resumeAgentSession(item: AgentSessionHistoryItem): Promise<string | null> {
     if (!selectedRoomId) return "Open a room first to resume sessions.";
@@ -5890,6 +5870,8 @@ export function App() {
         currentBackground={uiBackground}
         currentIconPack={modernIconPack}
         currentUiTheme={uiTheme}
+        currentGlassTint={liquidGlassTint}
+        onGlassTintChange={changeLiquidGlassTint}
         isCodexEnabled={isCodexEnabled}
         canManageCliRuntimes={auth?.user?.role === "ADMIN"}
         canManageDiagnostics={auth?.user?.role === "ADMIN"}
@@ -5943,6 +5925,8 @@ export function App() {
       <LazyAgentFilesDock activeRoom={activeRoom} refreshKey={latestArtifactEventId} paneTitles={agentFilesPaneTitles} />
     ) : surface === "shared-chat" ? (
       <LazySharedChatDock canRun={auth?.user?.role === "ADMIN" || auth?.user?.role === "OPERATOR"} />
+    ) : surface === "nous" ? (
+      <LazyNousDock canRun={auth?.user?.role === "ADMIN" || auth?.user?.role === "OPERATOR"} />
     ) : surface === "clipboard" ? (
       <LazyClipboardDock
         canInsert={activePane?.mode === "CHAT" || activePane?.mode === "TERMINAL"}
@@ -5959,9 +5943,10 @@ export function App() {
       <LazyTaskDock
         canInsert={activePane?.mode === "CHAT" || activePane?.mode === "TERMINAL"}
         activePaneLabel={activePane ? displayPaneTitle(activePane) : null}
+        activeCliPaneId={activePane?.mode === "TERMINAL" ? activePane.id : null}
         onInsert={insertTaskItem}
       />
-    ) : surface === "links" ? (
+    ) : surface === "vault" ? <LazyVaultDock /> : surface === "links" ? (
       <LinksPanel onOpen={link => {
         if (onNavigate && link.openMode !== "NEW_TAB" && !isYouTubeUrl(link.url)) {
           setWorkspaceUserLink(link);
@@ -6049,6 +6034,20 @@ export function App() {
     );
   }
 
+  const inviteToken = auth.isAuthenticated ? null : readInviteToken(window.location);
+  if (inviteToken) {
+    return (
+      <AppIconProvider pack={modernIconPack}>
+        <InviteAcceptScreen
+          token={inviteToken}
+          colorMode={uiTheme !== "classic" ? modernColorMode : null}
+          modern={uiTheme !== "classic"}
+          onLogin={handleLogin}
+        />
+      </AppIconProvider>
+    );
+  }
+
   if (!auth.isAuthenticated) {
     return (
       <AppIconProvider pack={modernIconPack}>
@@ -6128,7 +6127,7 @@ export function App() {
     />
   );
 
-  const isHeaderDockActive = !isRoomToolbarHidden && !(shellMode === "mobile" && isMobilePaneFocusMode && Boolean(activePane));
+  const isHeaderDockActive = !isRoomToolbarHidden;
 
   const desktopWidgetsLayer = shellMode === "mobile" ? null : (
     <DesktopWidgetsLayer
@@ -6185,7 +6184,7 @@ export function App() {
             className={
               uiTheme === "codex"
                 ? "modern-theme-page codex-theme-page"
-                : uiTheme === "motion" || uiTheme === "aurora"
+                : uiTheme === "motion" || uiTheme === "aurora" || uiTheme === "liquid-glass" || uiTheme === "jarvis" || uiTheme === "aira"
                   ? `modern-theme-page ${uiTheme}-theme-page`
                   : "modern-theme-page"
             }
@@ -6213,8 +6212,7 @@ export function App() {
     );
   }
 
-  const isMobilePaneFocused = shellMode === "mobile" && isMobilePaneFocusMode && Boolean(activePane);
-  const showPaneNavigation = !isMobilePaneFocused && showMinimizedBar;
+  const showPaneNavigation = showMinimizedBar;
   const shellClassName = ["space-shell", `shell-${shellMode}`, isRoomFocusMode ? "room-focus-mode" : ""].filter(Boolean).join(" ");
   const workspaceClassName = ["workspace", showInlineSideSurface ? "" : "side-surface-hidden"].filter(Boolean).join(" ");
   const boardClassName = ["board", showPaneNavigation ? "has-pane-navigation" : ""].filter(Boolean).join(" ");
@@ -6287,6 +6285,10 @@ export function App() {
       layerShellVisiblePanes.find((pane) => pane.id === layerSelectedPaneId) ??
       layerShellVisiblePanes[0] ??
       null;
+    // Every hidden pane of the displayed full-screen room sizes its CLI ahead of a switch (operator-approved 2026-10-18).
+    const layerFullscreenPresizeIds = new Set(
+      isInteractive && layerFullscreenLayout && shellMode !== "mobile" ? layerVisiblePanes.map((pane) => pane.id) : []
+    );
     const layerDensity = isActive ? paneDensity : paneDensityFor(shellMode, layerVisiblePanes.length);
     const layerColumnCount = isActive
       ? paneGridColumnCount
@@ -6331,7 +6333,7 @@ export function App() {
         ]
       : unorderedTerminalBootstrapPaneIds;
     const layerVisiblePaneCount = (shellMode === "mobile" || layerFullscreenLayout) && layerActivePane ? 1 : layerVisiblePanes.length;
-    const layerHasMaximizedPane = shellMode !== "mobile" && layerVisiblePanes.some((pane) => pane.isMaximized);
+    const layerHasMaximizedPane = shellMode !== "mobile" && !layerFullscreenLayout && layerVisiblePanes.some((pane) => pane.isMaximized);
     const layerHeight = (layerRoom?.paneLayoutHeight ?? 1) as 1 | 2 | 3 | 4;
     const {
       naturalRows: layerNaturalRows,
@@ -6487,7 +6489,7 @@ export function App() {
                 onClick={() => void addPane("BROWSER")}
                 disabled={!isInteractive || !selectedRoomId || paneCreationPendingMode !== null || cliPaneCreationPending}
               >
-                {paneCreationPendingMode === "BROWSER" ? <Loader2 className="spin" aria-hidden="true" /> : <Eye aria-hidden="true" />}
+                {paneCreationPendingMode === "BROWSER" ? <Loader2 className="spin" aria-hidden="true" /> : <Globe aria-hidden="true" />}
                 {paneCreationPendingMode === "BROWSER" ? "Opening Browser…" : "Open Browser"}
               </button>
             </div>
@@ -6557,7 +6559,6 @@ export function App() {
                         acceptsTerminalOutput &&
                         layerShellVisiblePaneIds.has(pane.id)
                       }
-                      isMobilePaneFocused={isInteractive && isMobilePaneFocused}
                       oskOpen={isOskKeyboardOpen}
                       browserObserverOnly={auth?.user?.automationScope === "APP_DIAGNOSTICS"}
                       terminalObserverOnly={auth?.user?.automationScope === "APP_DIAGNOSTICS"}
@@ -6585,12 +6586,12 @@ export function App() {
                       onClose={paneCardOnClose}
                       onMaximize={paneCardOnMaximize}
                       onMinimize={paneCardOnMinimize}
-                      onMobilePaneFocusChange={paneCardOnMobilePaneFocusChange}
                       onGrowColumnSpan={paneCardOnGrowColumnSpan}
                       onResetColumnSpan={paneCardOnResetColumnSpan}
                       onToggleColumnSpan={paneCardOnToggleColumnSpan}
                       onSplit={paneCardOnSplit}
                       isFullscreenLayout={layerFullscreenLayout}
+                      presizeInFullscreen={layerFullscreenPresizeIds.has(pane.id)}
                       fullscreenIndex={Math.max(0, layerVisiblePanes.findIndex((candidate) => candidate.id === pane.id))}
                       fullscreenCount={layerVisiblePanes.length}
                       onFullscreenNavigate={paneCardOnFullscreenNavigate}
@@ -6692,12 +6693,10 @@ export function App() {
       if (selectedRoomIdRef.current === roomId) {
         setPanes((current) => [...current.filter((candidate) => candidate.id !== pane.id), pane]);
         setSelectedPaneId(pane.id);
-        setIsMobilePaneFocusMode(false);
         await refreshRoomEvents(roomId);
       } else {
         await selectRoom(roomId);
         setSelectedPaneId(pane.id);
-        setIsMobilePaneFocusMode(false);
       }
       refreshToolbarSystemState();
     } catch (err) {
@@ -6738,7 +6737,7 @@ export function App() {
     }
   }
 
-  const showResourceIndicatorRail = (resourceIndicatorsVisible || (Boolean(showMinimizedBarToggle) && auth?.user?.role === "ADMIN")) && (isRoomToolbarHidden || isMobilePaneFocused);
+  const showResourceIndicatorRail = (resourceIndicatorsVisible || (Boolean(showMinimizedBarToggle) && auth?.user?.role === "ADMIN")) && isRoomToolbarHidden;
   const renderToolbarMetrics = (hideTrigger = true) => (
     <ToolbarMetrics
       hideTrigger={hideTrigger}
@@ -6781,7 +6780,8 @@ export function App() {
   function renderWorkspaceManageAction(id: string, back: () => void, navigate: (id: string) => void = openManage, inline = false) {
               if (id === "setup-connections" && inline) return <WorkspacePortalMount onTargetChange={setWorkspaceSetupHost} onBack={back} onBackRef={workspaceSetupBack} />;
               if (id === "space-cli-maintenance" || id === "cli-update-all" || id === "publish-space-release")
-                return <LazyAdminOperationsDialog embedded initialTool={id === "publish-space-release" ? "release" : id === "cli-update-all" ? "update-all" : "maintenance"} onClose={back} />;
+                return <LazyAdminOperationsDialog embedded initialTool={id === "publish-space-release" ? "release" : id === "cli-update-all" ? "update-all" : "maintenance"} onClose={back}
+                  onMinimize={() => { setIsServerActionsMenuOpen(false); back(); }} />;
               if (id === "codex-lb-speed-control" || id === "cli-session-cleanup" || id === "codex-history-purge")
                 return <LazyAdminCodexToolsDialog embedded initialTool={id === "codex-lb-speed-control" ? "speed" : id === "cli-session-cleanup" ? "cleanup" : "history"} isCodexEnabled={isCodexEnabled} anyCliEnabled={anyCliEnabled} onClose={back} />;
               if (id === "system-services") return <LazySystemServicesDialog embedded onClose={back} />;
@@ -6942,7 +6942,7 @@ export function App() {
 
   return (
     <AppIconProvider pack={modernIconPack}>
-      <LiveSessionProvider ownerId={auth.user?.id || ""} roomId={selectedRoomId || activeRoom?.id || null} roomName={activeRoom?.name}>
+      <LiveSessionProvider ownerId={startupReady ? auth.user?.id || "" : ""} roomId={selectedRoomId || activeRoom?.id || null} roomName={activeRoom?.name}>
       {vibeMusicPlayer}
       {oskKeyboard}
       {stickyNoteLayer}
@@ -7005,9 +7005,8 @@ export function App() {
       data-warm-room-pressure="false"
       data-warm-room-overcommit="false"
       data-cli-floats-hidden={cliFloatsHidden ? "true" : "false"}
-      data-workspace-rail={showResourceIndicatorRail || (isRoomToolbarHidden && !isMobilePaneFocused) ? "true" : undefined}
+      data-workspace-rail={showResourceIndicatorRail || isRoomToolbarHidden ? "true" : undefined}
       data-room-toolbar-hidden={isRoomToolbarHidden ? "true" : undefined}
-      data-mobile-pane-focus={isMobilePaneFocused ? "true" : undefined}
       data-browser-fullscreen={isBrowserFullscreen ? "true" : undefined}
     >
       <DesktopWindowTitlebar
@@ -7016,7 +7015,8 @@ export function App() {
         activePaneId={activePane?.id}
         isFullscreen={isBrowserFullscreen}
       />
-      {!selectedRoomId && shellMode !== "desktop" && !isRoomFocusMode && !isMobilePaneFocused ? <header className="topbar">
+      {uiTheme === "liquid-glass" ? <LiquidGlassLens /> : null}
+      {!selectedRoomId && shellMode !== "desktop" && !isRoomFocusMode ? <header className="topbar">
         <div className="brand">
           <SpaceBrand />
           <div>
@@ -7147,7 +7147,7 @@ export function App() {
       {manage.cliRuntimeRestartAll.isOpen ? <CliRuntimeRestartAllDialog controller={manage.cliRuntimeRestartAll} /> : null}
       {gatewayCompression.dialog}
 
-      {auth.user?.role === "ADMIN" && (isRoomToolbarHidden || isMobilePaneFocused || isMemoryWorkspaceOpen || isSpaceGatewayOpen || systemAnalyticsTab || !presentationRoom) ? renderToolbarMetrics(true) : null}
+      {auth.user?.role === "ADMIN" && (isRoomToolbarHidden || isMemoryWorkspaceOpen || isSpaceGatewayOpen || systemAnalyticsTab || !presentationRoom) ? renderToolbarMetrics(true) : null}
       {auth.user?.role === "ADMIN" ? (
         <RecoverableSurface fallback={isAgentsDashboardOpen ? <div role="status">Loading agents dashboard…</div> : null}>
           <LazyAgentsDashboard key={auth.user.id} userId={auth.user.id} open={isAgentsDashboardOpen} rooms={rooms} completions={paneCompletionLifecycle.panes}
@@ -7163,9 +7163,9 @@ export function App() {
         indicatorsVisible={resourceIndicatorsVisible}
         environment={codexEnvironmentSummary}
         readOnly={auth.user.role !== "ADMIN"}
-        minimizedBarToggle={auth.user.role === "ADMIN" && showMinimizedBarToggle && (isRoomToolbarHidden || isMobilePaneFocused) ? (
+        minimizedBarToggle={auth.user.role === "ADMIN" && showMinimizedBarToggle && isRoomToolbarHidden ? (
           <MinimizedPaneBarToggle
-            count={minimizedPanes.length}
+            count={minimizedCount}
             runningCount={minimizedPaneRunningCount}
             expanded={showMinimizedBar}
             onToggle={() => setMinimizedBarExpanded((value) => !value)}
@@ -7176,10 +7176,10 @@ export function App() {
         onReopenAllDetached={auth.user.role === "ADMIN" ? reopenAllDetachedPanes : undefined}
         onCloseSession={auth.user.role === "ADMIN" ? closeDetachedPane : undefined} />}
 
-      {isMobilePaneFocused || !isRoomToolbarHidden || showOverlaySideSurface || systemAnalyticsTab ? null : (
+      {!isRoomToolbarHidden || showOverlaySideSurface || systemAnalyticsTab ? null : (
         <CollapsedRoomRail
           popovers={toolbarPopovers}
-          railVisibility={lowerRailVisibility}
+          railVisibility={roomRailVisibility(lowerRailVisibility, presentationRoom)}
           touchContext={lowerRailTouchContext}
           navigation={workspaceNavigation}
           roomNavigation={{ previousRoom, nextRoom, selectRoom }}
@@ -7195,7 +7195,7 @@ export function App() {
           isBrowserFullscreen={isBrowserFullscreen}
           minimized={{
             showInRail: showMinimizedBarToggle && auth?.user?.role !== "ADMIN",
-            count: minimizedPanes.length,
+            count: minimizedCount,
             runningCount: minimizedPaneRunningCount,
             expanded: showMinimizedBar,
             onToggle: () => setMinimizedBarExpanded((value) => !value)
@@ -7256,7 +7256,7 @@ export function App() {
         <CompactSideSurfaceDrawer sideSurfaces={sideSurfaces} launcherActions={roomToolbar.orderedActions} renderSurface={renderSideSurfaceContent} fallback={sideSurfaceLoadingFallback} />
 
         <section className={boardClassName} aria-label="Pane board">
-          {!isMobilePaneFocused && !isRoomToolbarHidden ? (
+          {!isRoomToolbarHidden ? (
             <div
               ref={boardToolbarRef}
               className="board-toolbar"
@@ -7414,6 +7414,7 @@ export function App() {
                 <AsteroidsGate key={selectedRoomId} />
               ) : null}
           </div>
+          {shellMode === "mobile" ? <MobilePaneSwitcher panes={sortPanesForGrid(visiblePanes)} activePaneId={activePane?.id} onSelect={selectMobilePane} /> : null}
         </section>
         {paneMoveDialog ? (
           <MovePaneDialog
@@ -7455,7 +7456,7 @@ export function App() {
         </RecoverableSurface>
       ) : null}
       <LiveDebugToastView notices={notices} />
-      <NotificationToastHost />
+      <NotificationToastHost />{nousFocus}
       </main>
       <StreamingOverlay theme={uiTheme !== "classic" ? "modern" : "classic"} />
       </StreamingOverlayProvider>

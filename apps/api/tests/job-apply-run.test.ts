@@ -134,7 +134,7 @@ describe("job copilot run supervisor", () => {
   });
 
   it("answers a question longer than a memory key: the key keeps the first 300 normalized characters", async () => {
-    const { app, pane, headers, agent } = await fixture();
+    const { app, room, pane, headers, agent } = await fixture();
     try {
       const paneUrl = `/api/panes/${encodeURIComponent(pane.id)}/job-apply`;
       const queued = await app.inject({ method: "POST", url: `${paneUrl}/queue`, headers, payload: { urls: ["https://jobs.lever.co/initech/10"] } });
@@ -146,8 +146,12 @@ describe("job copilot run supervisor", () => {
       expect(question.length).toBeGreaterThan(500);
       const asked = await app.inject({ method: "POST", url: `/api/cli/job-apply/applications/${initech!.id}/question`, headers: agent, payload: { question, options: ["No", "Yes"], label: "Visa sponsorship" } });
       expect(asked.json()).toMatchObject({ answered: false });
+      // The question makes the room "Needs attention" until it is answered.
+      const attention = async () => (await app.inject({ method: "GET", url: "/api/notifications/pending", headers })).json().byRoom[room.id] ?? 0;
+      await vi.waitFor(async () => expect(await attention()).toBe(1));
       const answered = await app.inject({ method: "POST", url: `/api/job-apply/applications/${initech!.id}/answer`, headers, payload: { questionId: asked.json().questionId, answer: "No" } });
       expect(answered.statusCode).toBe(200);
+      await vi.waitFor(async () => expect(await attention()).toBe(0));
       expect(answered.json().memory.key.length).toBeLessThanOrEqual(300);
       const known = await app.inject({ method: "POST", url: `/api/cli/job-apply/applications/${initech!.id}/question`, headers: agent, payload: { question } });
       expect(known.json()).toMatchObject({ answered: true, answer: "No" });
@@ -256,6 +260,25 @@ describe("job copilot run supervisor", () => {
       const after = await app.inject({ method: "POST", url: "/api/cli/job-apply/job/next", headers: agent, payload: { waitMs: 0 } });
       expect([acmeGreenhouse!.id, acmeLever!.id]).toContain(after.json().application.id);
       expect(after.json().application).toMatchObject({ status: "FILLING", notBefore: null });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("an answer closes the question in the pane that asked, even when the posting was queued from another pane", async () => {
+    const { app, store, room, pane, headers, agent } = await fixture();
+    try {
+      const oldPane = store.createPane({ roomId: room.id, title: "Old Job Copilot", mode: "JOB_APPLY", terminalRuntimeId: "cli:codex" });
+      const queued = await app.inject({ method: "POST", url: `/api/panes/${encodeURIComponent(oldPane.id)}/job-apply/queue`, headers, payload: { urls: ["https://jobs.lever.co/initech/10"] } });
+      const [posting] = queued.json().queued as Array<{ id: string }>;
+      const asked = await app.inject({ method: "POST", url: `/api/cli/job-apply/applications/${posting!.id}/question`, headers: agent, payload: { question: "Years of Flutter?" } });
+      const questionId = asked.json().questionId as string;
+      const paneUrl = `/api/panes/${encodeURIComponent(pane.id)}/job-apply`;
+      expect((await app.inject({ method: "GET", url: `${paneUrl}/run`, headers })).json().pending).toEqual([expect.objectContaining({ id: questionId })]);
+      expect((await app.inject({ method: "POST", url: `/api/job-apply/applications/${posting!.id}/answer`, headers, payload: { questionId, answer: "0" } })).statusCode).toBe(200);
+      expect((await app.inject({ method: "GET", url: `${paneUrl}/run`, headers })).json().pending).toEqual([]);
+      const events = (await app.inject({ method: "GET", url: `/api/job-apply/events?paneId=${encodeURIComponent(pane.id)}`, headers })).json().events as Array<{ type: string }>;
+      expect(events.map((event) => event.type)).toContain("ANSWERED");
     } finally {
       await app.close();
     }

@@ -74,6 +74,7 @@ function deps(overrides: Partial<Record<string, unknown>> = {}) {
     delegate: vi.fn(async () => ({ status: "COMPLETED" as const, result: { to: "Nova" } })),
     publishDeliverable: vi.fn(async (_owner: string, _dot: string, input: { path: string }) => ({ deliverable: { name: input.path, version: 2, artifactId: "artifact:pub" }, unchanged: false })),
     deliverableFingerprint: vi.fn(async (_owner: string, _dot: string, path: string) => { if (path.includes("missing")) throw Error("missing"); return "f".repeat(64); }),
+    designRequest: vi.fn(async () => ({ status: "COMPLETED" as const, result: { requestId: "dreq:fromdot1", status: "QUEUED" } })),
     memoryScope: vi.fn(async (_owner: string, _dot: string, memoryId: string) => memoryId.endsWith("1") ? "SHARED" as const : "DOT" as const),
     ...(overrides.evaluationSession ? { evaluationSession: overrides.evaluationSession as DotToolGatewayDeps["evaluationSession"] } : {}),
     audit: vi.fn(async () => undefined)
@@ -161,12 +162,18 @@ describe("Dot gateway routes", () => {
     expect((await call(server, "space.execute", { actions: [{ kind: "resource", operation: "ops.test", input: {} }] })).json())
       .toMatchObject({ status: "BLOCKED", statusReason: expect.stringMatching(/never available/) });
     expect((await call(server, "space.unknown")).json()).toMatchObject({ status: "BLOCKED", statusReason: expect.stringMatching(/Unknown tool/) });
-    expect((await call(server, "space.screenshot")).json()).toMatchObject({ status: "BLOCKED" });
     expect((await call(server, "resource.tasks.delete", { id: "task:1" })).json()).toMatchObject({ status: "BLOCKED", statusReason: expect.stringMatching(/approval/) });
     expect((await call(server, "resource.rooms.reorder", { input: { roomIds: [] } })).json()).toMatchObject({ status: "BLOCKED" });
     expect((await call(server, "space.execute", { actions: [{ kind: "resource", operation: "rooms.reorder", input: {} }] })).json())
       .toMatchObject({ status: "BLOCKED", statusReason: expect.stringMatching(/administrator/) });
     expect(value.callControl).not.toHaveBeenCalled();
+  });
+
+  it("captures the Dot's own room read-only through space_screenshot", async () => {
+    const { value } = deps();
+    const server = await app(value);
+    await call(server, "space.screenshot", { format: "png", viewport: "mobile" });
+    expect(vi.mocked(value.callControl).mock.calls[0]!.slice(1)).toEqual(["space_screenshot", { format: "png", viewport: "mobile", roomId: "room:own" }]);
   });
 
   it("keeps a USER Dot inside the owner's rooms", async () => {
@@ -280,6 +287,19 @@ describe("Dot gateway routes", () => {
     expect(decided.json()).toMatchObject({ invocation: { status: "COMPLETED" } });
     expect(value.publishDeliverable).toHaveBeenCalledWith("user:owner", dotId, { path: "reports/q3.pdf", roomId: "room:own", expectedSha256: "f".repeat(64) });
     expect((await call(server, "deliverable.publish", { path: "missing.pdf" }, { callId: "call-pub9" })).json()).toMatchObject({ status: "BLOCKED" });
+  });
+
+  it("asks the Design pane for a graphic only after the owner approves it, in every mode", async () => {
+    const { value, repository } = deps();
+    (repository as unknown as { approvals: Map<string, { status: string }> }).approvals.set("dot_tool:design", { status: "RUNNING" } as never);
+    const server = await app(value);
+    expect((await call(server, "design.request", { brief: " " }, { callId: "call-design0" })).json()).toMatchObject({ status: "BLOCKED" });
+    expect((await call(server, "design.request", { brief: "A banner for the launch", formatIds: ["linkedin-banner"] }, { callId: "call-design", invocationId: "dot_tool:design" })).json())
+      .toMatchObject({ status: "APPROVAL_REQUIRED", statusReason: expect.stringMatching(/Ask the Design pane for linkedin-banner: “A banner for the launch”/) });
+    expect(value.designRequest).not.toHaveBeenCalled();
+    const decided = await server.inject({ method: "POST", url: `/api/dots/${encodeURIComponent(dotId)}/approvals/dot_tool:design`, payload: { decision: "APPROVE" } });
+    expect(decided.json()).toMatchObject({ invocation: { status: "COMPLETED" } });
+    expect(value.designRequest).toHaveBeenCalledWith(expect.objectContaining({ dotId, roomId: "room:own" }), "user:owner", { brief: "A banner for the launch", formatIds: ["linkedin-banner"] });
   });
 
   it("asks before sending mail or creating events while Settings say so (the default), even with full access", async () => {
@@ -471,4 +491,9 @@ it("builds Dot developer context from preferences without granting authority", (
   expect(own).toContain("Reply in the language the user writes in.");
   expect(own).toContain("Your private workspace: /opt/spaceapp/var/dots/workspaces/abc.");
   expect(own).toContain("computer.browser");
+  expect(own).toContain("never send or mention progress reports to Nous");
+  expect(own).not.toContain("Your personality");
+  const nova = dotDeveloperContext({ name: "Nova", appearance: { character: "star", accent: "amber" }, preferences: {} }, null);
+  expect(nova).toContain("Your personality: Warm encourager.");
+  expect(nova).toContain("- Strict, impatient or annoyed: Never takes it personally");
 });

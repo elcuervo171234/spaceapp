@@ -48,6 +48,8 @@ vi.mock("../src/api.js", () => ({
     toolbarApiProviderAccounts: mocks.apiProviderAccounts,
     toolbarCliSessions: mocks.sessions,
     codexEnvironment: mocks.environment,
+    // The Token usage page's Anthropic bill panel (2026-10-18): not configured, as in the demo.
+    gatewayAnthropicBilling: async () => ({ status: { configured: false, keyHint: null, savedAt: null, lastSyncAt: null, lastError: null, upstream: [] }, days: [] }),
   },
 }));
 vi.mock("../src/runtime/SpaceRuntime.js", () => ({
@@ -356,7 +358,7 @@ describe("shared health UI", () => {
     const terminal = screen.getByRole("textbox", { name: "Active terminal" });
     act(() => window.dispatchEvent(new CustomEvent("space:system-health", { detail: { section: "ai" } })));
     fireEvent.change(screen.getByRole("combobox", { name: "Resource view" }), { target: { value: "usage" } });
-    await waitFor(() => expect(mocks.models).toHaveBeenCalledWith("24h"));
+    await waitFor(() => expect(mocks.models).toHaveBeenCalledWith("24h", "all"));
     expect(await screen.findByText("Tokens in / out / reasoning")).toBeTruthy();
     expect(terminal.isConnected).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Close Resources" }));

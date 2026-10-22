@@ -6,7 +6,7 @@ import { InMemorySpaceStore } from "@space/runtime";
 import { createApp } from "../src/app.js";
 import { getApiConfig } from "../src/config.js";
 import { createCsrfToken, signSession } from "../src/auth.js";
-import { mayCreatePaneDirectory, resolveProjectEnsureTarget } from "../src/project-paths.js";
+import { mayCreateCliSessionDirectory, mayCreatePaneDirectory, resolveProjectEnsureTarget } from "../src/project-paths.js";
 
 const exists = (path: string) => stat(path).then(() => true, () => false);
 
@@ -65,6 +65,23 @@ describe("project ensure path policy", () => {
     }
   });
 
+  it("lets a CLI session create a missing folder only in the workspace root or where a pane may (SEC-009)", async () => {
+    // 1.1.5 internal review: the session start and terminal attach ran mkdir -p on any requested cwd.
+    const worktrees = join(install, "var", "worktrees");
+    const workspaces = join(base, "workspaces");
+    await mkdir(worktrees, { recursive: true });
+    const decide = (role: string | null, cwd: string) => mayCreateCliSessionDirectory({
+      cwd, role, projectsRoot: projects, installRoot: install, worktreesRoot: worktrees, workspaceRoot: workspaces
+    });
+    await expect(decide(null, join(workspaces, "room-abc"))).resolves.toBe(true);
+    await expect(decide(null, join(projects, "new-app"))).resolves.toBe(true);
+    await expect(decide(null, join(base, "elsewhere", "dir"))).resolves.toBe(false);
+    await expect(decide(null, join(workspaces, "..", "outside"))).resolves.toBe(false);
+    for (const cwd of ["/etc/space-session", join(install, "apps", "new"), "relative/dir"]) {
+      await expect(decide("ADMIN", cwd), cwd).resolves.toBe(false);
+    }
+  });
+
   it("enforces the policy on the HTTP route", async () => {
     const secret = "project-ensure-test-secret";
     const store = new InMemorySpaceStore();
@@ -80,11 +97,12 @@ describe("project ensure path policy", () => {
       return { cookie: `space_session=${session}`, "x-space-csrf-token": createCsrfToken(session, secret)! };
     };
     try {
+      // Projects live on the owner's disk, which a USER never reaches (MU-001).
       const denied = await app.inject({ method: "POST", url: "/api/projects/ensure", headers: headersFor("USER"), payload: { path: join(base, "user-elsewhere") } });
-      expect(denied.statusCode).toBe(403);
+      expect(denied.statusCode).toBe(404);
       expect(await exists(join(base, "user-elsewhere"))).toBe(false);
 
-      const named = await app.inject({ method: "POST", url: "/api/projects/ensure", headers: headersFor("USER"), payload: { name: "named-project" } });
+      const named = await app.inject({ method: "POST", url: "/api/projects/ensure", headers: headersFor("ADMIN"), payload: { name: "named-project" } });
       expect(named.statusCode).toBe(200);
       expect(named.json()).toMatchObject({ ok: true, path: join(projects, "named-project"), name: "named-project" });
       expect(await exists(join(projects, "named-project", ".git"))).toBe(true);

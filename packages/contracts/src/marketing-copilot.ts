@@ -159,12 +159,21 @@ export type MarketingPostKind = z.infer<typeof marketingPostKindSchema>;
 export const MARKETING_POST_STATUSES = ["DRAFT", "IN_REVIEW", "APPROVED", "PUBLISHING", "PUBLISHED", "FAILED", "REJECTED"] as const;
 export const marketingPostStatusSchema = z.enum(MARKETING_POST_STATUSES);
 export type MarketingPostStatus = z.infer<typeof marketingPostStatusSchema>;
-/** A generated image or video the post carries: a pane-owned file, never an Agent File unless the operator asks. */
+/**
+ * A generated image or video the post carries: a pane-owned file, never an Agent File unless the operator asks. With
+ * `artifactId` it is a capture in the owner's room Media (space_screenshot): the server sets path and kind from it.
+ */
 export const marketingAssetSchema = z.object({
   path: z.string().trim().min(1).max(500),
   label: z.string().trim().min(1).max(200),
-  kind: z.enum(["IMAGE", "VIDEO", "FILE"])
+  kind: z.enum(["IMAGE", "VIDEO", "FILE"]),
+  artifactId: z.string().trim().min(1).max(200).optional()
 }).strict();
+export type MarketingAsset = z.infer<typeof marketingAssetSchema>;
+/** What the agent sends: a file with its kind, or just a captured artifact and a label. */
+export const marketingAssetInputSchema = z.union([marketingAssetSchema,
+  z.object({ artifactId: z.string().trim().min(1).max(200), label: z.string().trim().min(1).max(200) }).strict()]);
+export type MarketingAssetInput = z.infer<typeof marketingAssetInputSchema>;
 export const marketingPostSchema = z.object({
   id: marketingPostIdSchema,
   ownerUserId: z.string().min(1).max(200),
@@ -198,7 +207,7 @@ export const marketingPostCreateSchema = z.object({
   target: z.string().trim().min(1).max(300).nullable().optional(),
   title: z.string().trim().min(1).max(300).nullable().optional(),
   body: z.string().trim().min(1).max(40_000),
-  assets: z.array(marketingAssetSchema).max(10).default([]),
+  assets: z.array(marketingAssetInputSchema).max(10).default([]),
   scheduledAt: isoDateTime.nullable().optional()
 }).strict();
 export type MarketingPostCreate = z.infer<typeof marketingPostCreateSchema>;
@@ -444,6 +453,29 @@ export const marketingPostMetricsRecordSchema = z.object({
   postId: marketingPostIdSchema,
   metrics: z.record(z.string().regex(/^[a-z][a-z0-9_]{0,39}$/), z.number().min(0).max(1e12)).refine((value) => Object.keys(value).length > 0 && Object.keys(value).length <= 12, "Report 1 to 12 metrics.")
 }).strict();
+
+// ---- bookmarks -------------------------------------------------------------------------------------
+/** A page the pane browser opens in a new tab with one Google account (operator request 2026-10-16); null: the pane's own. */
+export const marketingBookmarkIdSchema = idOf("mktbm");
+const bookmarkUrlSchema = z.string().trim().max(2048).url().refine((url) => /^https?:\/\//i.test(url), "Use an http or https address.");
+export const marketingBookmarkSchema = z.object({
+  id: marketingBookmarkIdSchema,
+  ownerUserId: z.string().min(1).max(200),
+  title: z.string().min(1).max(200),
+  url: bookmarkUrlSchema,
+  profileId: z.string().min(1).max(200).nullable(),
+  /** The account's address as the operator chose it, so the list and the agent name it without the account list. */
+  accountLabel: z.string().min(1).max(320).nullable(),
+  createdAt: isoDateTime
+}).strict();
+export type MarketingBookmark = z.infer<typeof marketingBookmarkSchema>;
+export const marketingBookmarkCreateSchema = z.object({
+  url: bookmarkUrlSchema,
+  title: z.string().trim().min(1).max(200).optional(),
+  profileId: z.string().trim().min(1).max(200).nullable().default(null),
+  accountLabel: z.string().trim().min(1).max(320).nullable().default(null)
+}).strict();
+export type MarketingBookmarkCreate = z.infer<typeof marketingBookmarkCreateSchema>;
 
 // ---- campaign templates ---------------------------------------------------------------------------
 /**

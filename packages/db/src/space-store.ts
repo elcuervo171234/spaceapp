@@ -1,5 +1,6 @@
+import { rollbackKeepingError } from "./rollback.js";
 import { t3CodePaneMetadataSchema, type T3CodePaneMetadata } from "@space/contracts";
-import { jobApplyPaneMetadataSchema, mailCopilotPaneMetadataSchema, marketingCopilotPaneMetadataSchema, type JobApplyPaneMetadata, type MailCopilotPaneMetadata, type MarketingCopilotPaneMetadata } from "@space/contracts";
+import { jobApplyPaneMetadataSchema, mailCopilotPaneMetadataSchema, marketingCopilotPaneMetadataSchema, freelanceCopilotPaneMetadataSchema, designPaneMetadataSchema, appStudioPaneMetadataSchema, type AppStudioPaneMetadata, type DesignPaneMetadata, type JobApplyPaneMetadata, type MailCopilotPaneMetadata, type MarketingCopilotPaneMetadata, type FreelanceCopilotPaneMetadata } from "@space/contracts";
 import type { PlanExecutionEvent } from "@space/runtime";
 import { managedPlanProjection } from "@space/runtime";
 import { managedPlanExecutionSchema } from "@space/contracts";
@@ -8,11 +9,12 @@ import { PostgresGoogleAccountsRepository } from "./google-accounts-repository.j
 import type { GoogleAccount, VerifiedGoogleIdentity } from "@space/runtime";
 import { transitionAgentRunLedger, pickNextAvailablePaneName, normalizePaneName } from "@space/contracts";
 import { splitCliHostTranscriptContent } from "@space/contracts";
+import { ownerWorkingTimeZone, resolveTaskScheduleZone, taskScheduleNextRunAt, type TaskScheduleInput } from "@space/contracts";
 import type { PaneBatchClaim } from "@space/contracts";
 import type { TaskTitleState } from "@space/contracts";
 import pg from "pg";
 import { accessSync, constants } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, parse } from "node:path";
 import { createHash } from "node:crypto";
 import { defaultToolRoutingState, toolRoutingStateSchema, type ToolRoutingStateV1 } from "@space/contracts";
 import {
@@ -311,6 +313,7 @@ import {
   type SpaceConfigRoom,
   type ExportConfigOptions,
   type ImportConfigOptions,
+  type ConfigSection,
   type ImportConfigResult,
   type SourceControlProvider,
   type SwarmLock,
@@ -411,6 +414,8 @@ import {
   type CodexCliTurnMarkerRecord,
   type CreateCodexCliTurnMarkerInput,
   type CreateMemoryEntryOptions,
+  type MemoryEmbeddingCounts,
+  type MemoryRecordToEmbed,
   type CreateMemoryChangeSetOptions,
   type CreateQueuedTurnInput,
   type CreateRoomStoreInput,
@@ -457,6 +462,7 @@ import {
   type ClaimOwnerSetupInput,
   type InitializeOwnerSetupInput,
   type OwnerCredentials,
+  type CreateUserInviteRecord,
   type OwnerSetupClaimResult,
   type OwnerSetupStatus,
   type PersistedSetupConnectionState,
@@ -477,12 +483,15 @@ import {
   openConfigBundleSecrets,
   prepareConfigImport,
   remapRoomKeyedSettings,
+  assertConfigReplaceConfirmed,
+  configImportIncludes,
+  mergeImportedUserSettings,
   sealConfigBundle,
   writeImportedApiKeys,
   type CliAuthCapture,
   type ConfigImportHooks
 } from "@space/runtime";
-import type { SetupOnboarding, AdminUserItem } from "@space/contracts";
+import type { SetupOnboarding, AdminUserItem, UserInvite, RoomShare } from "@space/contracts";
 import type { TelegramOutboxPersistence, TelegramPersistence } from "@space/runtime";
 import { PostgresTelegramPersistence } from "./telegram-persistence.js";
 
@@ -562,6 +571,8 @@ function createSinglePgPool(
 ): pg.Pool {
   const pool = new Pool({
     connectionString,
+    // Names the process in pg_stat_activity unless the URL or PGAPPNAME already does.
+    fallback_application_name: `space:${parse(process.argv[1] ?? "node").name}`,
     max: poolOptions.max ?? defaultMax,
     idleTimeoutMillis: poolOptions.idleTimeoutMillis ?? 30_000,
     connectionTimeoutMillis: poolOptions.connectionTimeoutMillis ?? 5_000,
@@ -594,7 +605,80 @@ export function prefersSpaceSocket(connectionString: string): boolean {
   }
 }
 
+/** Default cap of the one pool a process keeps per connection string (stable hit max_connections=100 on 2026-10-18). */
+export const SHARED_SPACE_PG_POOL_MAX = 20;
+const SHARED_SPACE_PG_POOL_IDLE_MS = 10_000;
+const sharedSpacePgPools = new Map<string, { pool: pg.Pool; requested: number; handles: number }>();
+
+/** A positive integer from the environment, bounded like the API config (apps/api/src/config.ts), else the fallback. */
+function envPoolSetting(name: string, fallback: number, ceiling: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? Math.min(value, ceiling) : fallback;
+}
+
+function sharedPoolCap(): number {
+  return envPoolSetting("SPACE_DATABASE_SHARED_POOL_MAX", SHARED_SPACE_PG_POOL_MAX, 100);
+}
+
+/**
+ * Every caller in the process gets a handle on one shared pool per connection string instead of its own pool.
+ * Each handle adds its `max` to the pool's cap, up to SPACE_DATABASE_SHARED_POOL_MAX (SHARED_SPACE_PG_POOL_MAX
+ * when unset), so a process with one small repository keeps a small pool; idle connections close after
+ * SPACE_DATABASE_POOL_IDLE_TIMEOUT_MS (10 s when unset) and the caller's other pool options are not used.
+ * Ending a handle ends the pool only when it is the last one. A client held across other queries (a session
+ * advisory lock around work) takes createDedicatedSpacePgPool so it cannot starve the shared pool.
+ */
 export function createSpacePgPool(
+  connectionString: string,
+  poolOptions: PostgresPoolOptions = {},
+  defaultMax = 10
+): pg.Pool {
+  const socketPath = poolOptions.socketPath ?? process.env.SPACE_PG_SOCKET_PATH ?? DEFAULT_SPACE_PG_SOCKET_PATH;
+  const key = `${socketPath}\n${connectionString}`;
+  const want = poolOptions.max ?? defaultMax;
+  let entry = sharedSpacePgPools.get(key);
+  if (!entry) {
+    entry = {
+      pool: createDedicatedSpacePgPool(connectionString, {
+        socketPath,
+        max: want,
+        idleTimeoutMillis: envPoolSetting("SPACE_DATABASE_POOL_IDLE_TIMEOUT_MS", SHARED_SPACE_PG_POOL_IDLE_MS, 300_000)
+      }),
+      requested: 0,
+      handles: 0
+    };
+    sharedSpacePgPools.set(key, entry);
+  }
+  const shared = entry;
+  shared.requested += want;
+  shared.handles += 1;
+  // pg-pool reads options.max on every checkout, so the cap follows the handles that are open.
+  shared.pool.options.max = Math.min(sharedPoolCap(), shared.requested);
+  let ended = false;
+  return new Proxy(shared.pool, {
+    get(target, prop) {
+      if (prop === "end") {
+        return async () => {
+          if (ended) return;
+          ended = true;
+          shared.requested -= want;
+          shared.handles -= 1;
+          if (shared.handles > 0) {
+            shared.pool.options.max = Math.min(sharedPoolCap(), Math.max(1, shared.requested));
+            return;
+          }
+          if (sharedSpacePgPools.get(key) === shared) sharedSpacePgPools.delete(key);
+          if (!target.ending && !target.ended) await target.end();
+        };
+      }
+      const val = Reflect.get(target, prop, target);
+      return typeof val === "function" ? val.bind(target) : val;
+    }
+  });
+}
+
+/** A pool of its own, not shared with the rest of the process. */
+export function createDedicatedSpacePgPool(
   connectionString: string,
   poolOptions: PostgresPoolOptions = {},
   defaultMax = 10
@@ -725,6 +809,11 @@ type TaskItemRow = {
   characterCount: number;
   createdAt: Date | string;
   lastUsedAt: Date | string;
+  recurrence: TaskScheduleInput["recurrence"] | null;
+  timeZone: string | null;
+  nextRunAt: Date | string | null;
+  lastRunAt: Date | string | null;
+  lastOutcome: string | null;
 };
 
 type UserLinkRow = Omit<UserLink, "createdAt" | "updatedAt"> & {
@@ -742,6 +831,9 @@ type PaneRow = {
   jobApplyMetadata?: Pane["jobApplyMetadata"];
   mailCopilotMetadata?: Pane["mailCopilotMetadata"];
   marketingCopilotMetadata?: Pane["marketingCopilotMetadata"];
+  freelanceCopilotMetadata?: Pane["freelanceCopilotMetadata"];
+  designMetadata?: Pane["designMetadata"];
+  appStudioMetadata?: Pane["appStudioMetadata"];
   paneName?: string | null;
   mode: Pane["mode"];
   status: Pane["status"];
@@ -1655,6 +1747,12 @@ const clipboardItemSelect = `
   FROM clipboard_items
 `;
 
+const taskScheduleColumns = `recurrence, time_zone AS "timeZone", next_run_at AS "nextRunAt", last_run_at AS "lastRunAt", last_outcome AS "lastOutcome"`;
+
+const taskItemReturning = `id, title, objective, status, source, room_id AS "roomId", pane_id AS "paneId", pane_title AS "paneTitle",
+  occurrence_count AS "occurrenceCount", character_count AS "characterCount", created_at AS "createdAt", last_used_at AS "lastUsedAt",
+  ${taskScheduleColumns}`;
+
 const taskItemSelect = `
   SELECT
     id,
@@ -1668,7 +1766,8 @@ const taskItemSelect = `
     occurrence_count AS "occurrenceCount",
     character_count AS "characterCount",
     created_at AS "createdAt",
-    last_used_at AS "lastUsedAt"
+    last_used_at AS "lastUsedAt",
+    ${taskScheduleColumns}
   FROM task_items
 `;
 
@@ -1699,6 +1798,9 @@ const paneSelect = `
     job_apply_metadata AS "jobApplyMetadata",
     mail_copilot_metadata AS "mailCopilotMetadata",
     marketing_copilot_metadata AS "marketingCopilotMetadata",
+    freelance_copilot_metadata AS "freelanceCopilotMetadata",
+    design_metadata AS "designMetadata",
+    app_studio_metadata AS "appStudioMetadata",
     mode,
     status,
     provider_id AS "providerId",
@@ -1948,7 +2050,11 @@ const paneBrowserSessionSelect = `
     resolved_stream_mode AS "resolvedStreamMode",
     runtime_state AS "runtimeState",
     capacity_state AS "capacityState",
-    control_state AS "controlState",
+    -- A lease past its expiry holds nothing even before anyone marks it EXPIRED (an acquire whose answer was lost).
+    CASE WHEN control_state <> 'UNCONTROLLED' AND NOT EXISTS (
+      SELECT 1 FROM browser_control_leases held
+      WHERE held.session_id = pane_browser_sessions.session_id AND held.status = 'ACTIVE' AND held.expires_at > now()
+    ) THEN 'UNCONTROLLED' ELSE control_state END AS "controlState",
     pages,
     active_page_id AS "activePageId",
     worker_heartbeat_at AS "workerHeartbeatAt",
@@ -2716,6 +2822,23 @@ const importCandidateSelect = `
   FROM import_candidates
 `;
 
+interface UserInviteRow {
+  id: string; email: string; role: UserInvite["role"]; createdBy: string; createdAt: Date | string; expiresAt: Date | string;
+  acceptedAt: Date | string | null; acceptedUserId: string | null; revokedAt: Date | string | null;
+}
+const userInviteColumns = `id, email, role, created_by AS "createdBy", created_at AS "createdAt", expires_at AS "expiresAt",
+  accepted_at AS "acceptedAt", accepted_user_id AS "acceptedUserId", revoked_at AS "revokedAt"`;
+function userInviteFromRow(row: UserInviteRow): UserInvite {
+  return {
+    id: row.id, email: row.email, role: row.role, createdBy: row.createdBy, createdAt: toIso(row.createdAt),
+    expiresAt: toIso(row.expiresAt), acceptedAt: toIso(row.acceptedAt), acceptedUserId: row.acceptedUserId, revokedAt: toIso(row.revokedAt)
+  };
+}
+
+interface RoomShareRow { roomId: string; userId: string; permission: RoomShare["permission"]; createdBy: string; createdAt: Date | string }
+const roomShareColumns = `room_id AS "roomId", user_id AS "userId", permission, created_by AS "createdBy", created_at AS "createdAt"`;
+const roomShareFromRow = (row: RoomShareRow): RoomShare => ({ ...row, createdAt: toIso(row.createdAt) });
+
 function toIso(value: Date | string): string;
 function toIso(value: Date | string | null): string | null;
 function toIso(value: Date | string | null): string | null {
@@ -2833,10 +2956,14 @@ function mapClipboardItem(row: ClipboardItemRow): ClipboardItem {
 }
 
 function mapTaskItem(row: TaskItemRow): TaskItem {
+  const { recurrence, timeZone, nextRunAt, lastRunAt, lastOutcome, ...item } = row;
   return taskItemSchema.parse({
-    ...row,
+    ...item,
     createdAt: toIso(row.createdAt),
-    lastUsedAt: toIso(row.lastUsedAt)
+    lastUsedAt: toIso(row.lastUsedAt),
+    schedule: recurrence && timeZone ? {
+      recurrence, timeZone, nextRunAt: nextRunAt ? toIso(nextRunAt) : null, lastRunAt: lastRunAt ? toIso(lastRunAt) : null, lastOutcome
+    } : null
   });
 }
 
@@ -2855,6 +2982,9 @@ function mapPane(row: PaneRow): Pane {
     jobApplyMetadata: row.jobApplyMetadata ?? null,
     mailCopilotMetadata: row.mailCopilotMetadata ?? null,
     marketingCopilotMetadata: row.marketingCopilotMetadata ?? null,
+    freelanceCopilotMetadata: row.freelanceCopilotMetadata ?? null,
+    designMetadata: row.designMetadata ?? null,
+    appStudioMetadata: row.appStudioMetadata ?? null,
     paneName: row.paneName ?? null,
     mode: row.mode,
     status: row.status,
@@ -4101,6 +4231,7 @@ export class PostgresSpaceStore implements SpaceStore {
 
   async claimOwnerSetup(input: ClaimOwnerSetupInput): Promise<OwnerSetupClaimResult> {
     const client = await this.pool.connect();
+    let rollbackFailed = false;
     try {
       await client.query("BEGIN");
       const setup = await client.query<{
@@ -4175,10 +4306,10 @@ export class PostgresSpaceStore implements SpaceStore {
         }
       };
     } catch (error) {
-      await client.query("ROLLBACK");
+      rollbackFailed = await rollbackKeepingError(client);
       throw error;
     } finally {
-      client.release?.();
+      client.release?.(rollbackFailed || undefined);
     }
   }
 
@@ -4237,7 +4368,7 @@ export class PostgresSpaceStore implements SpaceStore {
         room = existing.rows[0] ? mapRoom(existing.rows[0]) : null;
       }
       if (!room) {
-        room = await this.createStarterRoom(client, traceId);
+        room = await this.createStarterRoom(client, traceId, row.ownerUserId);
         await client.query(
           `
             UPDATE space_owner_setup
@@ -4724,8 +4855,9 @@ export class PostgresSpaceStore implements SpaceStore {
           ON CONFLICT (owner_user_id, content_hash)
           DO UPDATE SET
             text = EXCLUDED.text,
-            source = EXCLUDED.source,
-            title = EXCLUDED.title,
+            -- A copy or paste of a plan's or note's text keeps its source and title, so it never becomes prunable history.
+            source = CASE WHEN EXCLUDED.source IN ('COPY', 'PASTE') AND clipboard_items.source NOT IN ('COPY', 'PASTE') THEN clipboard_items.source ELSE EXCLUDED.source END,
+            title = CASE WHEN EXCLUDED.source IN ('COPY', 'PASTE') AND clipboard_items.source NOT IN ('COPY', 'PASTE') THEN clipboard_items.title ELSE EXCLUDED.title END,
             minimum_model = COALESCE(EXCLUDED.minimum_model, clipboard_items.minimum_model),
             minimum_reasoning = COALESCE(EXCLUDED.minimum_reasoning, clipboard_items.minimum_reasoning),
             steps_json = CASE WHEN EXISTS (SELECT 1 FROM managed_plan_executions WHERE plan_id=clipboard_items.id AND owner_user_id=$2) THEN clipboard_items.steps_json ELSE COALESCE($12::jsonb, clipboard_items.steps_json) END,
@@ -4771,14 +4903,17 @@ export class PostgresSpaceStore implements SpaceStore {
           parsed.steps ? JSON.stringify(parsed.steps) : null
         ]
       );
+      // Only COPY/PASTE history is capped (newest 100); plans and notes go only by an explicit delete.
       await client.query(
         `
           DELETE FROM clipboard_items
           WHERE owner_user_id = $1
+            AND source IN ('COPY', 'PASTE')
             AND id NOT IN (
               SELECT id
               FROM clipboard_items
               WHERE owner_user_id = $1
+                AND source IN ('COPY', 'PASTE')
               ORDER BY last_used_at DESC, id DESC
               LIMIT 100
             )
@@ -4880,6 +5015,25 @@ export class PostgresSpaceStore implements SpaceStore {
       const item = await client.query<ClipboardItemRow>(`${clipboardItemSelect} WHERE owner_user_id=$1 AND id=$2`, [owner,execution.planId]);
       return mapClipboardItem(item.rows[0]!);
     });
+  }
+
+  async updateClipboardNoteText(ownerUserId: string, clipboardItemId: string, text: string): Promise<ClipboardItem> {
+    const contentHash = createHash("sha256").update(text).digest("hex");
+    try {
+      const result = await this.pool.query<ClipboardItemRow>(
+        `UPDATE clipboard_items SET text = $3, content_hash = $4, character_count = char_length($3), last_used_at = clock_timestamp()
+          WHERE owner_user_id = $1 AND id = $2 AND source IN ('MANUAL_NOTE', 'AGENT_NOTE')
+          RETURNING id`,
+        [ownerUserId, clipboardItemId, text, contentHash]
+      );
+      firstOrNotFound(result.rows, `Clipboard note ${clipboardItemId} was not found.`);
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") throw new SpaceConflictError("Another clipboard record already has this exact text.");
+      throw error;
+    }
+    const item = await this.getClipboardItem(ownerUserId, clipboardItemId);
+    if (!item) throw new SpaceNotFoundError(`Clipboard note ${clipboardItemId} was not found.`);
+    return item;
   }
 
   async setClipboardItemCompleted(
@@ -5097,15 +5251,22 @@ export class PostgresSpaceStore implements SpaceStore {
   async upsertTaskItem(input: UpsertTaskItemInput): Promise<TaskItem> {
     const parsed = upsertTaskItemInputSchema.parse(input);
     const contentHash = createHash("sha256").update(parsed.objective).digest("hex");
+    const given = resolveTaskScheduleZone(parsed.schedule, parsed.schedule && !parsed.schedule.timeZone ? ownerWorkingTimeZone(await this.getUserSettings(parsed.ownerUserId)) : "UTC");
     return this.withTransaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [parsed.ownerUserId]);
+      const existingRow = (await client.query<TaskItemRow>(
+        `${taskItemSelect} WHERE owner_user_id = $1 AND content_hash = $2 FOR UPDATE`, [parsed.ownerUserId, contentHash]
+      )).rows[0];
+      const existing = existingRow ? mapTaskItem(existingRow).schedule : null;
+      const schedule = given !== undefined ? given : existing && { recurrence: existing.recurrence, timeZone: existing.timeZone };
+      const nextRunAt = taskScheduleNextRunAt(schedule ?? null, parsed.status, Date.now(), existing);
       const result = await client.query<TaskItemRow>(
         `
           INSERT INTO task_items (
             id, owner_user_id, content_hash, title, objective, status, source, room_id, pane_id, pane_title,
-            occurrence_count, character_count, created_at, last_used_at
+            occurrence_count, character_count, created_at, last_used_at, recurrence, time_zone, next_run_at
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, char_length($5), clock_timestamp(), clock_timestamp())
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, char_length($5), clock_timestamp(), clock_timestamp(), $11::jsonb, $12, $13)
           ON CONFLICT (owner_user_id, content_hash)
           DO UPDATE SET
             title = EXCLUDED.title,
@@ -5116,20 +5277,11 @@ export class PostgresSpaceStore implements SpaceStore {
             pane_title = EXCLUDED.pane_title,
             occurrence_count = task_items.occurrence_count + 1,
             character_count = EXCLUDED.character_count,
-            last_used_at = clock_timestamp()
-          RETURNING
-            id,
-            title,
-            objective,
-            status,
-            source,
-            room_id AS "roomId",
-            pane_id AS "paneId",
-            pane_title AS "paneTitle",
-            occurrence_count AS "occurrenceCount",
-            character_count AS "characterCount",
-            created_at AS "createdAt",
-            last_used_at AS "lastUsedAt"
+            last_used_at = clock_timestamp(),
+            recurrence = EXCLUDED.recurrence,
+            time_zone = EXCLUDED.time_zone,
+            next_run_at = EXCLUDED.next_run_at
+          RETURNING ${taskItemReturning}
         `,
         [
           makeSpaceId("task"),
@@ -5141,17 +5293,25 @@ export class PostgresSpaceStore implements SpaceStore {
           parsed.source,
           parsed.roomId ?? null,
           parsed.paneId ?? null,
-          parsed.paneTitle ?? null
+          parsed.paneTitle ?? null,
+          schedule ? JSON.stringify(schedule.recurrence) : null,
+          schedule?.timeZone ?? null,
+          nextRunAt
         ]
       );
+      // Only finished, unscheduled tasks are capped (newest 100); open and scheduled tasks go only by an explicit delete.
       await client.query(
         `
           DELETE FROM task_items
           WHERE owner_user_id = $1
+            AND status IN ('DONE', 'ARCHIVED')
+            AND recurrence IS NULL
             AND id NOT IN (
               SELECT id
               FROM task_items
               WHERE owner_user_id = $1
+                AND status IN ('DONE', 'ARCHIVED')
+                AND recurrence IS NULL
               ORDER BY last_used_at DESC, id DESC
               LIMIT 100
             )
@@ -5204,46 +5364,54 @@ export class PostgresSpaceStore implements SpaceStore {
 
   async updateTaskItem(ownerUserId: string, taskItemId: string, input: UpdateTaskItemInput): Promise<TaskItem> {
     const parsed = updateTaskItemInputSchema.parse(input);
-    const updates: string[] = [];
-    const values: unknown[] = [ownerUserId, taskItemId];
-    if (parsed.title !== undefined) {
-      values.push(parsed.title);
-      updates.push(`title = $${values.length}`);
-    }
-    if (parsed.objective !== undefined) {
-      values.push(parsed.objective);
-      updates.push(`objective = $${values.length}`, `character_count = char_length($${values.length})`);
-    }
-    if (parsed.status !== undefined) {
-      values.push(parsed.status);
-      updates.push(`status = $${values.length}`);
-    }
-    if (updates.length === 0) {
-      throw new Error("Task update must include title, objective, or status.");
-    }
-    updates.push("last_used_at = clock_timestamp()");
-    const result = await this.pool.query<TaskItemRow>(
-      `
-        UPDATE task_items
-        SET ${updates.join(", ")}
-        WHERE owner_user_id = $1 AND id = $2
-        RETURNING
-          id,
-          title,
-          objective,
-          status,
-          source,
-          room_id AS "roomId",
-          pane_id AS "paneId",
-          pane_title AS "paneTitle",
-          occurrence_count AS "occurrenceCount",
-          character_count AS "characterCount",
-          created_at AS "createdAt",
-          last_used_at AS "lastUsedAt"
-      `,
-      values
+    const given = resolveTaskScheduleZone(parsed.schedule, parsed.schedule && !parsed.schedule.timeZone ? ownerWorkingTimeZone(await this.getUserSettings(ownerUserId)) : "UTC");
+    return this.withTransaction(async (client) => {
+      const currentRow = (await client.query<TaskItemRow>(
+        `${taskItemSelect} WHERE owner_user_id = $1 AND id = $2 FOR UPDATE`, [ownerUserId, taskItemId]
+      )).rows[0];
+      const current = mapTaskItem(firstOrNotFound(currentRow ? [currentRow] : [], `Task item ${taskItemId} was not found.`));
+      const schedule = given !== undefined ? given
+        : current.schedule && { recurrence: current.schedule.recurrence, timeZone: current.schedule.timeZone };
+      const nextRunAt = taskScheduleNextRunAt(schedule, parsed.status ?? current.status, Date.now(), current.schedule);
+      const values: unknown[] = [ownerUserId, taskItemId, schedule ? JSON.stringify(schedule.recurrence) : null, schedule?.timeZone ?? null, nextRunAt];
+      const updates = ["recurrence = $3::jsonb", "time_zone = $4", "next_run_at = $5"];
+      if (parsed.title !== undefined) {
+        values.push(parsed.title);
+        updates.push(`title = $${values.length}`);
+      }
+      if (parsed.objective !== undefined) {
+        values.push(parsed.objective);
+        updates.push(`objective = $${values.length}`, `character_count = char_length($${values.length})`);
+      }
+      if (parsed.status !== undefined) {
+        values.push(parsed.status);
+        updates.push(`status = $${values.length}`);
+      }
+      updates.push("last_used_at = clock_timestamp()");
+      const result = await client.query<TaskItemRow>(
+        `UPDATE task_items SET ${updates.join(", ")} WHERE owner_user_id = $1 AND id = $2 RETURNING ${taskItemReturning}`,
+        values
+      );
+      return mapTaskItem(firstOrNotFound(result.rows, `Task item ${taskItemId} was not found.`));
+    });
+  }
+
+  /** Scheduled tasks whose next run is due, oldest first. */
+  async dueTaskSchedules(nowIso: string, limit: number): Promise<Array<TaskItem & { ownerUserId: string }>> {
+    const result = await this.pool.query<TaskItemRow & { ownerUserId: string }>(
+      `SELECT ${taskItemReturning}, owner_user_id AS "ownerUserId" FROM task_items WHERE next_run_at <= $1 ORDER BY next_run_at ASC, id ASC LIMIT $2`, [nowIso, limit]
     );
-    return mapTaskItem(firstOrNotFound(result.rows, `Task item ${taskItemId} was not found.`));
+    return result.rows.map(({ ownerUserId, ...row }) => ({ ...mapTaskItem(row), ownerUserId }));
+  }
+
+  /** Advances one occurrence with a compare-and-set on its due time, so it is handled once. */
+  async claimTaskSchedule(taskItemId: string, expectedNextRunAt: string, update: { nextRunAt: string | null; outcome: string; ran: boolean }): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE task_items SET next_run_at = $3, last_outcome = $4, last_run_at = CASE WHEN $5 THEN clock_timestamp() ELSE last_run_at END
+        WHERE id = $1 AND next_run_at = $2`,
+      [taskItemId, expectedNextRunAt, update.nextRunAt, update.outcome.slice(0, 500), update.ran]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   async deleteTaskItem(ownerUserId: string, taskItemId: string): Promise<TaskItem> {
@@ -5251,19 +5419,7 @@ export class PostgresSpaceStore implements SpaceStore {
       `
         DELETE FROM task_items
         WHERE owner_user_id = $1 AND id = $2
-        RETURNING
-          id,
-          title,
-          objective,
-          status,
-          source,
-          room_id AS "roomId",
-          pane_id AS "paneId",
-          pane_title AS "paneTitle",
-          occurrence_count AS "occurrenceCount",
-          character_count AS "characterCount",
-          created_at AS "createdAt",
-          last_used_at AS "lastUsedAt"
+        RETURNING ${taskItemReturning}
       `,
       [ownerUserId, taskItemId]
     );
@@ -5387,6 +5543,7 @@ export class PostgresSpaceStore implements SpaceStore {
       googleId: string | null;
       avatarUrl: string | null;
       roomCount: string | number;
+      disabled: boolean;
       createdAt: Date | string;
       updatedAt: Date | string;
     }>(
@@ -5398,11 +5555,12 @@ export class PostgresSpaceStore implements SpaceStore {
           u.google_id AS "googleId",
           u.avatar_url AS "avatarUrl",
           COUNT(r.id)::int AS "roomCount",
+          u.disabled_at IS NOT NULL AS "disabled",
           u.created_at AS "createdAt",
           u.updated_at AS "updatedAt"
         FROM users u
         LEFT JOIN rooms r ON r.owner_user_id = u.id
-        GROUP BY u.id, u.email, u.role, u.google_id, u.avatar_url, u.created_at, u.updated_at
+        GROUP BY u.id, u.email, u.role, u.google_id, u.avatar_url, u.disabled_at, u.created_at, u.updated_at
         ORDER BY u.created_at ASC
       `
     );
@@ -5413,9 +5571,146 @@ export class PostgresSpaceStore implements SpaceStore {
       googleId: row.googleId,
       avatarUrl: row.avatarUrl,
       roomCount: Number(row.roomCount),
+      disabled: row.disabled === true,
       createdAt: toIso(row.createdAt)!,
       updatedAt: toIso(row.updatedAt)!
     }));
+  }
+
+  async createUserInvite(input: CreateUserInviteRecord): Promise<UserInvite> {
+    const taken = await this.pool.query("SELECT 1 FROM users WHERE lower(email) = lower($1) LIMIT 1", [input.email]);
+    if (taken.rows.length > 0) throw new SpaceConflictError("This email already has a SpaceApp account.");
+    const result = await this.pool.query<UserInviteRow>(
+      `INSERT INTO user_invites (id, token_sha256, email, role, created_by, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${userInviteColumns}`,
+      [makeSpaceId("user_invite"), input.tokenSha256, input.email, input.role, input.createdBy, input.createdAt, input.expiresAt]
+    );
+    return userInviteFromRow(result.rows[0]!);
+  }
+
+  async listUserInvites(): Promise<UserInvite[]> {
+    const result = await this.pool.query<UserInviteRow>(
+      `SELECT ${userInviteColumns} FROM user_invites ORDER BY created_at DESC LIMIT 200`
+    );
+    return result.rows.map(userInviteFromRow);
+  }
+
+  async revokeUserInvite(inviteId: string, revokedAt: string): Promise<boolean> {
+    const result = await this.pool.query(
+      "UPDATE user_invites SET revoked_at = $2 WHERE id = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
+      [inviteId, revokedAt]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async acceptUserInvite(input: { tokenSha256: string; passwordHash: string; now: string }): Promise<AuthUser | null> {
+    const client = await this.pool.connect();
+    let rollbackFailed = false;
+    try {
+      await client.query("BEGIN");
+      const found = await client.query<{ id: string; email: string; role: AuthUser["role"]; expiresAt: Date | string }>(
+        `SELECT id, email, role, expires_at AS "expiresAt" FROM user_invites
+         WHERE token_sha256 = $1 AND accepted_at IS NULL AND revoked_at IS NULL FOR UPDATE`,
+        [input.tokenSha256]
+      );
+      const invite = found.rows[0];
+      const taken = invite
+        ? await client.query("SELECT 1 FROM users WHERE lower(email) = lower($1) LIMIT 1", [invite.email])
+        : null;
+      if (!invite || Date.parse(input.now) >= Date.parse(toIso(invite.expiresAt)) || (taken?.rows.length ?? 0) > 0) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      const user = authUserSchema.parse({ id: makeSpaceId("user"), email: invite.email, role: invite.role });
+      await client.query(
+        "INSERT INTO users (id, email, role, password_hash, updated_at) VALUES ($1, $2, $3, $4, $5)",
+        [user.id, user.email, user.role, input.passwordHash, input.now]
+      );
+      await client.query(
+        "UPDATE user_invites SET accepted_at = $2, accepted_user_id = $3 WHERE id = $1",
+        [invite.id, input.now, user.id]
+      );
+      await client.query("COMMIT");
+      return user;
+    } catch (error) {
+      rollbackFailed = await rollbackKeepingError(client);
+      throw error;
+    } finally {
+      client.release?.(rollbackFailed || undefined);
+    }
+  }
+
+  async getPasswordUser(email: string): Promise<OwnerCredentials | null> {
+    const result = await this.pool.query<AuthUser & { passwordHash: string }>(
+      `SELECT id, email, role, google_id AS "googleId", avatar_url AS "avatarUrl", password_hash AS "passwordHash"
+       FROM users WHERE lower(email) = lower($1) AND password_hash IS NOT NULL AND disabled_at IS NULL LIMIT 1`,
+      [email]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const { passwordHash, ...user } = row;
+    return { user: authUserSchema.parse(user), passwordHash };
+  }
+
+  async setUserDisabled(userId: string, disabled: boolean, at: string): Promise<boolean> {
+    const result = await this.pool.query(
+      "UPDATE users SET disabled_at = CASE WHEN $2 THEN $3::timestamptz ELSE NULL END, updated_at = $3 WHERE id = $1",
+      [userId, disabled, at]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async isUserDisabled(userId: string): Promise<boolean> {
+    const result = await this.pool.query<{ disabled: boolean }>(
+      'SELECT disabled_at IS NOT NULL AS "disabled" FROM users WHERE id = $1',
+      [userId]
+    );
+    return result.rows[0]?.disabled === true;
+  }
+
+  async setRoomShare(share: RoomShare): Promise<RoomShare> {
+    const result = await this.pool.query<RoomShareRow>(
+      `INSERT INTO room_shares (room_id, user_id, permission, created_by, created_at) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (room_id, user_id) DO UPDATE SET permission = EXCLUDED.permission, created_by = EXCLUDED.created_by
+       RETURNING ${roomShareColumns}`,
+      [share.roomId, share.userId, share.permission, share.createdBy, share.createdAt]
+    );
+    return roomShareFromRow(result.rows[0]!);
+  }
+
+  async deleteRoomShare(roomId: string, userId: string): Promise<boolean> {
+    const result = await this.pool.query("DELETE FROM room_shares WHERE room_id = $1 AND user_id = $2", [roomId, userId]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async getRoomShare(roomId: string, userId: string): Promise<RoomShare | null> {
+    const result = await this.pool.query<RoomShareRow>(
+      `SELECT ${roomShareColumns} FROM room_shares WHERE room_id = $1 AND user_id = $2`, [roomId, userId]);
+    return result.rows[0] ? roomShareFromRow(result.rows[0]) : null;
+  }
+
+  async listRoomShares(roomId: string): Promise<RoomShare[]> {
+    const result = await this.pool.query<RoomShareRow>(
+      `SELECT ${roomShareColumns} FROM room_shares WHERE room_id = $1 ORDER BY created_at ASC`, [roomId]);
+    return result.rows.map(roomShareFromRow);
+  }
+
+  async listSharedRooms(userId: string): Promise<Room[]> {
+    const result = await this.pool.query<RoomRow>(
+      `${roomSelect} WHERE id IN (SELECT room_id FROM room_shares WHERE user_id = $1) ORDER BY room_order ASC, created_at ASC`,
+      [userId]
+    );
+    return result.rows.map(mapRoom);
+  }
+
+  async setPaneOwner(paneId: string, userId: string): Promise<void> {
+    await this.pool.query("UPDATE panes SET owner_user_id = $2 WHERE id = $1", [paneId, userId]);
+  }
+
+  async getPaneOwner(paneId: string): Promise<string | null> {
+    const result = await this.pool.query<{ ownerUserId: string | null }>(
+      'SELECT owner_user_id AS "ownerUserId" FROM panes WHERE id = $1', [paneId]);
+    return result.rows[0]?.ownerUserId ?? null;
   }
 
   async updateUserRole(userId: string, role: "ADMIN" | "USER"): Promise<AuthUser> {
@@ -6816,7 +7111,7 @@ export class PostgresSpaceStore implements SpaceStore {
 
   async enqueueRoomAgentMission(
     input: EnqueueRoomAgentMissionInput,
-    _traceId = makeSpaceId("trace")
+    traceId?: string
   ): Promise<RoomAgentEnqueueRecord> {
     const queueItem = roomAgentSupervisorQueueItemSchema.parse(input.queueItem);
     const sessionId = queueItem.turn.agentSessionId;
@@ -7051,9 +7346,10 @@ export class PostgresSpaceStore implements SpaceStore {
       const missionResult = missionInput ? await client.query<RoomAgentMissionRow>(
         `
           INSERT INTO room_agent_missions (
-            mission_id, request_id, room_id, session_id, workflow_id, status, current_pane_id, status_reason, execution_state
+            mission_id, request_id, room_id, session_id, workflow_id, status, current_pane_id, status_reason, execution_state,
+            trace_id
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
           RETURNING
             dot_id AS "dotId", mission_id AS id, request_id AS "requestId", room_id AS "roomId", session_id AS "sessionId",
             workflow_id AS "workflowId", status, current_pane_id AS "currentPaneId", status_reason AS "statusReason",
@@ -7062,7 +7358,8 @@ export class PostgresSpaceStore implements SpaceStore {
             last_progress_at AS "lastProgressAt", execution_state AS "executionState", updated_at AS "updatedAt"
         `,
         [missionInput.id, missionInput.requestId, missionInput.roomId, missionInput.sessionId, missionInput.workflowId,
-          missionInput.status, missionInput.currentPaneId, missionInput.statusReason, JSON.stringify(missionInput.executionState)]
+          missionInput.status, missionInput.currentPaneId, missionInput.statusReason, JSON.stringify(missionInput.executionState),
+          traceId ?? null]
       ) : null;
       const mission = linkedMission ?? mapRoomAgentMission(firstOrNotFound(
         missionResult?.rows ?? [],
@@ -7150,7 +7447,7 @@ export class PostgresSpaceStore implements SpaceStore {
 
   async createRoomAgentMission(
     input: CreateRoomAgentMissionInput,
-    _traceId = makeSpaceId("trace")
+    traceId?: string
   ): Promise<RoomAgentMissionRecord> {
     const parsed = createRoomAgentMissionInputSchema.parse(input);
     return this.withTransaction(async (client) => {
@@ -7175,9 +7472,10 @@ export class PostgresSpaceStore implements SpaceStore {
             status,
             current_pane_id,
             status_reason,
-            execution_state
+            execution_state,
+            trace_id
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
           RETURNING
             dot_id AS "dotId", mission_id AS id,
             request_id AS "requestId",
@@ -7205,7 +7503,8 @@ export class PostgresSpaceStore implements SpaceStore {
           parsed.status,
           parsed.currentPaneId,
           parsed.statusReason,
-          JSON.stringify(parsed.executionState)
+          JSON.stringify(parsed.executionState),
+          traceId ?? null
         ]
       );
       return mapRoomAgentMission(firstOrNotFound(result.rows, `Room agent mission ${parsed.id} was not created.`));
@@ -7243,7 +7542,8 @@ export class PostgresSpaceStore implements SpaceStore {
               total_paused_ms = COALESCE($12, total_paused_ms),
               last_progress_at = CASE WHEN $13::boolean THEN $14 ELSE last_progress_at END,
               execution_state = CASE WHEN $15::boolean THEN $16::jsonb ELSE execution_state END,
-              updated_at = $17
+              updated_at = $17,
+              error_code = COALESCE(error_code, $18)
           WHERE mission_id = $1
           RETURNING
             dot_id AS "dotId", mission_id AS id,
@@ -7280,7 +7580,8 @@ export class PostgresSpaceStore implements SpaceStore {
           parsed.lastProgressAt ?? null,
           "executionState" in parsed,
           JSON.stringify(parsed.executionState ?? {}),
-          nowIso()
+          nowIso(),
+          parsed.errorCode ?? null
         ]
       );
       return mapRoomAgentMission(firstOrNotFound(result.rows, `Room agent mission ${missionId} was not found.`));
@@ -7507,7 +7808,7 @@ export class PostgresSpaceStore implements SpaceStore {
 
   async upsertRoomAgentTaskRun(
     input: UpsertRoomAgentTaskRunInput,
-    _traceId = makeSpaceId("trace")
+    traceId?: string
   ): Promise<RoomAgentTaskRunRecord> {
     const parsed = upsertRoomAgentTaskRunInputSchema.parse(input);
     const resultPayload = {
@@ -7537,10 +7838,12 @@ export class PostgresSpaceStore implements SpaceStore {
       `
         INSERT INTO room_agent_task_runs (
           run_id, mission_id, room_id, step_id, pane_id, label, instruction, status,
-          result_payload, queued_at, started_at, first_response_at, completed_at, updated_at
+          result_payload, queued_at, started_at, first_response_at, completed_at, updated_at, trace_id, error_code
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         ON CONFLICT (mission_id, step_id) DO UPDATE SET
+          trace_id = COALESCE(room_agent_task_runs.trace_id, EXCLUDED.trace_id),
+          error_code = COALESCE(room_agent_task_runs.error_code, EXCLUDED.error_code),
           pane_id = EXCLUDED.pane_id,
           label = EXCLUDED.label,
           instruction = EXCLUDED.instruction,
@@ -7559,7 +7862,7 @@ export class PostgresSpaceStore implements SpaceStore {
       [
         parsed.runId, parsed.missionId, parsed.roomId, parsed.stepId, parsed.paneId, parsed.label,
         parsed.instruction, parsed.status, JSON.stringify(resultPayload), parsed.queuedAt, parsed.startedAt,
-        parsed.firstResponseAt, parsed.completedAt, nowIso()
+        parsed.firstResponseAt, parsed.completedAt, nowIso(), traceId ?? null, parsed.errorCode ?? null
       ]
     );
     return mapRoomAgentTaskRun(firstOrNotFound(result.rows, `Room agent task run ${parsed.stepId} was not persisted.`));
@@ -7657,6 +7960,39 @@ export class PostgresSpaceStore implements SpaceStore {
     });
   }
 
+  async updateFreelanceCopilotMetadata(paneId: string, metadata: FreelanceCopilotPaneMetadata): Promise<Pane> {
+    const parsed = freelanceCopilotPaneMetadataSchema.parse(metadata);
+    return this.withTransaction(async client => {
+      const pane = await this.getPaneForUpdate(client, paneId);
+      if (pane.mode !== "FREELANCE_COPILOT" || pane.isClosed) throw new SpaceConflictError("An open Freelance Copilot pane is required.");
+      const timestamp = nowIso();
+      await client.query("UPDATE panes SET freelance_copilot_metadata = $2::jsonb, updated_at = $3 WHERE id = $1", [paneId, JSON.stringify(parsed), timestamp]);
+      return { ...pane, freelanceCopilotMetadata: parsed, updatedAt: timestamp };
+    });
+  }
+
+  async updateDesignMetadata(paneId: string, metadata: DesignPaneMetadata): Promise<Pane> {
+    const parsed = designPaneMetadataSchema.parse(metadata);
+    return this.withTransaction(async client => {
+      const pane = await this.getPaneForUpdate(client, paneId);
+      if (pane.mode !== "DESIGN" || pane.isClosed) throw new SpaceConflictError("An open Design pane is required.");
+      const timestamp = nowIso();
+      await client.query("UPDATE panes SET design_metadata = $2::jsonb, updated_at = $3 WHERE id = $1", [paneId, JSON.stringify(parsed), timestamp]);
+      return { ...pane, designMetadata: parsed, updatedAt: timestamp };
+    });
+  }
+
+  async updateAppStudioMetadata(paneId: string, metadata: AppStudioPaneMetadata): Promise<Pane> {
+    const parsed = appStudioPaneMetadataSchema.parse(metadata);
+    return this.withTransaction(async client => {
+      const pane = await this.getPaneForUpdate(client, paneId);
+      if (pane.mode !== "APP_STUDIO" || pane.isClosed) throw new SpaceConflictError("An open App Studio pane is required.");
+      const timestamp = nowIso();
+      await client.query("UPDATE panes SET app_studio_metadata = $2::jsonb, updated_at = $3 WHERE id = $1", [paneId, JSON.stringify(parsed), timestamp]);
+      return { ...pane, appStudioMetadata: parsed, updatedAt: timestamp };
+    });
+  }
+
   async updatePane(paneId: string, input: UpdatePaneInput, traceId = makeSpaceId("trace")): Promise<Pane> {
     return this.withTransaction(async (client) => {
       const current = await this.getPaneForUpdate(client, paneId);
@@ -7702,7 +8038,7 @@ export class PostgresSpaceStore implements SpaceStore {
         providerId: input.providerId === undefined ? current.providerId : input.providerId,
         modelId: input.modelId === undefined ? current.modelId : input.modelId,
         terminalRuntimeId:
-          ["TERMINAL", "JOB_APPLY", "MAIL_COPILOT", "MARKETING_COPILOT"].includes(input.mode ?? current.mode)
+          ["TERMINAL", "JOB_APPLY", "MAIL_COPILOT", "MARKETING_COPILOT", "FREELANCE_COPILOT", "DESIGN", "APP_STUDIO"].includes(input.mode ?? current.mode)
             ? input.terminalRuntimeId === undefined
               ? current.terminalRuntimeId
               : input.terminalRuntimeId
@@ -7750,6 +8086,9 @@ export class PostgresSpaceStore implements SpaceStore {
     job_apply_metadata AS "jobApplyMetadata",
     mail_copilot_metadata AS "mailCopilotMetadata",
     marketing_copilot_metadata AS "marketingCopilotMetadata",
+    freelance_copilot_metadata AS "freelanceCopilotMetadata",
+    design_metadata AS "designMetadata",
+    app_studio_metadata AS "appStudioMetadata",
             mode,
             status,
             provider_id AS "providerId",
@@ -10119,8 +10458,8 @@ export class PostgresSpaceStore implements SpaceStore {
       if (pane.roomId !== parsed.roomId) {
         throw new SpaceNotFoundError(`Pane ${parsed.paneId} was not found.`);
       }
-      if (pane.mode !== "TERMINAL" && pane.mode !== "JOB_APPLY" && pane.mode !== "MAIL_COPILOT" && pane.mode !== "MARKETING_COPILOT") {
-        throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; CLI sessions require TERMINAL, JOB_APPLY, MAIL_COPILOT or MARKETING_COPILOT panes.`);
+      if (pane.mode !== "TERMINAL" && pane.mode !== "JOB_APPLY" && pane.mode !== "MAIL_COPILOT" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT" && pane.mode !== "DESIGN" && pane.mode !== "APP_STUDIO") {
+        throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; CLI sessions require TERMINAL, JOB_APPLY, MAIL_COPILOT, MARKETING_COPILOT, FREELANCE_COPILOT, DESIGN or APP_STUDIO panes.`);
       }
       if (pane.isClosed) {
         throw new SpaceConflictError(`Pane ${pane.id} is closed.`);
@@ -11021,8 +11360,8 @@ export class PostgresSpaceStore implements SpaceStore {
       if (pane.roomId !== parsed.roomId) {
         throw new SpaceNotFoundError(`Pane ${parsed.paneId} was not found.`);
       }
-      if (pane.mode !== "BROWSER" && pane.mode !== "YOUTUBE" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT") {
-        throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; browser sessions require BROWSER, YOUTUBE, JOB_APPLY or MARKETING_COPILOT panes.`);
+      if (pane.mode !== "BROWSER" && pane.mode !== "YOUTUBE" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT") {
+        throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; browser sessions require BROWSER, YOUTUBE, JOB_APPLY, MARKETING_COPILOT or FREELANCE_COPILOT panes.`);
       }
       if (pane.isClosed) {
         throw new SpaceConflictError(`Pane ${pane.id} is closed.`);
@@ -11671,9 +12010,21 @@ export class PostgresSpaceStore implements SpaceStore {
   }
 
   async getActiveBrowserHandoffRequest(sessionId: string): Promise<BrowserHandoffRequest | null> {
+    const timestamp = nowIso();
+    // A request past its TTL is EXPIRED (status readers and the pane must not see it as REQUESTED). An accepted
+    // handoff stays the operator's while their control lease is alive, past the request's own TTL.
+    await this.pool.query(
+      `UPDATE browser_handoff_requests AS h
+          SET status = 'EXPIRED', expired_at = COALESCE(h.expired_at, $2), updated_at = $2
+        WHERE h.session_id = $1 AND h.expires_at <= $2
+          AND (h.status = 'REQUESTED' OR (h.status = 'ACCEPTED' AND NOT EXISTS (
+            SELECT 1 FROM browser_control_leases AS l
+             WHERE l.lease_id = h.control_lease_id AND l.status = 'ACTIVE' AND l.expires_at > $2)))`,
+      [sessionId, timestamp]
+    );
     const result = await this.pool.query<BrowserHandoffRequestRow>(
-      `${browserHandoffRequestSelect} WHERE session_id = $1 AND status IN ('REQUESTED', 'ACCEPTED') AND expires_at > $2 LIMIT 1`,
-      [sessionId, nowIso()]
+      `${browserHandoffRequestSelect} WHERE session_id = $1 AND status IN ('REQUESTED', 'ACCEPTED') ORDER BY requested_at DESC LIMIT 1`,
+      [sessionId]
     );
     return result.rows[0] ? mapBrowserHandoffRequest(result.rows[0]) : null;
   }
@@ -11710,9 +12061,12 @@ export class PostgresSpaceStore implements SpaceStore {
       const timestamp = nowIso();
       await client.query(
         `
-          UPDATE browser_handoff_requests
+          UPDATE browser_handoff_requests AS h
           SET status = 'EXPIRED', expired_at = $2, updated_at = $2
-          WHERE session_id = $1 AND status IN ('REQUESTED', 'ACCEPTED') AND expires_at <= $2
+          WHERE h.session_id = $1 AND h.expires_at <= $2
+            AND (h.status = 'REQUESTED' OR (h.status = 'ACCEPTED' AND NOT EXISTS (
+              SELECT 1 FROM browser_control_leases AS l
+               WHERE l.lease_id = h.control_lease_id AND l.status = 'ACTIVE' AND l.expires_at > $2)))
         `,
         [parsed.sessionId, timestamp]
       );
@@ -12378,7 +12732,12 @@ export class PostgresSpaceStore implements SpaceStore {
   async listTraceRecords(
     traceId: string,
     options: { limit?: number; sinceDays?: number } = {}
-  ): Promise<{ events: Event[]; auditEvents: AuditEvent[]; workflows: WorkflowRun[] }> {
+  ): Promise<{
+    events: Event[]; auditEvents: AuditEvent[]; workflows: WorkflowRun[];
+    agentRuns: Array<Pick<SpaceAgentRunRecord, "runId" | "workflowId" | "status" | "errorCode" | "createdAt" | "completedAt"> & { continuationOf: string | null }>;
+    roomAgentMissions: Array<{ missionId: string; roomId: string; status: string; errorCode: string | null; queuedAt: string; completedAt: string | null }>;
+    roomAgentTaskRuns: Array<{ runId: string; missionId: string; roomId: string; status: string; errorCode: string | null; queuedAt: string; completedAt: string | null }>;
+  }> {
     // Same bounds as traceRecordLimits in @space/runtime (kept local so this
     // package does not depend on a newer runtime build at test time).
     const bounded = (value: number | undefined, fallback: number, max: number) =>
@@ -12395,10 +12754,55 @@ export class PostgresSpaceStore implements SpaceStore {
       this.pool.query<AuditEventRow>(`${auditEventSelect} WHERE trace_id = $1 ORDER BY created_at DESC LIMIT $2`, [traceId, limit]),
       this.pool.query<WorkflowRunRow>(`${workflowRunSelect} WHERE trace_id = $1 ORDER BY started_at DESC LIMIT $2`, [traceId, limit])
     ]);
-    return {
+    const records = {
       events: events.rows.map(mapEvent),
       auditEvents: auditEvents.rows.map(mapAuditEvent),
       workflows: workflows.rows.map(mapWorkflowRun)
+    };
+    // Agent runs carry no trace id; they join the trace through its workflow ids (idx_space_agent_runs_workflow_id).
+    const workflowIds = new Set(records.workflows.map((workflow) => workflow.workflowId));
+    for (const event of records.events) {
+      const fromPayload = (event.payload as Record<string, unknown> | null | undefined)?.workflowId;
+      for (const id of [event.workflowId, fromPayload]) if (typeof id === "string" && id) workflowIds.add(id);
+    }
+    type RunRow = { runId: string; workflowId: string; status: SpaceAgentRunRecord["status"]; errorCode: string | null; createdAt: Date | string; completedAt: Date | string | null };
+    const runSelect = `SELECT run_id AS "runId", workflow_id AS "workflowId", status, error_code AS "errorCode", created_at AS "createdAt", completed_at AS "completedAt"
+      FROM space_agent_runs`;
+    const runs = workflowIds.size
+      ? await this.pool.query<RunRow>(`${runSelect} WHERE workflow_id = ANY($1::text[]) ORDER BY created_at DESC LIMIT $2`, [[...workflowIds], limit])
+      : { rows: [] };
+    const agentRuns = runs.rows.map((row) => ({ ...row, createdAt: toIso(row.createdAt), completedAt: toIso(row.completedAt), continuationOf: null as string | null }));
+    // Background continuations keep their own trace (workflow ids embed it); follow them from the run they continue
+    // (idx_room_agent_requests_continuation_source), at most 50 generations and the row limit.
+    let frontier = agentRuns.map((run) => run.runId);
+    for (let generation = 0; generation < 50 && frontier.length && agentRuns.length < limit; generation += 1) {
+      const continued = await this.pool.query<{ runId: string; sourceRunId: string }>(
+        `SELECT turn_payload->'turn'->>'agentRunId' AS "runId", turn_payload->'turn'->'roomAgentContinuation'->>'sourceRunId' AS "sourceRunId"
+           FROM room_agent_requests WHERE turn_payload->'turn'->'roomAgentContinuation'->>'sourceRunId' = ANY($1::text[]) LIMIT $2`,
+        [frontier, limit - agentRuns.length]
+      );
+      const sources = new Map(continued.rows.filter((row) => row.runId && !agentRuns.some((run) => run.runId === row.runId))
+        .map((row) => [row.runId, row.sourceRunId]));
+      if (!sources.size) break;
+      const found = await this.pool.query<RunRow>(`${runSelect} WHERE run_id = ANY($1::text[]) ORDER BY created_at ASC`, [[...sources.keys()]]);
+      for (const row of found.rows) {
+        agentRuns.push({ ...row, createdAt: toIso(row.createdAt), completedAt: toIso(row.completedAt), continuationOf: sources.get(row.runId) ?? null });
+      }
+      frontier = found.rows.map((row) => row.runId);
+    }
+    const [missions, taskRuns] = await Promise.all([
+      this.pool.query<{ missionId: string; roomId: string; status: string; errorCode: string | null; queuedAt: Date | string; completedAt: Date | string | null }>(
+        `SELECT mission_id AS "missionId", room_id AS "roomId", status, error_code AS "errorCode", queued_at AS "queuedAt", completed_at AS "completedAt"
+           FROM room_agent_missions WHERE trace_id = $1 ORDER BY queued_at DESC LIMIT $2`, [traceId, limit]),
+      this.pool.query<{ runId: string; missionId: string; roomId: string; status: string; errorCode: string | null; queuedAt: Date | string; completedAt: Date | string | null }>(
+        `SELECT run_id AS "runId", mission_id AS "missionId", room_id AS "roomId", status, error_code AS "errorCode", queued_at AS "queuedAt", completed_at AS "completedAt"
+           FROM room_agent_task_runs WHERE trace_id = $1 ORDER BY queued_at DESC LIMIT $2`, [traceId, limit])
+    ]);
+    return {
+      ...records,
+      agentRuns: agentRuns.slice(0, limit),
+      roomAgentMissions: missions.rows.map((row) => ({ ...row, queuedAt: toIso(row.queuedAt), completedAt: toIso(row.completedAt) })),
+      roomAgentTaskRuns: taskRuns.rows.map((row) => ({ ...row, queuedAt: toIso(row.queuedAt), completedAt: toIso(row.completedAt) }))
     };
   }
 
@@ -13779,8 +14183,8 @@ export class PostgresSpaceStore implements SpaceStore {
       const memoryId = makeSpaceId("memory");
       const result = await client.query<MemoryEntryRow>(
         `
-          INSERT INTO memory_records (id, scope, room_id, title, body, provenance, embedding, created_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8)
+          INSERT INTO memory_records (id, scope, room_id, title, body, provenance, embedding, embedding_model, created_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $9, $8)
           RETURNING
             id,
             scope,
@@ -13798,7 +14202,8 @@ export class PostgresSpaceStore implements SpaceStore {
           redactMemoryText(input.body),
           redactMemoryText(input.provenance),
           toPgVectorLiteral(options.embedding),
-          timestamp
+          timestamp,
+          options.embedding ? options.embeddingModel ?? null : null
         ]
       );
       const entry = mapMemoryEntry(firstOrNotFound(result.rows, `Memory entry ${memoryId} was not recorded.`));
@@ -13844,6 +14249,10 @@ export class PostgresSpaceStore implements SpaceStore {
       const index = values.length;
       where.push("embedding IS NOT NULL");
       orderBy = `embedding <=> $${index}::vector ASC, created_at DESC`;
+      if (options.embeddingModel) {
+        values.push(options.embeddingModel);
+        where.push(`embedding_model = $${values.length}`);
+      }
     }
     let limitClause = "";
     if (options.limit !== undefined) {
@@ -13855,6 +14264,33 @@ export class PostgresSpaceStore implements SpaceStore {
       values
     );
     return result.rows.map(mapMemoryEntry);
+  }
+
+  async listMemoryRecordsToEmbed(model: string, limit: number): Promise<MemoryRecordToEmbed[]> {
+    const result = await this.pool.query<MemoryRecordToEmbed>(
+      `SELECT id, title, body FROM memory_records WHERE embedding_model IS DISTINCT FROM $1
+       ORDER BY (embedding IS NULL) DESC, created_at DESC, id LIMIT $2`,
+      [model, Math.max(1, Math.min(500, Math.trunc(limit)))]
+    );
+    return result.rows;
+  }
+
+  async setMemoryRecordEmbedding(id: string, embedding: number[], model: string): Promise<void> {
+    const literal = toPgVectorLiteral(embedding);
+    if (!literal) throw new SpaceConflictError("A memory embedding must be a finite vector.");
+    const result = await this.pool.query("UPDATE memory_records SET embedding = $2::vector, embedding_model = $3 WHERE id = $1", [id, literal, model]);
+    if (result.rowCount === 0) throw new SpaceNotFoundError(`Memory record ${id} was not found.`);
+  }
+
+  async countMemoryRecordEmbeddings(): Promise<MemoryEmbeddingCounts> {
+    const totals = await this.pool.query<{ total: string; withoutEmbedding: string }>(
+      `SELECT count(*) AS total, count(*) FILTER (WHERE embedding IS NULL) AS "withoutEmbedding" FROM memory_records`
+    );
+    const models = await this.pool.query<{ model: string; count: string }>(
+      `SELECT coalesce(embedding_model, 'unknown') AS model, count(*) AS count FROM memory_records WHERE embedding IS NOT NULL GROUP BY 1 ORDER BY 1`
+    );
+    return { total: Number(totals.rows[0]?.total ?? 0), withoutEmbedding: Number(totals.rows[0]?.withoutEmbedding ?? 0),
+      byModel: models.rows.map((row) => ({ model: row.model, count: Number(row.count) })) };
   }
 
   async linkMemoryCacheRecord(input: LinkMemoryCacheInput): Promise<MemoryCacheLink> {
@@ -14723,8 +15159,8 @@ export class PostgresSpaceStore implements SpaceStore {
             AND p.updated_at < NOW() - ($1::text || ' hours')::interval
             AND ($2::text IS NULL OR p.room_id = $2)
             AND p.id NOT IN (SELECT pane_id FROM room_agent_bindings)
-            -- The newest closed Job and Marketing Copilot pane of each room stays: a new one continues its browser tabs and account.
-            AND ((p.mode IS DISTINCT FROM 'JOB_APPLY' AND p.mode IS DISTINCT FROM 'MARKETING_COPILOT') OR EXISTS (
+            -- The newest closed Job, Marketing and Freelance Copilot pane of each room stays: a new one continues its browser tabs and account.
+            AND ((p.mode IS DISTINCT FROM 'JOB_APPLY' AND p.mode IS DISTINCT FROM 'MARKETING_COPILOT' AND p.mode IS DISTINCT FROM 'FREELANCE_COPILOT') OR EXISTS (
               SELECT 1 FROM panes q
               WHERE q.room_id = p.room_id AND q.mode = p.mode AND q.is_closed = true
                 AND (q.updated_at, q.id) > (p.updated_at, p.id)
@@ -16150,10 +16586,12 @@ export class PostgresSpaceStore implements SpaceStore {
   ): Promise<ImportConfigResult> {
     const parsedBundle = spaceConfigBundleSchema.parse(bundle);
     const targetUserId = options.targetUserId || parsedBundle.source.exportedBy || "user:operator";
-    const mode = options.mode || "replace";
+    const mode = options.mode || "merge";
+    assertConfigReplaceConfirmed({ mode, confirmReplace: options.confirmReplace });
+    const take = (section: ConfigSection) => configImportIncludes(options.sections, section);
     // Decrypt and fit to this host before the transaction: a wrong passphrase writes nothing.
     const { secrets, warnings } = await openConfigBundleSecrets(parsedBundle, options.passphrase);
-    const prepared = await prepareConfigImport(parsedBundle, { pathRewrite: options.pathRewrite }, {
+    const prepared = await prepareConfigImport(parsedBundle, { pathRewrite: options.pathRewrite, sections: options.sections }, {
       profileExists: async (runtimeId, profileId) => {
         try { return Boolean(await this.getCliAccountProfile(runtimeId as CliToggleRuntimeId, profileId)); } catch { return false; }
       }
@@ -16162,6 +16600,7 @@ export class PostgresSpaceStore implements SpaceStore {
     const data = prepared.data;
 
     const client = await this.pool.connect();
+    let rollbackFailed = false;
     try {
       await client.query("BEGIN");
 
@@ -16177,11 +16616,12 @@ export class PostgresSpaceStore implements SpaceStore {
         warnings.push(`Target user ${targetUserId} not found in database; using existing user ${effectiveUserId}`);
       }
 
+      // A confirmed Replace clears only the sections this import brings.
       if (mode === "replace") {
-        await client.query("DELETE FROM rooms WHERE owner_user_id = $1", [effectiveUserId]);
-        await client.query("DELETE FROM user_links WHERE owner_user_id = $1", [effectiveUserId]);
-        await client.query("DELETE FROM clipboard_items WHERE owner_user_id = $1", [effectiveUserId]);
-        await client.query("DELETE FROM task_items WHERE owner_user_id = $1", [effectiveUserId]);
+        if (take("rooms")) await client.query("DELETE FROM rooms WHERE owner_user_id = $1", [effectiveUserId]);
+        if (take("userLinks")) await client.query("DELETE FROM user_links WHERE owner_user_id = $1", [effectiveUserId]);
+        if (take("clipboardItems")) await client.query("DELETE FROM clipboard_items WHERE owner_user_id = $1", [effectiveUserId]);
+        if (take("taskItems")) await client.query("DELETE FROM task_items WHERE owner_user_id = $1", [effectiveUserId]);
       }
 
       const roomIdMap = new Map<string, string>();
@@ -16321,7 +16761,10 @@ export class PostgresSpaceStore implements SpaceStore {
             settings = EXCLUDED.settings,
             updated_at = now()
           `,
-          [effectiveUserId, JSON.stringify(remapRoomKeyedSettings(data.userSettings, roomIdMap))]
+          [effectiveUserId, JSON.stringify(mode === "merge"
+            ? mergeImportedUserSettings((await client.query<{ settings: UserSettings }>("SELECT settings FROM user_settings WHERE user_id = $1", [effectiveUserId])).rows[0]?.settings,
+              remapRoomKeyedSettings(data.userSettings, roomIdMap))
+            : remapRoomKeyedSettings(data.userSettings, roomIdMap))]
         );
         settingsUpdated = true;
       }
@@ -16549,13 +16992,13 @@ export class PostgresSpaceStore implements SpaceStore {
       await client.query("COMMIT");
 
       let apiKeysImported = 0;
-      if (options.importApiKeys !== false && secrets.apiKeys && Object.keys(secrets.apiKeys).length > 0) {
+      if (options.importApiKeys !== false && take("apiKeys") && secrets.apiKeys && Object.keys(secrets.apiKeys).length > 0) {
         const res = writeImportedApiKeys(secrets.apiKeys, { secretsDir: options.secretsDir });
         apiKeysImported = res.imported;
         warnings.push(`Imported ${apiKeysImported} provider API key(s) to ${res.targetDir}`);
       }
 
-      const cliAuth = options.importCredentials !== false && secrets.cliAuth && hooks.applyCliAuth
+      const cliAuth = options.importCredentials !== false && take("credentials") && secrets.cliAuth && hooks.applyCliAuth
         ? await hooks.applyCliAuth(secrets.cliAuth)
         : undefined;
       const credentialsImported = cliAuth?.filter((entry) => entry.result === "imported").length ?? 0;
@@ -16580,10 +17023,10 @@ export class PostgresSpaceStore implements SpaceStore {
         cliAuth
       };
     } catch (error) {
-      await client.query("ROLLBACK");
+      rollbackFailed = await rollbackKeepingError(client);
       throw error;
     } finally {
-      client.release?.();
+      client.release?.(rollbackFailed || undefined);
     }
   }
 }

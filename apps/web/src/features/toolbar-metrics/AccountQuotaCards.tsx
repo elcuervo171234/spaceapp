@@ -26,6 +26,8 @@ export interface AccountQuotaEntry {
   availability: AvailabilityState;
   offlineLabel?: string;
   hint?: string;
+  /** Extra lines under the hint or the rows (the Claude API key's Anthropic bill). */
+  notes?: string[];
   rows: AccountQuotaRow[];
   // Remaining share of the tightest window, used to list the roomiest accounts first.
   capacity: number;
@@ -153,14 +155,17 @@ export function AccountQuotaCard({ entry, clock, settings }: {
         <div key={row.key} className="account-quota-row">
           {row.label ? <span className="account-quota-row-label">{row.label}</span> : null}
           <div className="account-quota-cells">
-            <QuotaCell
-              label="5h"
-              remaining={row.quota.fiveHourRemainingPercent}
-              resetAt={row.quota.fiveHourResetAt}
-              threshold={row.threshold}
-              clock={clock}
-              settings={settings}
-            />
+            {/* A known week without a 5h figure: the account has no 5h limit (Codex Prolite). */}
+            {row.quota.fiveHourRemainingPercent == null && row.quota.weeklyRemainingPercent != null ? null : (
+              <QuotaCell
+                label="5h"
+                remaining={row.quota.fiveHourRemainingPercent}
+                resetAt={row.quota.fiveHourResetAt}
+                threshold={row.threshold}
+                clock={clock}
+                settings={settings}
+              />
+            )}
             <QuotaCell
               label={row.weeklyScope ? `Week · ${row.weeklyScope}` : "Week"}
               remaining={row.quota.weeklyRemainingPercent}
@@ -172,6 +177,7 @@ export function AccountQuotaCard({ entry, clock, settings }: {
           </div>
         </div>
       )) : entry.hint ? <span className="toolbar-metric-dim">{entry.hint}</span> : null}
+      {entry.notes?.map((note) => <span key={note} className="account-quota-note">{note}</span>)}
     </li>
   );
 }

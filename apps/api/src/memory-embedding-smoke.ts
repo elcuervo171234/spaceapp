@@ -22,6 +22,8 @@ export interface MemoryEmbeddingSmokeOptions {
 export interface CreateMemoryEmbeddingOptions {
   fetchImpl?: EmbeddingFetchLike;
   readFileImpl?: (path: string) => Promise<string>;
+  /** Space Gateway only: what the vector is for (Gemini embeds documents and queries differently; OpenAI ignores it). */
+  taskType?: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY";
 }
 
 function parseMemoryEmbeddingProvider(provider: string): MemoryEmbeddingProvider | null {
@@ -29,7 +31,7 @@ function parseMemoryEmbeddingProvider(provider: string): MemoryEmbeddingProvider
 }
 
 function embeddingProviderName(provider: MemoryEmbeddingProvider): string {
-  return provider === "codex-lb" ? "Codex-LB" : "OpenAI";
+  return provider === "codex-lb" ? "Space Gateway" : "OpenAI";
 }
 
 function finishResult(
@@ -136,7 +138,7 @@ export async function runMemoryEmbeddingSmoke(
     return finishResult({
       status: "ERROR",
       code: "EMBEDDING_PROVIDER_UNSUPPORTED",
-      message: `Embedding provider ${provider} is not supported yet. Only OpenAI and Codex-LB embedding smoke are implemented.`,
+      message: `Embedding provider ${provider} is not supported yet. Only OpenAI and Space Gateway embedding smoke are implemented.`,
       smokeEnabled,
       provider,
       model,
@@ -227,7 +229,7 @@ export async function runMemoryEmbeddingSmoke(
       message:
         embeddingProvider === "openai"
           ? "OpenAI embedding smoke requires SPACE_MEMORY_EMBEDDING_BASE_URL to be https://api.openai.com/v1."
-          : "Codex-LB embedding smoke requires SPACE_MEMORY_EMBEDDING_BASE_URL to be an http(s) Codex-LB /v1 endpoint.",
+          : "Space Gateway embedding smoke requires SPACE_MEMORY_EMBEDDING_BASE_URL to be an http(s) Space Gateway /v1 endpoint.",
       smokeEnabled,
       provider,
       model,
@@ -346,7 +348,7 @@ function embeddingsUrl(provider: MemoryEmbeddingProvider, baseUrl: string): stri
       throw new Error("Unsupported OpenAI embeddings base URL.");
     }
   } else if (base.protocol !== "http:" && base.protocol !== "https:") {
-    throw new Error("Unsupported Codex-LB embeddings base URL.");
+    throw new Error("Unsupported Space Gateway embeddings base URL.");
   }
   if (base.username || base.password) {
     throw new Error("Embedding provider base URL must not include credentials.");
@@ -407,7 +409,8 @@ export async function createMemoryEmbedding(
       body: JSON.stringify({
         model: config.memoryEmbeddingModel,
         input,
-        dimensions: config.memoryEmbeddingDimensions
+        dimensions: config.memoryEmbeddingDimensions,
+        ...(embeddingProvider === "codex-lb" && options.taskType ? { task_type: options.taskType } : {})
       }),
       signal: abort.signal
     });
@@ -453,7 +456,8 @@ export async function createMemoryEmbeddings(
   }
   const fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
   const abort = new AbortController();
-  const timeout = setTimeout(() => abort.abort(), config.memoryEmbeddingTimeoutMs);
+  // The local model takes about a second a text on the CPU: each two texts of a batch get the whole timeout.
+  const timeout = setTimeout(() => abort.abort(), config.memoryEmbeddingTimeoutMs * Math.ceil(input.length / 2));
   try {
     const response = await fetchImpl(endpoint, {
       method: "POST",
@@ -464,7 +468,8 @@ export async function createMemoryEmbeddings(
       body: JSON.stringify({
         model: config.memoryEmbeddingModel,
         input,
-        dimensions: config.memoryEmbeddingDimensions
+        dimensions: config.memoryEmbeddingDimensions,
+        ...(embeddingProvider === "codex-lb" && options.taskType ? { task_type: options.taskType } : {})
       }),
       signal: abort.signal
     });

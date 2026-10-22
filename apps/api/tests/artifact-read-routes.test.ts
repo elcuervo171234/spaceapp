@@ -6,6 +6,8 @@ import { afterEach, beforeEach, expect, it } from "vitest";
 import { InMemorySpaceStore } from "@space/runtime";
 import { registerArtifactReadRoutes } from "../src/artifact-read-routes.js";
 import { FilesystemError } from "../src/filesystem-error.js";
+import { withPngMetadata } from "../src/design/images.js";
+import { pngOf } from "./fixtures/design-png.js";
 
 let app: ReturnType<typeof Fastify>;
 let root: string;
@@ -47,10 +49,20 @@ it("keeps active content as a sandboxed attachment and rejects symlink reads", a
   expect(response.headers["content-disposition"]).toMatch(/^attachment;/);
   expect(response.headers["content-security-policy"]).toContain("sandbox");
   expect(response.headers["x-content-type-options"]).toBe("nosniff");
+  expect(response.headers["cache-control"]).toBe("private, no-store");
   await rm(join(root, "browser-evidence", "fixture", "active.html"));
   await writeFile(join(root, "sentinel.txt"), "sentinel");
   await symlink(join(root, "sentinel.txt"), join(root, "browser-evidence", "fixture", "active.html"));
   expect((await app.inject(url)).statusCode).toBe(403);
+});
+
+it("lets the browser cache image files, whose bytes never change", async () => {
+  const file = artifact("photo.png", "image/png");
+  await writeFile(join(root, "browser-evidence", "fixture", "photo.png"), "png");
+  const response = await app.inject(`/api/artifacts/${encodeURIComponent(file.id)}/file`);
+  expect(response.statusCode).toBe(200);
+  expect(response.headers["cache-control"]).toBe("private, max-age=86400, stale-while-revalidate=604800");
+  expect(response.headers["content-security-policy"]).toContain("sandbox");
 });
 
 it("preserves plain text preview and forced Agent File download", async () => {
@@ -68,4 +80,29 @@ it("preserves plain text preview and forced Agent File download", async () => {
   expect(download.headers["content-disposition"]).toContain('attachment; filename="note.txt";');
   expect(download.headers["content-disposition"]).toContain("filename*=UTF-8''note.txt");
   expect(download.body).toBe("content");
+});
+
+it("answers the Details dialog: an image's measured size and the metadata a design PNG carries inside", async () => {
+  const design = { formatId: "linkedin", width: 1200, height: 627, description: "6 AI models played chess. Zero checkmates.", madeBy: { by: "AGENT", runtimeId: "cli:claude", model: "claude-opus-5-5" } };
+  const png = artifact("design-linkedin.png", "image/png");
+  await writeFile(join(root, "browser-evidence", "fixture", "design-linkedin.png"),
+    withPngMetadata(pngOf(1200, 627), { Description: design.description, Software: "SpaceApp Design", "spaceapp:design": JSON.stringify(design) }));
+  const response = await app.inject(`/api/artifacts/${encodeURIComponent(png.id)}/metadata`);
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toMatchObject({
+    artifact: { id: png.id, filename: expect.stringMatching(/\.png$/), mimeType: "image/png", sha256: "a".repeat(64) },
+    image: { width: 1200, height: 627 },
+    embedded: { Description: design.description, Software: "SpaceApp Design" },
+    design: { formatId: "linkedin", madeBy: { by: "AGENT", runtimeId: "cli:claude", model: "claude-opus-5-5" } }
+  });
+
+  // A JPEG has its size and nothing inside; a text file is not read; a deleted artifact is gone.
+  const jpeg = artifact("photo.jpg", "image/jpeg");
+  const sof = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x02, 0x73, 0x04, 0xb0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0]);
+  await writeFile(join(root, "browser-evidence", "fixture", "photo.jpg"), sof);
+  expect((await app.inject(`/api/artifacts/${encodeURIComponent(jpeg.id)}/metadata`)).json()).toMatchObject({ image: { width: 1200, height: 627 }, embedded: {}, design: null });
+  const note = artifact("note.txt", "text/plain");
+  expect((await app.inject(`/api/artifacts/${encodeURIComponent(note.id)}/metadata`)).json()).toMatchObject({ image: null, embedded: {}, design: null });
+  store.deleteArtifact(png.id);
+  expect((await app.inject(`/api/artifacts/${encodeURIComponent(png.id)}/metadata`)).statusCode).toBeGreaterThanOrEqual(400);
 });

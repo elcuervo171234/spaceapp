@@ -1,18 +1,23 @@
 import { randomBytes } from "node:crypto";
 import {
   effectiveMarketingAutonomy, MARKETING_CAMPAIGN_TEMPLATES, MARKETING_CHANNEL_LABELS, marketingRuleMatches, marketingUrlMatchesChannel, marketingWordingIssues, resolveMarketingCopilotPaneMetadata,
-  type MarketingCampaign, type MarketingCampaignCreate, type MarketingEvent, type MarketingMetric, type MarketingEventType, type MarketingMemoryCreate, type MarketingMemoryQuery, type MarketingPendingItem,
-  type MarketingPost, type MarketingPostCreate, type MarketingPostReviewDecision, type MarketingPostUpdate, type MarketingRule, type MarketingRuleProposal, type MarketingRun,
+  type MarketingBookmark, type MarketingBookmarkCreate, type MarketingCampaign, type MarketingCampaignCreate, type MarketingEvent, type MarketingMetric, type MarketingEventType, type MarketingMemoryCreate, type MarketingMemoryQuery, type MarketingPendingItem,
+  type MarketingAsset, type MarketingAssetInput, type MarketingPost, type MarketingPostCreate, type MarketingPostReviewDecision, type MarketingPostUpdate, type MarketingRule, type MarketingRuleProposal, type MarketingRun,
   type MarketingRunView, type Pane
 } from "@space/contracts";
 import type { MarketingCopilotRepository, MarketingPostFilter } from "@space/db";
 import { SpaceConflictError, SpaceNotFoundError } from "@space/runtime";
+import type { BrowserHostActorContext } from "@space/browser-host";
 
 export interface MarketingCopilotServiceOptions {
   /** Campaigns, posts, memory, activity, runs and rules. */
   repository: MarketingCopilotRepository;
   /** Every activity event, for the room stream and notifications. */
   onEvent?(event: MarketingEvent): void;
+  /** Opens a bookmark in a new tab of the pane browser with its Google account (the browser routes' openTab). */
+  openInBrowser?(owner: string, pane: Pane, bookmark: MarketingBookmark, traceId: string, actor: BrowserHostActorContext): Promise<unknown>;
+  /** A capture in the owner's room Media as a post asset: its file path and kind, kept until deleted by hand. */
+  resolveArtifactAsset?(owner: string, artifactId: string): Promise<{ path: string; kind: "IMAGE" | "VIDEO" }>;
   now?(): string;
 }
 
@@ -50,6 +55,14 @@ export function createMarketingCopilotService(options: MarketingCopilotServiceOp
     try { options.onEvent?.(event); } catch { /* listeners never break the write */ }
     return event;
   }
+  /** Captured assets get their path and kind from the artifact, never from the agent. */
+  async function resolveAssets(owner: string, assets: MarketingAssetInput[]): Promise<MarketingAsset[]> {
+    return Promise.all(assets.map(async (asset) => {
+      if (!asset.artifactId) return asset as MarketingAsset;
+      if (!options.resolveArtifactAsset) throw new SpaceConflictError("Captured media cannot be attached on this runtime.");
+      return { label: asset.label, artifactId: asset.artifactId, ...await options.resolveArtifactAsset(owner, asset.artifactId) };
+    }));
+  }
   async function postOf(owner: string, id: string): Promise<MarketingPost> {
     const post = await repository.getPost(owner, id);
     if (!post) throw new SpaceNotFoundError(`Post ${id} was not found.`);
@@ -77,6 +90,10 @@ export function createMarketingCopilotService(options: MarketingCopilotServiceOp
     const label = MARKETING_CHANNEL_LABELS[post.channel];
     if (settings.paused) throw new SpaceConflictError("MARKETING_PAUSED: the pane is paused; nothing is published until the operator resumes it.");
     if (!settings.channels[post.channel].enabled) throw new SpaceConflictError(`MARKETING_CHANNEL_OFF: ${label} is off in this pane's Setup.`);
+    // Stable 2026-10-19: an approved X post slotted for 10-21 13:10 UTC went out two days early when the CLI began it itself.
+    if (post.scheduledAt && Date.parse(post.scheduledAt) > Date.parse(now())) {
+      throw new SpaceConflictError(`MARKETING_NOT_DUE: this post is scheduled for ${post.scheduledAt}; it publishes then, not before (it comes back as a PUBLISH item when due).`);
+    }
     const slot = await nextSlot(owner, pane, post);
     if (slot) throw new SpaceConflictError(`MARKETING_LIMIT: ${label} allows ${settings.channels[post.channel].posts} post(s) per ${settings.channels[post.channel].perDays} day(s); the next slot opens at ${slot}.`);
     if (post.status === "APPROVED") return { ruleId: null };
@@ -135,7 +152,7 @@ export function createMarketingCopilotService(options: MarketingCopilotServiceOp
     async createPost(owner: string, pane: Pane | null, input: MarketingPostCreate) {
       if (input.campaignId && !await repository.getCampaign(owner, input.campaignId)) throw new SpaceNotFoundError("The campaign was not found.");
       const post = await repository.createPost({ ownerUserId: owner, paneId: pane?.id ?? null, campaignId: input.campaignId ?? null, channel: input.channel, kind: input.kind, target: input.target ?? null,
-        title: input.title ?? null, body: input.body, assets: input.assets, status: "DRAFT", scheduledAt: input.scheduledAt ?? null, reviewNote: null, ruleId: null, publishedUrl: null, publishedAt: null,
+        title: input.title ?? null, body: input.body, assets: await resolveAssets(owner, input.assets), status: "DRAFT", scheduledAt: input.scheduledAt ?? null, reviewNote: null, ruleId: null, publishedUrl: null, publishedAt: null,
         evidence: {}, metrics: {} });
       const runId = pane ? await bumpRun(owner, pane.id, "drafted") : null;
       await record(owner, { paneId: pane?.id ?? null, runId, postId: post.id, campaignId: post.campaignId, type: "POST_DRAFTED", message: `Drafted a ${MARKETING_CHANNEL_LABELS[post.channel]} ${post.kind.toLowerCase().replace("_", " ")}${post.title ? `: ${post.title}` : ""}` });
@@ -143,9 +160,17 @@ export function createMarketingCopilotService(options: MarketingCopilotServiceOp
     },
     /** The agent edits its own drafts (and posts sent back for changes); reviewed or published posts stay as they are. */
     async updatePost(owner: string, id: string, patch: MarketingPostUpdate) {
-      const post = await repository.updatePost(owner, id, patch, ["DRAFT", "FAILED"]);
+      const post = await repository.updatePost(owner, id, { ...patch, assets: patch.assets && await resolveAssets(owner, patch.assets) }, ["DRAFT", "FAILED"]);
       if (!post) throw new SpaceConflictError("Only a draft (or a failed post) can be edited; a post in review waits for the operator.");
       return { post, wordingIssues: marketingWordingIssues(`${post.title ?? ""}\n${post.body}`) };
+    },
+    /** Graphics the Design pane delivered for a post ("Make graphic"): added to any post that is not published or rejected. */
+    async attachAssets(owner: string, postId: string, assets: Array<{ artifactId: string; label: string }>) {
+      const current = await postOf(owner, postId);
+      const post = await repository.updatePost(owner, postId, { assets: [...current.assets, ...await resolveAssets(owner, assets)] }, ["DRAFT", "IN_REVIEW", "APPROVED", "FAILED"]);
+      if (!post) throw new SpaceConflictError(`The post is ${current.status.toLowerCase()}; its graphics can no longer change.`);
+      await record(owner, { paneId: post.paneId, postId: post.id, campaignId: post.campaignId, type: "NOTE", message: `The Design pane attached ${assets.length} graphic${assets.length === 1 ? "" : "s"}` });
+      return post;
     },
     async requestReview(owner: string, pane: Pane | null, input: { postId: string; summary?: string }) {
       const post = await repository.updatePost(owner, input.postId, { reviewNote: null }, ["DRAFT", "FAILED"]).then((updated) => updated && repository.updatePost(owner, input.postId, { status: "IN_REVIEW" }));
@@ -236,17 +261,29 @@ export function createMarketingCopilotService(options: MarketingCopilotServiceOp
       channel: input.channel ?? null, tags: input.tags, source, pinned: input.pinned }),
     updateMemory: (owner: string, id: string, patch: { text?: string; pinned?: boolean }) => repository.updateMemory(owner, id, patch),
     forgetMemory: (owner: string, id: string) => repository.deleteMemory(owner, id),
+    // ---- bookmarks ----------------------------------------------------------------------------
+    listBookmarks: (owner: string) => repository.listBookmarks(owner),
+    createBookmark: (owner: string, input: MarketingBookmarkCreate) => repository.createBookmark({ ownerUserId: owner, url: input.url,
+      title: input.title ?? new URL(input.url).hostname.replace(/^www\./, ""), profileId: input.profileId, accountLabel: input.profileId ? input.accountLabel : null }),
+    deleteBookmark: (owner: string, id: string) => repository.deleteBookmark(owner, id),
+    async openBookmark(owner: string, pane: Pane, id: string, traceId: string, actor: BrowserHostActorContext) {
+      const bookmark = await repository.getBookmark(owner, id);
+      if (!bookmark) throw new SpaceNotFoundError(`Bookmark ${id} was not found.`);
+      if (!options.openInBrowser) throw new SpaceConflictError("The pane browser cannot open tabs on this runtime.");
+      return { bookmark, pages: await options.openInBrowser(owner, pane, bookmark, traceId, actor) };
+    },
     // ---- questions ----------------------------------------------------------------------------
     async askQuestion(owner: string, pane: Pane, input: { question: string; options?: string[]; postId?: string }) {
       const questionId = `mktq:${randomBytes(9).toString("base64url")}`;
       await record(owner, { paneId: pane.id, postId: input.postId ?? null, type: "QUESTION", message: `Needs you: ${input.question}`, payload: { questionId, question: input.question, options: input.options ?? [] } });
       return { questionId };
     },
-    async answerQuestion(owner: string, pane: Pane | null, input: { questionId: string; answer: string }) {
+    /** by NOUS: Nous, the mind of SpaceApp, answered for the operator (its answer is the agent's memory, not the operator's voice). */
+    async answerQuestion(owner: string, pane: Pane | null, input: { questionId: string; answer: string }, by: "USER" | "NOUS" = "USER") {
       const question = (await repository.listEvents(owner, { types: ["QUESTION"], limit: 300 })).find((event) => event.payload.questionId === input.questionId);
       if (!question) throw new SpaceNotFoundError("The question was not found.");
-      const memory = await repository.upsertMemory({ ownerUserId: owner, kind: "FACT", key: String(question.payload.question).toLowerCase().slice(0, 300), text: input.answer, channel: null, tags: ["question"], source: "USER", pinned: false });
-      await record(owner, { paneId: pane?.id ?? question.paneId, postId: question.postId, type: "ANSWERED", message: `You answered: ${input.answer.slice(0, 200)}`, payload: { questionId: input.questionId, answer: input.answer, memoryId: memory.id } });
+      const memory = await repository.upsertMemory({ ownerUserId: owner, kind: "FACT", key: String(question.payload.question).toLowerCase().slice(0, 300), text: input.answer, channel: null, tags: ["question"], source: by === "NOUS" ? "AGENT" : "USER", pinned: false });
+      await record(owner, { paneId: pane?.id ?? question.paneId, postId: question.postId, type: "ANSWERED", message: `${by === "NOUS" ? "Nous" : "You"} answered: ${input.answer.slice(0, 200)}`, payload: { questionId: input.questionId, answer: input.answer, memoryId: memory.id, answeredBy: by } });
       return { memory };
     },
     async waitForAnswer(owner: string, input: { questionId: string; waitMs: number }) {
@@ -410,7 +447,7 @@ export function createMarketingCopilotService(options: MarketingCopilotServiceOp
         const delta = change && points.length > 1 ? latest.value - points[0]!.value : null;
         return `${label} ${latest.value}${delta !== null ? ` (${delta >= 0 ? "+" : ""}${delta} this week)` : ""}`;
       };
-      const parts = [line("GitHub stars", "GITHUB", "stars", true), line("forks", "GITHUB", "forks", true), line("npm downloads last week", "NPM", "downloads_week", false)].filter(Boolean);
+      const parts = [line("GitHub stars", "GITHUB", "stars", true), line("forks", "GITHUB", "forks", true), line("npm downloads last week", "NPM", "downloads_week", false), line("active self-hosted installs", "INSTALLS", "active_7d", true)].filter(Boolean);
       if (!parts.length) return null;
       return record(owner, { paneId: pane.id, type: "METRICS", message: `This week: ${parts.join(", ")}`, payload: { digest: true } });
     },

@@ -16,6 +16,7 @@ import { sendApiError } from "./http-errors.js";
 import { registerLiveHistoryRoutes } from "./live-history-routes.js";
 import { createLivePersonalMemory } from "./live-personal-memory.js";
 import { buildLiveRoomContext } from "./live-room-context.js";
+import { fetchPublicUrl, PublicUrlRefusedError } from "./public-url-fetch.js";
 import type { RoomAgentService } from "./room-agent.js";
 import type { RoomPaneController } from "./room-pane-control.js";
 
@@ -31,6 +32,8 @@ export function registerLiveRoutes(app: FastifyInstance, options: {
   roomAgentService: RoomAgentService;
   routeOptions: Pick<RouteShorthandOptions, "config">;
   assertRoomAccess: (roomId: string, user: AuthUser | null | undefined) => Promise<Room>;
+  /** The Agents Dashboard sample, so Live and the Dashboard agree on who is working. */
+  readDashboardAgents?: (roomId: string) => Promise<{ activity: Record<string, string> }>;
 }) {
   const { config, auth, store, roomPaneController, roomAgentService, routeOptions: defaultRouteRateLimitOptions,
     assertRoomAccess } = options;
@@ -49,12 +52,12 @@ export function registerLiveRoutes(app: FastifyInstance, options: {
     if (domainMatch && domainMatch[1]) {
       try {
         const targetUrl = domainMatch[1].startsWith("http") ? domainMatch[1] : `https://${domainMatch[1]}`;
-        const siteResp = await fetch(targetUrl, {
+        const siteResp = await fetchPublicUrl(targetUrl, {
           headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)" },
-          signal: AbortSignal.timeout(4000)
+          timeoutMs: 4000
         });
         if (siteResp.ok) {
-          const html = await siteResp.text();
+          const html = siteResp.text;
           const title = html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim() || domainMatch[1];
           const metaDesc = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i)?.[1]?.trim() || "";
           const bodySnippet = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
@@ -121,9 +124,10 @@ export function registerLiveRoutes(app: FastifyInstance, options: {
     return { results: results.slice(0, limit) };
   });
   app.post("/api/live/fetch-url", defaultRouteRateLimitOptions, async (request, reply) => {
-    const body = (request.body as { url?: string; maxChars?: number }) || {};
-    let rawUrl = typeof body.url === "string" ? body.url.trim() : "";
-    const maxChars = typeof body.maxChars === "number" && body.maxChars > 0 ? Math.min(body.maxChars, 8000) : 3000;
+    const parsed = z.object({ url: z.string().trim().max(2048).optional(), maxChars: z.number().optional() }).safeParse(request.body ?? {});
+    if (!parsed.success) return sendApiError(reply, 400, "INVALID_REQUEST", "Send a URL as text.");
+    let rawUrl = parsed.data.url ?? "";
+    const maxChars = parsed.data.maxChars && parsed.data.maxChars > 0 ? Math.min(parsed.data.maxChars, 8000) : 3000;
     if (!rawUrl) {
       return sendApiError(reply, 400, "MISSING_URL", "Target URL is required.");
     }
@@ -132,21 +136,21 @@ export function registerLiveRoutes(app: FastifyInstance, options: {
     }
 
     try {
-      const resp = await fetch(rawUrl, {
+      const resp = await fetchPublicUrl(rawUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
           "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         },
-        signal: AbortSignal.timeout(6000)
+        timeoutMs: 6000
       });
       if (!resp.ok) {
         return {
           url: rawUrl,
           title: "",
-          text: `HTTP error ${resp.status} fetching ${rawUrl}: ${resp.statusText}`
+          text: `HTTP error ${resp.status} fetching ${rawUrl}`
         };
       }
-      const html = await resp.text();
+      const html = resp.text;
       const title = html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim() || rawUrl;
       const cleanText = html
         .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -167,6 +171,7 @@ export function registerLiveRoutes(app: FastifyInstance, options: {
         text: cleanText.slice(0, maxChars)
       };
     } catch (err) {
+      if (err instanceof PublicUrlRefusedError) return sendApiError(reply, 400, err.code, err.message);
       return {
         url: rawUrl,
         title: "",
@@ -184,8 +189,9 @@ export function registerLiveRoutes(app: FastifyInstance, options: {
     const pending = liveContextReads.get(key);
     if (pending) return pending;
     const read = (async () => {
-      const [panes, mission] = await Promise.all([store.listPanes(roomId), roomAgentService.inspectMission(roomId).catch(() => null)]);
-      return buildLiveRoomContext({ room, panes, objective: mission?.snapshot?.objective,
+      const [panes, mission, board] = await Promise.all([store.listPanes(roomId), roomAgentService.inspectMission(roomId).catch(() => null),
+        options.readDashboardAgents?.(roomId).catch(() => null) ?? null]);
+      return buildLiveRoomContext({ room, panes, objective: mission?.snapshot?.objective, dashboard: board?.activity,
         inspect: pane => roomPaneController.inspect(pane, fresh === "true" ? { fresh: true } : undefined) });
     })();
     liveContextReads.set(key, read);
@@ -242,5 +248,5 @@ export function registerLiveRoutes(app: FastifyInstance, options: {
     }
   });
   // The Research Council reads the owner's personal memory as context for its coordinator.
-  return { livePersonalMemory };
+  return { livePersonalMemory, liveHistory: liveHistoryRepository };
 }

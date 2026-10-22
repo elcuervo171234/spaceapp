@@ -3,7 +3,7 @@ import { hostname } from "node:os";
 import { assertDevInstanceIsolated, instanceBackgroundJobEnabled } from "@space/contracts";
 import { PostgresSpaceStore, PostgresStreamingBotRepository, PostgresStreamingRepository } from "@space/db";
 import { StreamingCredentialStore } from "@space/streaming";
-import { TelegramDeliveryWorker, TelegramSecretStore } from "@space/runtime";
+import { TelegramDeliveryWorker, TelegramSecretStore, otlpSpanExporterFromEnv } from "@space/runtime";
 import { NativeConnection, Runtime, Worker } from "@temporalio/worker";
 import * as activities from "./activities.js";
 import { createActivityObservabilityInterceptors } from "./activity-observability.js";
@@ -14,6 +14,7 @@ import { DEFAULT_TASK_QUEUE, DEFAULT_TEMPORAL_ADDRESS, DEFAULT_TEMPORAL_NAMESPAC
 import { runTelegramNotificationCycle, TelegramNotificationLoop } from "./telegram-notification-runtime.js";
 import { StreamingBotLoop, createSpaceBotMemoryStore, runStreamingBotCycle } from "./streaming-bot-runtime.js";
 import { CHESS_MOVE_SOCKET, startChessMoveServer } from "./chess-cli-move.js";
+import { NOUS_TURN_MAX_BODY_BYTES, NousTurnInputError, runNousTurn, validateNousTurnInput } from "./nous-turn.js";
 
 assertDevInstanceIsolated(process.env, "worker");
 const address = process.env.SPACE_TEMPORAL_ADDRESS ?? DEFAULT_TEMPORAL_ADDRESS;
@@ -35,6 +36,7 @@ if (temporalCoreMetricsBind) {
 }
 
 const connection = await NativeConnection.connect({ address });
+const spans = otlpSpanExporterFromEnv(process.env, "space-worker");
 const worker = await Worker.create({
   connection,
   namespace,
@@ -43,7 +45,7 @@ const worker = await Worker.create({
   activities,
   // Structured, correlated activity records and worker metrics. Activity-side
   // only: the workflow sandbox and its replay behaviour are unchanged.
-  interceptors: { activity: [createActivityObservabilityInterceptors()] }
+  interceptors: { activity: [createActivityObservabilityInterceptors({ spans })] }
 });
 
 // Optional loopback-only Prometheus endpoint for worker metrics.
@@ -157,10 +159,13 @@ if (databaseUrl && streamingBotEnabled) {
   streamingBotLoop.start();
 }
 
-// Chess benchmark CLI moves for the API: CLI processes must run here, never in the API's cgroup.
+// Chess benchmark CLI moves and Nous's turns for the API: CLI processes must run here, never in the API's cgroup.
 const chessMoveServer = process.env.SPACE_CHESS_MOVE_SOCKET === "disabled"
   ? null
-  : await startChessMoveServer(process.env.SPACE_CHESS_MOVE_SOCKET || CHESS_MOVE_SOCKET).catch((error: unknown) => {
+  : await startChessMoveServer(process.env.SPACE_CHESS_MOVE_SOCKET || CHESS_MOVE_SOCKET, undefined, {
+    "/nous-turn": { maxBodyBytes: NOUS_TURN_MAX_BODY_BYTES, isInputError: (error) => error instanceof NousTurnInputError,
+      handle: (body, signal) => runNousTurn(validateNousTurnInput(body), signal) }
+  }).catch((error: unknown) => {
       workerLog("warn", "worker.chess_move_server", { status: "UNAVAILABLE", error: error instanceof Error ? error.message : String(error) });
       return null;
     });
@@ -172,4 +177,5 @@ try {
   telegramNotificationLoop?.stop();
   streamingBotLoop?.stop();
   chessMoveServer?.close();
+  await spans?.close();
 }

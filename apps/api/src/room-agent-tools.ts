@@ -3,6 +3,7 @@ import {
   PANE_TYPES, paneTypeIdSchema, roomAgentControlTools,
   type ControlOperation, type Pane, type RoomAgentEvent, type RoomAgentEventStatus
 } from "@space/contracts";
+import { releaseTrainInputSchema, type ReleaseTrainActor, type ReleaseTrainInput } from "./release-trains.js";
 import { classifyPaneApproval } from "./room-agent-guardrails.js";
 import type { RoomPaneObservation } from "./room-pane-control.js";
 
@@ -51,6 +52,8 @@ export interface RoomAgentToolDeps {
   /** Opens the panes and returns their names (Andy, Bob, ...). */
   openPanes(input: { roomId: string; actorId: string; requestId: string; traceId: string; counts: Record<string, number> }): Promise<string[]>;
   search(input: { roomId: string; actorId: string; requestId: string; traceId: string; query: string; engine: "GOOGLE" | "YOUTUBE"; paneId?: string }): Promise<string>;
+  /** Reads (op status) or changes a product's release train; returns the trains as text. */
+  releaseTrain?(input: ReleaseTrainInput, by: ReleaseTrainActor): Promise<string>;
   monitor?: {
     listEvents(roomId: string, options: { limit?: number; statuses?: RoomAgentEventStatus[]; paneId?: string }): Promise<RoomAgentEvent[]>;
     updateEvent(eventId: string, patch: { status?: RoomAgentEventStatus; decision?: string | null }, from?: RoomAgentEventStatus[]): Promise<RoomAgentEvent | null>;
@@ -105,7 +108,10 @@ const schemas = {
     query: z.string().trim().min(1).max(1_000),
     engine: z.enum(["GOOGLE", "YOUTUBE"]).optional()
   }),
-  confirm_action: z.object({ token: z.string().trim().min(1).max(80) })
+  confirm_action: z.object({ token: z.string().trim().min(1).max(80) }),
+  space_room_release: releaseTrainInputSchema.extend({
+    pane: paneRef.optional().describe("The captain for open; the pane that joins or leaves for join and leave.")
+  })
 } as const;
 
 export type RoomAgentToolName = keyof typeof schemas;
@@ -124,7 +130,10 @@ const descriptions: Record<RoomAgentToolName, string> = {
   set_pane_model: "Change a pane's model and reasoning effort.",
   space_control: "Full Space Control as the operator, for anything the other tools do not cover (inspect sections, schedules, watches, operations, diagnostics). space_execute runs one batch of actions.",
   search_web_in_browser: "Search Google or YouTube in the room's browser pane.",
-  confirm_action: "Run an action the operator has just confirmed, with the token its tool returned. Only after the operator's explicit yes."
+  confirm_action: "Run an action the operator has just confirmed, with the token its tool returned. Only after the operator's explicit yes.",
+  space_room_release: "The joint release of a product (default run-spaceapp): one live release every pane joins instead of cutting its own version. "
+    + "status lists the trains and where each joined commit already is (dev, main, candidate); open (version, pane = captain); join or leave (pane, commit, note); "
+    + "candidate (sourceSha the captain builds from); publishing (no more joins); published; cancel. You never publish, push, promote or bump versions yourself."
 };
 
 export const roomAgentToolNames = Object.keys(schemas) as RoomAgentToolName[];
@@ -178,6 +187,7 @@ export function roomAgentToolLabel(name: string, args: Record<string, unknown>):
     case "space_control": return `Using Space Control (${list(args.tool) || "tool"})`;
     case "search_web_in_browser": return `Searching ${args.engine === "YOUTUBE" ? "YouTube" : "Google"}`;
     case "confirm_action": return "Running the confirmed action";
+    case "space_room_release": return args.op === "status" ? "Checking the release train" : `Release train: ${String(args.op ?? "")}`;
     default: return `Using ${name}`;
   }
 }
@@ -193,20 +203,30 @@ function countsLabel(value: unknown): string {
 }
 
 /** Space Control actions that only the operator may approve, or that need their explicit yes. */
-export function roomAgentControlRisk(tool: string, args: Record<string, unknown>): { level: "SAFE" | "DESTRUCTIVE" | "PROTECTED"; reason: string | null } {
+/** What a Space Control operation is, by its type (hardening plan step 12): the wording of its arguments never lowers it. */
+export type ControlActionClass = { level: "SAFE" | "DESTRUCTIVE" | "PROTECTED"; category: "RELEASE" | "DESTRUCTIVE" | "EXTERNAL" | null; reason: string | null };
+export function controlActionClass(kind: string, operation: string): ControlActionClass {
+  if (kind === "resource" && operation === "ops.deploy") return { level: "PROTECTED", category: "RELEASE", reason: "Deploys go only through the merge queue, by the operator." };
+  if (kind === "resource" && ["files.publish", "media.publish"].includes(operation)) return { level: "DESTRUCTIVE", category: "EXTERNAL", reason: operation };
+  if (kind === "pane" && ["close", "restart", "stop", "cancel"].includes(operation)) return { level: "DESTRUCTIVE", category: "DESTRUCTIVE", reason: `${operation} panes` };
+  if (kind === "resource" && (operation.endsWith(".delete") || ["settings.update", "settings.rollback", "ops.test", "ops.verify", "ops.proof", "access.cli"].includes(operation))) {
+    return { level: "DESTRUCTIVE", category: "DESTRUCTIVE", reason: operation };
+  }
+  if (kind === "clipboard" && operation === "delete") return { level: "DESTRUCTIVE", category: "DESTRUCTIVE", reason: "delete a clipboard record" };
+  if (["room", "cli", "vpn"].includes(kind)) return { level: "DESTRUCTIVE", category: "DESTRUCTIVE", reason: `${kind} ${operation}`.trim() };
+  return { level: "SAFE", category: null, reason: null };
+}
+
+export function roomAgentControlRisk(tool: string, args: Record<string, unknown>): ControlActionClass {
   const command = tool === "space_execute" ? args : tool === "space_schedules" ? (args.command as Record<string, unknown> | undefined) : undefined;
   const actions = Array.isArray(command?.actions) ? command!.actions as Array<Record<string, unknown>> : [];
-  let destructive: string | null = null;
+  let first: ControlActionClass | null = null;
   for (const action of actions) {
-    const kind = String(action.kind ?? "");
-    const operation = String(action.operation ?? "");
-    if (kind === "resource" && operation === "ops.deploy") return { level: "PROTECTED", reason: "Deploys go only through the merge queue, by the operator." };
-    if (kind === "pane" && ["close", "restart", "stop", "cancel"].includes(operation)) destructive ??= `${operation} panes`;
-    else if (kind === "resource" && (operation.endsWith(".delete") || ["settings.update", "settings.rollback", "files.publish", "media.publish", "ops.test", "ops.verify", "ops.proof", "access.cli"].includes(operation))) destructive ??= operation;
-    else if (kind === "clipboard" && operation === "delete") destructive ??= "delete a clipboard record";
-    else if (["room", "cli", "vpn"].includes(kind)) destructive ??= `${kind} ${operation}`.trim();
+    const risk = controlActionClass(String(action.kind ?? ""), String(action.operation ?? ""));
+    if (risk.level === "PROTECTED") return risk;
+    if (risk.level === "DESTRUCTIVE") first ??= risk;
   }
-  return destructive ? { level: "DESTRUCTIVE", reason: destructive } : { level: "SAFE", reason: null };
+  return first ?? { level: "SAFE", category: null, reason: null };
 }
 
 function operationOutcome(operation: ControlOperation, done: string, failure: string): RoomAgentToolOutcome {
@@ -220,6 +240,8 @@ function operationOutcome(operation: ControlOperation, done: string, failure: st
       results: operation.results.map((result) => ({ paneId: result.paneId ?? null, status: result.status, detail: result.detail })) })
   };
 }
+
+const SET_MODEL_READY_WAIT_MS = 20_000;
 
 export function createRoomAgentTools(deps: RoomAgentToolDeps) {
   async function resolvePanes(ctx: RoomAgentToolContext, refs: string[], prefer: "OPEN" | "CLOSED" = "OPEN") {
@@ -297,7 +319,9 @@ export function createRoomAgentTools(deps: RoomAgentToolDeps) {
       const observed = await deps.inspectPane(pane);
       if (!observed.sessionId) return fail(`${paneName(pane)} has no running CLI`);
       if (!args.decline && !["WAITING_FOR_INPUT", "UNKNOWN"].includes(observed.state)) {
-        return fail(`${paneName(pane)} is not waiting for an answer`, `${paneName(pane)} is not waiting for an answer (state ${observed.state}). Read the pane again.`);
+        const next = observed.state === "IDLE" ? "It is at an empty prompt: send the answer as its next prompt (send_to_pane) instead."
+          : observed.state === "RUNNING" ? "Its turn is still running: send the answer with send_to_pane (after its turn)." : "Read the pane again.";
+        return fail(`${paneName(pane)} is not waiting for an answer`, `${paneName(pane)} is not waiting for an answer (state ${observed.state}). ${next}`);
       }
       const expected = typeof raw.expectedPromptFingerprint === "string" ? raw.expectedPromptFingerprint : null;
       if (ctx.confirmed && expected && observed.promptFingerprint !== expected) {
@@ -374,6 +398,12 @@ export function createRoomAgentTools(deps: RoomAgentToolDeps) {
     async set_pane_model(args, ctx) {
       const { panes: [pane], problem } = await resolvePanes(ctx, [args.pane]);
       if (!pane) return fail(`Could not find ${args.pane}`, problem!);
+      // A just-opened CLI reads UNKNOWN until it shows its prompt (stable 2026-10-19: 32 "Native state is unknown" in 7 days).
+      if (pane.mode === "TERMINAL") {
+        for (let waited = 0; waited < SET_MODEL_READY_WAIT_MS && (await deps.inspectPane(pane).catch(() => null))?.state === "UNKNOWN"; waited += 1_000) {
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
+        }
+      }
       return control(ctx, [{ kind: "configure", target: { paneIds: [pane.id], state: "OPEN" }, modelId: args.modelId,
         ...(args.reasoningEffort ? { reasoningEffort: args.reasoningEffort } : {}), when: args.when === "now" ? "NOW" : "AFTER_TURN" }],
         `Set ${paneName(pane)}'s model to ${args.modelId}${args.reasoningEffort ? ` (${args.reasoningEffort})` : ""}`, `Could not change ${paneName(pane)}'s model`);
@@ -404,6 +434,14 @@ export function createRoomAgentTools(deps: RoomAgentToolDeps) {
     },
     async confirm_action() {
       return fail("Nothing to confirm", "confirm_action is handled by the conversation.");
+    },
+    async space_room_release(args, ctx) {
+      if (!deps.releaseTrain) return fail("Release trains are unavailable");
+      const { pane: ref, ...input } = args;
+      const { panes: [pane], problem } = ref ? await resolvePanes(ctx, [ref]) : { panes: [], problem: null };
+      if (ref && !pane) return fail(`Could not find ${ref}`, problem!);
+      const result = await deps.releaseTrain(input, { roomId: ctx.roomId, pane: pane ? { paneId: pane.id, name: paneName(pane) } : null, paneSelf: false });
+      return { ok: true, display: input.op === "status" ? "Read the release trains" : `Release train: ${input.op} done`, result: clip(result) };
     }
   };
 

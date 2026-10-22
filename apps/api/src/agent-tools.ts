@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, realpath, rename, writeFile, access } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn } from "./safe-child-process.js";
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -73,7 +73,9 @@ function stateRootFor(runtimeId: string, options: AgentToolsOptions): string {
   const baseRoot = options.baseRoot ?? defaultOptions.baseRoot;
   const descriptor = cliRuntimeDescriptors.find((candidate) => candidate.id === runtimeId);
   if (!descriptor) return `${baseRoot}/.codex/${runtimeId.replace("cli:", "")}`;
-  const relative = descriptor.stateRoot.replace(/^\/home\/spaceapp-user/, "");
+  // A plain prefix, not a regex literal: the public export rewrites the home path only where it is written plainly.
+  const home = defaultOptions.baseRoot;
+  const relative = descriptor.stateRoot.startsWith(home) ? descriptor.stateRoot.slice(home.length) : descriptor.stateRoot;
   return `${baseRoot}${relative}`;
 }
 

@@ -171,7 +171,7 @@ describe("browser session navigation restore", () => {
   it("requires navigation for restored active sessions that still have no current URL", () => {
     expect(
       browserSessionNeedsNavigation({
-        targetUrl: "https://www.example.invalid/",
+        targetUrl: "https://www.google.com/",
         currentUrl: null,
         status: "READY"
       })
@@ -181,16 +181,16 @@ describe("browser session navigation restore", () => {
   it("requires navigation for starting and error sessions with a target URL", () => {
     expect(
       browserSessionNeedsNavigation({
-        targetUrl: "https://www.example.invalid/",
-        currentUrl: "https://www.example.invalid/",
+        targetUrl: "https://www.google.com/",
+        currentUrl: "https://www.google.com/",
         status: "STARTING"
       })
     ).toBe(true);
 
     expect(
       browserSessionNeedsNavigation({
-        targetUrl: "https://www.example.invalid/",
-        currentUrl: "https://www.example.invalid/",
+        targetUrl: "https://www.google.com/",
+        currentUrl: "https://www.google.com/",
         status: "ERROR"
       })
     ).toBe(true);
@@ -199,8 +199,8 @@ describe("browser session navigation restore", () => {
   it("does not navigate already loaded ready sessions or sessions without a target", () => {
     expect(
       browserSessionNeedsNavigation({
-        targetUrl: "https://www.example.invalid/",
-        currentUrl: "https://www.example.invalid/",
+        targetUrl: "https://www.google.com/",
+        currentUrl: "https://www.google.com/",
         status: "READY"
       })
     ).toBe(false);
@@ -510,6 +510,17 @@ describe("browser runtime v2 capacity", () => {
     gate.releaseLive("stream:0");
     expect(gate.acquireSession("session:replacement")).toBe(true);
     expect(gate.acquireLive("stream:replacement")).toBe(true);
+  });
+
+  it("lets streams use the session limit while recordings keep the live limit", () => {
+    const gate = new BrowserCapacityGate(8, 4);
+    for (let index = 0; index < 8; index += 1) {
+      expect(gate.acquireLive(`stream:${index}`, gate.maxSessions)).toBe(true);
+    }
+    expect(gate.acquireLive("stream:overflow", gate.maxSessions)).toBe(false);
+    expect(gate.acquireLive("capture:job")).toBe(false);
+    for (let index = 0; index < 5; index += 1) gate.releaseLive(`stream:${index}`);
+    expect(gate.acquireLive("capture:job")).toBe(true);
   });
 });
 
@@ -1232,14 +1243,14 @@ describe("browser session restore metadata", () => {
 });
 
 describe("browser session display pool", () => {
-  it("allocates up to eight displays and reuses released ones", () => {
+  it("allocates up to ten displays and reuses released ones", () => {
     const allocated = new Set<number>();
-    for (let index = 0; index < 8; index += 1) {
+    for (let index = 0; index < 10; index += 1) {
       const display = allocateDisplay();
       expect(display).not.toBeNull();
       allocated.add(display!);
     }
-    expect(allocated.size).toBe(8);
+    expect(allocated.size).toBe(10);
     expect(allocateDisplay()).toBeNull();
 
     const first = [...allocated][0]!;

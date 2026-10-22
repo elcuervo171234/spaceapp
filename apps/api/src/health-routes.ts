@@ -1,5 +1,5 @@
 import type {} from "./request-context.js";
-import { execFile } from "node:child_process";
+import { execFile } from "./safe-child-process.js";
 import { promisify } from "node:util";
 import type { FastifyInstance, RouteShorthandOptions } from "fastify";
 import type { BrowserHostCaptureMetrics } from "@space/browser-host";
@@ -7,6 +7,7 @@ import { workerReadinessSchema } from "@space/contracts";
 import type { SpaceStore } from "@space/runtime";
 import type { AppDiagnosticsService } from "./app-diagnostics.js";
 import type { AppVersionReader } from "./app-version.js";
+import { defaultSessionRevocationStore } from "./auth.js";
 import { browserHostReadiness, type BrowserSessionManagerWithHostHealth } from "./browser-host-proxy.js";
 import type { CliTerminalManager } from "./cli-terminal.js";
 import type { SpaceApiConfig } from "./config.js";
@@ -55,6 +56,16 @@ export function registerHealthRoutes(app: FastifyInstance, options: {
     service: "space-api",
     uptimeSeconds: Math.round(process.uptime())
   }));
+  // One pending check per dependency: a stalled dependency answers every probe with its timeout fallback
+  // instead of collecting a new unfinished check per probe (1.1.5 internal review, 2026-10-16).
+  const inflight = new Map<string, Promise<unknown>>();
+  const shared = <T>(key: string, start: () => Promise<T>): Promise<T> => {
+    const pending = inflight.get(key) as Promise<T> | undefined;
+    if (pending) return pending;
+    const next = start().finally(() => inflight.delete(key));
+    inflight.set(key, next);
+    return next;
+  };
   app.get("/readyz", defaultRouteRateLimitOptions, async (request, reply) => {
     const bounded = <T>(operation: Promise<T>, fallback: T, timeoutMs = 2_500): Promise<T> =>
       Promise.race([
@@ -63,12 +74,12 @@ export function registerHealthRoutes(app: FastifyInstance, options: {
       ]);
     const databaseCheck = store.checkReadiness
       ? bounded(
-          store.checkReadiness().then(() => "RUNNING" as const).catch(() => "UNAVAILABLE" as const),
+          shared("database", () => store.checkReadiness!().then(() => "RUNNING" as const).catch(() => "UNAVAILABLE" as const)),
           "UNAVAILABLE" as const
         )
       : Promise.resolve("in-memory" as const);
     const [worker, appDiagnostics, database] = await Promise.all([
-      config.workflowsEnabled === false ? Promise.resolve(null) : bounded(workerReadinessChecker(), workerReadinessSchema.parse({
+      config.workflowsEnabled === false ? Promise.resolve(null) : bounded(shared("worker", () => workerReadinessChecker()), workerReadinessSchema.parse({
         id: "space-worker",
         status: "ERROR",
         statusReason: "Worker readiness check timed out.",
@@ -85,7 +96,7 @@ export function registerHealthRoutes(app: FastifyInstance, options: {
         lastPollerAccessAt: null,
         checkedAt: new Date().toISOString()
       })),
-      appDiagnosticsService.getStatus(),
+      shared("appDiagnostics", () => appDiagnosticsService.getStatus()),
       databaseCheck
     ]);
     const cliHost = config.cliEnabled
@@ -115,7 +126,9 @@ export function registerHealthRoutes(app: FastifyInstance, options: {
     } else if (!config.browserSessionsEnabled) {
       browserHost = "DISABLED";
     }
-    const ok = database !== "UNAVAILABLE" && (config.workflowsEnabled === false || worker?.status === "RUNNING") && cliHost !== "UNAVAILABLE" && cliAdminHost !== "UNAVAILABLE" &&
+    // Sessions are refused until the persisted logouts load (auth.ts, fail closed).
+    const sessionRevocations = defaultSessionRevocationStore.isReady() ? "RUNNING" : "UNAVAILABLE";
+    const ok = database !== "UNAVAILABLE" && sessionRevocations === "RUNNING" && (config.workflowsEnabled === false || worker?.status === "RUNNING") && cliHost !== "UNAVAILABLE" && cliAdminHost !== "UNAVAILABLE" &&
       (browserHost === "in-process" || browserHost === "RUNNING" || browserHost === "DISABLED");
     // Default responses stay 200 with an ok flag for existing consumers (web
     // proxy recovery, live guard). Orchestrators that only read status codes
@@ -128,6 +141,7 @@ export function registerHealthRoutes(app: FastifyInstance, options: {
         store: config.runtimeStore,
         runtimeStore: config.runtimeStore,
         database,
+        sessionRevocations,
         eventBus: "in-process",
         temporal: config.workflowsEnabled === false ? "disabled" : config.enableDummyTurns ? "enabled" : "disabled",
         worker: config.workflowsEnabled === false ? "disabled" : worker?.status,

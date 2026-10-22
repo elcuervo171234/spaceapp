@@ -3,7 +3,7 @@ import { registerPlanExecutionRoutes } from "./plan-execution-routes.js";
 import { registerDotsRoutes, validateSessionDotOwner } from "./dots-routes.js";
 import { dotConversationContext, dotRuntimeFor, registerDotHomeRoutes } from "./dot-home.js";
 import { createDotProactiveService, createProactiveDecider } from "./dot-proactive.js";
-import { dotDeveloperContext, registerDotToolGatewayRoutes } from "./dot-tools-gateway.js";
+import { dotDeveloperContext, findRoomOwnerDot, registerDotToolGatewayRoutes, sessionDotIdentity } from "./dot-tools-gateway.js";
 import { createDotGoalService, createDotGoalWorkflowCoordinator, registerDotGoalRoutes } from "./dot-goals.js";
 import { sweepStrandedChatRuns as sweepStrandedChatRunsOnce } from "./stranded-chat-runs.js";
 import { createDotScheduleService, registerDotScheduleRoutes } from "./dot-schedules.js";
@@ -15,17 +15,24 @@ import { createDotMemoryService, registerDotMemoryRoutes } from "./dot-memory.js
 import { InMemoryRoomAgentMonitorRepository, PostgresRoomAgentMonitorRepository, type RoomAgentMonitorRepository } from "@space/db";
 import { InMemorySpaceNotificationsRepository, PostgresSpaceNotificationsRepository, type SpaceNotificationsRepository } from "@space/db";
 import { createNotificationService } from "./notifications/service.js";
+import { startBrowserHandoffNotifications } from "./notifications/browser-handoff.js";
+import { createFcmSender, loadFcmServiceAccount, type FcmSender } from "./notifications/fcm.js";
 import { registerNotificationRoutes } from "./notifications/routes.js";
 import { mailCopilotEventNotifies, notifyMailCopilotEvent } from "./mail-copilot/notify.js";
+import { createMailCopilotKickoff } from "./mail-copilot/kickoff.js";
 import { registerCouncil } from "./council/wiring.js";
+import { registerNous, type NousWiring } from "./nous/wiring.js";
+import { createRoomAgentEventRouting } from "./room-agent-event-routing.js";
+import type { NousRunner } from "./nous/service.js";
+import type { PaneSummaryRunner } from "./nous/pane-board.js";
 import { createRoomAgentMonitor } from "./room-agent-monitor.js";
 import { createDotDeliverablesService, registerDotDeliverableRoutes } from "./dot-deliverables.js";
-import { createConnectorCrypto, createConnectorService, createGoogleConnector, createMicrosoftConnector, registerConnectorRoutes } from "./dot-connectors.js";
+import { createConnectorCrypto, createConnectorService, readConnectorKey, createGoogleConnector, createMicrosoftConnector, registerConnectorRoutes } from "./dot-connectors.js";
 import { Client, Connection, WorkflowNotFoundError } from "@temporalio/client";
 import { cliResourceHealth } from "./cli-resource-health.js";
 import { registerReviewRoutes } from "./review-routes.js";
 import { registerSwarmRoutes } from "./swarm-routes.js";
-import { getPaneById, getLatestRoomEvent, PaneClosedConflictError, assertCliPaneCompatible, assertBrowserPaneCompatible, assertNormalCliSession, isBrowserPane } from "./pane-guards.js";
+import { getPaneById, getLatestRoomEvent, PaneClosedConflictError, assertCliPaneCompatible, assertBrowserPaneCompatible, assertNormalCliSession, isBrowserPane, isCliPane } from "./pane-guards.js";
 import { registerTelegramRoutes } from "./telegram-routes.js";
 import { registerConfigurationRoutes } from "./configuration-routes.js";
 import { createPublicCredentialHost } from "./cli-auth-transfer.js";
@@ -38,13 +45,17 @@ import { registerTaskItemRoutes } from "./task-item-routes.js";
 import { registerClipboardRoutes } from "./clipboard-routes.js";
 import { registerClientErrorRoutes } from "./client-error-routes.js";
 import { createInstallTelemetry } from "./install-telemetry.js";
-import { registerInstallTelemetryRoutes } from "./install-telemetry-routes.js";
+import { registerFirstAnswerWatch, registerInstallTelemetryRoutes } from "./install-telemetry-routes.js";
 import { registerAdminUserRoutes } from "./admin-user-routes.js";
-import { createGatewayCodexResetCreditsService, createGatewayCodexUsageProvider } from "./gateway/gateway-codex-services.js";
+import { createSessionAccess } from "./session-access.js";
+import { createGatewayCodexResetCreditsService, createGatewayCodexUsageProvider, registerCodexQuotaResetWatch } from "./gateway/gateway-codex-services.js";
+import { registerGatewayDownWatch } from "./gateway/gateway-down-watch.js";
+import { registerMemoryMaintenanceFailureWatch } from "./memory-maintenance-watch.js";
 import { emailsOutOfRotation } from "./gateway/account-rotation.js";
 import { createCliBrowserCdpProxy } from "./cli-browser-cdp.js";
 import { InMemoryJobApplyRepository } from "./job-apply/memory-repository.js";
 import { createImapMailboxFactory, type MailboxFactory } from "./job-apply/mailbox.js";
+import { scheduleJobApplyMailTriage } from "./job-apply/mail-triage-timer.js";
 import { createJobApplyService, type JobApplyGoogleAccess, type JobApplyService } from "./job-apply/service.js";
 import { registerJobApplyRoutes } from "./job-apply/routes.js";
 import { registerMailCopilotRoutes } from "./mail-copilot/routes.js";
@@ -53,7 +64,11 @@ import { isCliBridgeRoutePath } from "./cli-bridge-paths.js";
 import { createMailCopilotSync } from "./mail-copilot/sync.js";
 import { InMemoryMailCopilotRepository, PostgresMailCopilotRepository, type MailCopilotRepository } from "@space/db";
 import { registerMarketingCopilot, type MarketingCopilotWiring } from "./marketing-copilot/wiring.js";
-import { selectRoomCliMenuRow } from "./room-cli-menu.js";
+import { registerFreelanceCopilot, type FreelanceCopilotWiring } from "./freelance-copilot/wiring.js";
+import { dotDesignRequest, registerDesign, type DesignWiring } from "./design/wiring.js";
+import { registerAppStudio, type AppStudioWiring } from "./app-studio/wiring.js";
+import { collectStorageReadiness } from "./storage-readiness.js";
+import { resumeRoomCliFromMenu, selectRoomCliMenuRow } from "./room-cli-menu.js";
 import { createGatewayCliAccounts } from "./gateway/gateway-cli-accounts.js";
 import { createGatewayAdminService, type GatewayAdminService } from "./gateway/gateway-service.js";
 import { registerGatewayAdminRoutes } from "./gateway/gateway-routes.js";
@@ -68,11 +83,11 @@ import { sweepExpiredBrowserArtifacts, localArtifactFilePath } from "./artifact-
 export { sweepExpiredBrowserArtifacts, type BrowserArtifactRetentionSweepResult } from "./artifact-storage.js";
 import { withStagedBufferUpload, withPersistedUpload } from "./multipart-upload.js";
 import { recordUploadedArtifact } from "./upload-record.js";
-import { createCliDashboardActivityReader, readDashboardActivity, type DashboardActivityDetail, type DashboardStatus } from "./agents-dashboard.js";
+import { cliUsageLimited, createCliDashboardActivityReader, readDashboardActivity, type DashboardActivityDetail, type DashboardStatus } from "./agents-dashboard.js";
 import { createRoomAgentSnapshotProvider } from "./room-agent-snapshot.js";
 import { createDashboardCliProofController } from "./agents-dashboard-proof.js";
 import { PostgresSessionRevocationRepository } from "@space/db";
-import { DOT_TOOL_GATEWAY_VERSION, dotWorkspacePath, slackAppUrl, summarizeAutoRouteShadow } from "@space/contracts";
+import { brokerScopeAllows, DOT_TOOL_GATEWAY_VERSION, dotWorkspacePath, slackAppUrl, summarizeAutoRouteShadow } from "@space/contracts";
 import { findCodexWriterThreads } from "./codex-thread-writer.js";
 import { createCliRenderAiController } from "./cli-render-ai-proof.js";
 import { controlExecuteSchema, controlOperationSchema, SPACE_CONTROL_VERSION } from "@space/contracts";
@@ -80,10 +95,12 @@ import { cliProfileUsageSchema, type CliProfileUsage } from "@space/contracts";
 import { createCliAccountBalancer, type CliAccountBalancer } from "./cli-account-balancer.js";
 import { createCliAccountAutoSwitch } from "./cli-account-auto-switch.js";
 import { controlTokenHeader, verifyControlToken } from "./space-control-token.js";
+import { harnessAgentPrincipal, isHarnessAgentSessionId } from "./harness-agent-tokens.js";
 import { PANE_CATALOG_VERSION, paneCountsSchema, PANE_TYPES, isAgentRuntimeReady } from "@space/contracts";
-import { controlSkills, controlResourceRoutes, controlPublishInput } from "./space-control-resources.js";
+import { controlSkills, controlSkillsPage, controlResourceRoutes, controlPublishInput } from "./space-control-resources.js";
 import { captureControlSettingsSnapshot, restoreControlSettingsSnapshot, executeControlPluginAction } from "./space-control-settings.js";
 import { createSpaceControl, supportsControlRuntime } from "./space-control.js";
+import { createControlScreenshotCapture } from "./space-control-capture.js";
 import { registerSpaceControlRoutes } from "./space-control-routes.js";
 import { pluginsService } from "./plugins-service.js";
 import { InMemorySourceControlRepository, PostgresSourceControlRepository } from "@space/db";
@@ -92,6 +109,7 @@ import { registerSourceControlRoutes } from "./source-control/routes.js";
 import { WorktreeService } from "./worktrees/worktree-service.js";
 import { registerWorktreeRoutes } from "./worktrees/worktree-routes.js";
 import { GitControlError } from "./source-control/errors.js";
+import { registerVault, type VaultOverrides } from "./vault/wiring.js";
 import { InMemoryControlRepository, PostgresControlRepository } from "@space/db";
 import { createRoomRoutedActions } from "./room-routed-actions.js";
 import { createRoomPaneCommands } from "./room-pane-commands.js";
@@ -103,12 +121,11 @@ import { createRoomQuickActions } from "./room-quick-actions.js";
 import { SystemHealthMonitor } from "./system-health-service.js";
 import { SystemTopologyService } from "./system-topology-service.js";
 import { InMemorySystemHealthRepository, PostgresSystemHealthRepository } from "@space/db";
-import { YouTubeAccountStore, privatePaneProfileId, youtubeAccountProfileKey } from "./youtube-accounts.js";
+import { YouTubeAccountStore, freelanceProfileKey, privatePaneProfileId, youtubeAccountProfileKey } from "./youtube-accounts.js";
 import type { PaneBrowserSessionResponse } from "@space/contracts";
 import { YouTubePlaybackStore, youtubeBrowserPlayback } from "./youtube-playback-state.js";
-import { CanonicalMemorySearch } from "./canonical-memory-search.js";
-import { CanonicalMemoryEmbeddings } from "@space/db";
-import { createMemoryEmbeddings } from "./memory-embedding-smoke.js";
+import type { MemoryEmbeddingBackfill } from "./memory-embedding-backfill.js";
+import { createMemoryEmbeddingIndexing } from "./memory-embedding-indexing.js";
 import cookie from "@fastify/cookie";
 import compress from "@fastify/compress";
 import helmet from "@fastify/helmet";
@@ -116,10 +133,10 @@ import multipart from "@fastify/multipart";
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
-import { execFile, spawn } from "node:child_process";
-import { createNativeCliModelCatalog, findNativeCliModel, nativeCliCatalogBufferBytes, nativeCliConfirmedModel, nativeCliConfirmedReasoning, switchNativeCliModel, switchNativeCliReasoning } from "./cli-native-model-picker.js";
+import { execFile, spawn } from "./safe-child-process.js";
+import { createNativeCliModelCatalog, findNativeCliModel, inspectedNativeModelId, nativeCliCatalogBufferBytes, nativeCliConfirmedModel, nativeCliConfirmedReasoning, switchNativeCliModel, switchNativeCliReasoning, withOmpSessionModel } from "./cli-native-model-picker.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { appendFile, chmod, mkdir, readFile, rename, stat, statfs, unlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -171,7 +188,6 @@ import {
   providerSwitchTargetsSchema,
   publicWaitlistRequestSchema,
   publicWaitlistResponseSchema,
-  storageReadinessSchema,
   voiceTranscriptionMaxBytes,
   type StorageReadiness,
   type HostMemoryDetails,
@@ -238,6 +254,8 @@ import {
   defaultSessionRevocationStore,
   getAuthConfig,
   operatorSessionTtlSeconds,
+  renewSessionIfDue,
+  signedSessionPayload,
   signOAuthState,
   signSession,
   verifyOAuthState,
@@ -263,14 +281,14 @@ import { registerDemoProjectsRoutes } from "./demo-projects/routes.js";
 import { DemoProjectsService } from "./demo-projects/service.js";
 import { DemoCredentialStore } from "./demo-projects/credentials.js";
 import { t3PublicOrigins } from "./t3code/access.js";
-import { isOtherSiteBrowserRequest, requiresSameSiteBrowser } from "./http-origin-guard.js";
+import { isOtherSiteBrowserRequest, isOtherSiteUpgradeRequest, requiresSameSiteBrowser } from "./http-origin-guard.js";
 import { registerT3Bindings } from "./t3code/bindings.js";
 import { registerT3Gateway } from "./t3code/gateway.js";
 import { registerT3LegacyRetirement } from "./t3code/legacy.js";
 import { registerT3StaticAssets, t3StartupAssets } from "./t3code/static-assets.js";
 import { t3InlineBootstrapSupported } from "./t3code/upstream.js";
 import { createT3CodeServiceController, registerT3CodeAdminRoutes, type T3CodeServiceController } from "./t3code/service-control.js";
-import { isHarnessRootHttpPath, registerHarnessRoutes, readHarnessTaskTitle, renameHarnessTaskTitle } from "./harness-proxy.js";
+import { harnessRoleAllowed, harnessSameOriginRequest, isHarnessRootHttpPath, registerHarnessRoutes, readHarnessTaskTitle, renameHarnessTaskTitle } from "./harness-proxy.js";
 import { createActiveAgentCountProvider } from "./active-agent-count.js";
 import { createAutoRouteFactsLoader, createPriceCatalogLoader } from "./auto-route-facts.js";
 import { createDotEvalService, registerDotEvalRoutes } from "./dot-evals.js";
@@ -278,11 +296,12 @@ import { createDotChannelService, registerDotChannelRoutes } from "./dot-channel
 import { createDotLiveService, registerDotLiveRoutes } from "./dot-live.js";
 import { createSlackClient, parseSlackEnvelope, verifySlackSignature } from "./channel-slack.js";
 import { createBotFrameworkVerifier, createTeamsClient, parseTeamsActivity } from "./channel-teams.js";
-import { readDeployQueue } from "./deploy-queue.js";
+import { createRoomCoordination } from "./room-coordination.js";
 import { projectRoutingState } from "./tool-routing.js";
 import { registerAgentToolRoutingRoutes } from "./agent-tool-routing-routes.js";
 import {
   agentFileMaxBytes,
+  cliAgentFilesApiBaseUrl,
   persistAgentFile,
   type AgentFileDocxNormalizer
 } from "./cli-agent-files.js";
@@ -291,6 +310,7 @@ import {
   type BrowserEvidenceCaptureHandler
 } from "./browser-evidence.js";
 import { BrowserControlHeldError } from "./browser-errors.js";
+import { withHostBoundBrowserInput } from "./browser-input-client.js";
 import { withBrowserPageLifecycle } from "./browser-page-lifecycle.js";
 import {
   createConfiguredBrowserSessionManager,
@@ -310,10 +330,11 @@ import {
   isOpenCodeDirectParityRuntime
 } from "./cli-parity.js";
 import { createRoomPaneController, type RoomPaneObservation, type RoomCommandAction } from "./room-pane-control.js";
-import { OpenCodeNativeInputNotReadyError, openCodeComposerLine, openCodeCurrentSelectionWithSource, openCodeTuiSelection, switchOpenCodeTuiSettings } from "./cli-opencode-model-picker.js";
+import { openCodeCurrentSelectionWithSource, openCodeTuiSelection } from "./cli-opencode-model-picker.js";
 import { openCodeTaskTimeline } from "./room-task-telemetry.js";
 import { roomOpenCodeTerminalState, roomPromptFingerprint, roomTerminalCommands, roomTerminalState, roomTerminalMode, roomTerminalInterruptKey } from "./room-terminal-screen.js";
-import { openCodeServerFetch } from "@space/opencode-control";
+import { submitCliPrompt } from "./cli-prompt-submit.js";
+import { fetchOpenCodeAgentNames, fetchOpenCodeSessionMessages, sendOpenCodePrompt } from "@space/opencode-control";
 import { findCodexTaskTimeline, findCodexCliPlanState } from "./codex-rollout-diagnostics.js";
 import type { CodexResetCreditsService } from "./codex-reset-credits.js";
 import {
@@ -354,6 +375,8 @@ import { verifyGeminiPaneSession } from "./gemini-session-verification.js";
 import { loadGeminiNativeTurns } from "./gemini-native-turns.js";
 import { QuietRequestLogController } from "./request-log-policy.js";
 import { createClaudeNativeRefRecorder, loadClaudeNativeTurns, type ClaudeNativeTurns } from "./claude-native-turns.js";
+import { switchClaudePaneAccount, type ClaudeAccountSwitchDeps } from "./claude-account-switch.js";
+import { CLAUDE_GATEWAY_PROFILE, claudeLimitMoveDeps, createClaudeDirectPins, createClaudeLimitMove } from "./claude-limit-move.js";
 import { createCliPaneReopener } from "./cli-pane-reopen.js";
 import { createCliRuntimePaneRestorer } from "./cli-runtime-pane-restore.js";
 import {
@@ -364,6 +387,7 @@ import {
   openCodeServerIsHealthy,
   parseOpenCodeCompositeModelId,
   readOpenCodeServerControl,
+  readOpenCodeSessionTurnActive,
   openCodeSpaceChatStateRoot,
   opencodeServerControlPath,
   resolveOpenCodeTitleFallbackControl,
@@ -465,11 +489,8 @@ import {
   createToolbarModelStatsCollector,
   type ToolbarModelStatsCollector
 } from "./toolbar-model-stats.js";
-import {
-  SystemAnalyticsService,
-  type SystemAnalyticsLiveSession
-} from "./system-analytics-service.js";
-import { OpencodeModelBenchService } from "./opencode-model-bench.js";
+import { SystemAnalyticsService, tokenUsageSourcesFor, type SystemAnalyticsLiveSession } from "./system-analytics-service.js";
+import { OpencodeModelBenchService, openCode2Models } from "./opencode-model-bench.js";
 import { StreamingCredentialStore } from "./streaming-credential-store.js";
 import { formatStreamingBotLiveMetrics } from "@space/streaming";
 import {
@@ -495,7 +516,7 @@ import {
   ReleasePublishingManager
 } from "./release-publishing.js";
 import { createAppVersionReader } from "./app-version.js";
-import { createMemoryEmbedding, runMemoryEmbeddingSmoke } from "./memory-embedding-smoke.js";
+import { createMemoryEmbedding } from "./memory-embedding-smoke.js";
 import { registerMemoryGraphRoutes } from "./memory-graph-routes.js";
 import { createMemoryGraphService, type MemoryGraphApiService } from "./memory-graph-service.js";
 import {
@@ -512,7 +533,7 @@ import { registerProviderRoutes } from "./provider-routes.js";
 import { registerLinkInspectRoutes } from "./link-inspect-routes.js";
 import { registerCliAccountRoutes } from "./cli-account-routes.js";
 import { registerCliRuntimeRoutes, registerCliRuntimeSettingsRoutes } from "./cli-runtime-routes.js";
-import { registerPaneCliTerminalRoutes, registerPaneCliModelRoutes } from "./pane-cli-routes.js";
+import { registerPaneCliRoutes } from "./pane-cli-route-group.js";
 import {
   cliModelReasoningEffortSchema, CodexRuntimeModelSettingsUnconfirmedError, canonicalCodexAdvertisedModelId,
   type CodexRuntimeModelSettings
@@ -520,8 +541,10 @@ import {
 import { registerPaneRoutes } from "./pane-routes.js";
 import { registerPaneStreamRoutes, registerPaneBrowserFrameRoutes } from "./pane-stream-routes.js";
 import { type PaneBrowserAccountControl, registerPaneBrowserRoutes } from "./pane-browser-routes.js";
+import { registerBrowserCensusRoutes } from "./browser-census-routes.js";
 import type { PaneBrowserAccount } from "./pane-browser-account.js";
 import { registerCliBrowserBridgeRoutes } from "./cli-browser-bridge-routes.js";
+import { agentTokenSecret } from "./cli-browser-bridge.js";
 import { registerInternalAgentActionRoutes } from "./internal-agent-action-routes.js";
 import { registerPaneCliSessionRoutes } from "./pane-cli-session-routes.js";
 import { safeBrowserObservationUrl, safeBrowserObservationText } from "./browser-observation.js";
@@ -559,6 +582,9 @@ export { type SpaceCapabilityInventoryCollector } from "./space-capability-inven
 import { registerProofRoomRoutes } from "./proof-room-routes.js";
 import { observeMemoryWorkers } from "./host-metrics.js";
 import { type DashboardAgentsSample, registerRoomListRoutes, registerRoomManagementRoutes } from "./room-routes.js";
+import { createOwnedResourceGuard } from "./owned-resource-access.js";
+import { createRoomShareAccess, registerRoomShareRoutes } from "./room-shares.js";
+import { createCliUserHosting } from "./cli-user-hosts.js";
 import { registerAgentSessionHistoryRoutes, registerAgentSessionThreadRoutes } from "./agent-session-routes.js";
 import { buildSharedCliTaskContext } from "./codex-history-titles.js";
 export { buildSharedCliTaskContext } from "./codex-history-titles.js";
@@ -581,7 +607,7 @@ import {
   createRoomAgentWorkflowCoordinator,
   type RoomAgentWorkflowCoordinator
 } from "./room-agent.js";
-import { createCachedModelSelection } from "./room-agent-model-resolver.js";
+import { createCachedModelSelection, runOpenCodeText } from "./room-agent-model-resolver.js";
 import { createGatewayChatModel, createOpenCodeTextModel, createRoomAgentChat, type RoomAgentChatModel } from "./room-agent-chat.js";
 import { createRoomAgentTools } from "./room-agent-tools.js";
 import { createRoomAgentAutopilot } from "./room-agent-autopilot.js";
@@ -614,7 +640,9 @@ export interface CreateAppOptions {
   codexTurnStarter?: TurnStarter;
   browserEvidenceCapture?: BrowserEvidenceCaptureHandler;
   browserSessionManager?: BrowserSessionManager;
-  memoryEmbeddingGenerator?: (input: string) => Promise<number[]>;
+  memoryEmbeddingGenerator?: (input: string, purpose?: "document" | "query") => Promise<number[]>;
+  /** null turns the backfill off (tests); absent builds it from the config. */
+  memoryEmbeddingBackfill?: MemoryEmbeddingBackfill | null;
   spaceAgentAdapter?: SpaceAgentAdapter;
   /** Stage 7 tests: Auto shadow evidence without a database. */
   autoRouteShadowRepository?: AutoRouteShadowRepository;
@@ -624,10 +652,17 @@ export interface CreateAppOptions {
   channelsRepository?: ChannelsRepository;
   /** Room Agent conversation model; tests inject a scripted stream. */
   roomAgentChatModel?: RoomAgentChatModel;
+  nousRunner?: NousRunner;
+  /** The Vault broker's root reinstall a Nous decision runs (tests). */
+  vaultBrokerReinstall?: () => Promise<string>;
+  /** The pane board's summary model (nous/pane-board.ts); tests inject one, the live instance uses stable's worker. */
+  paneBoardRunner?: PaneSummaryRunner;
   /** Room Agent monitor storage; defaults to Postgres with a database URL, else memory. */
   roomAgentMonitorRepository?: RoomAgentMonitorRepository;
   /** Tests replace the notification store (Postgres on the live instances). */
   notificationsRepository?: SpaceNotificationsRepository;
+  /** Tests replace the FCM sender (the configured service account key on the live instances). */
+  notificationPush?: FcmSender | null;
   /** Start the room monitor loop on ready; defaults to on for the production store and off for injected test stores. */
   startRoomAgentMonitor?: boolean;
   roomAgentWorkflow?: RoomAgentWorkflowCoordinator;
@@ -708,7 +743,9 @@ export interface CreateAppOptions {
   mailCopilotGoogle?: MailCopilotGoogleAccess;
   mailCopilotGmailFetch?: typeof fetch;
   mailCopilotRepository?: MailCopilotRepository;
-  marketingCopilotRepository?: MarketingCopilotWiring["repository"]; marketingCopilotKickoff?: MarketingCopilotWiring["kickoff"]; marketingCopilotScheduler?: boolean; marketingCopilotMetrics?: boolean;
+  vault?: VaultOverrides; marketingCopilotRepository?: MarketingCopilotWiring["repository"]; marketingCopilotKickoff?: MarketingCopilotWiring["kickoff"]; marketingCopilotScheduler?: boolean; marketingCopilotMetrics?: boolean; freelanceCopilotRepository?: FreelanceCopilotWiring["repository"]; freelanceCopilotKickoff?: FreelanceCopilotWiring["kickoff"]; freelanceCopilotScheduler?: boolean; freelanceCopilotMailboxes?: FreelanceCopilotWiring["mailboxes"];
+  /** Tests replace the Design pane's repository, gateway client, template renderer and CLI kickoff. */
+  designRepository?: DesignWiring["repository"]; designGenerate?: DesignWiring["generate"]; designRender?: DesignWiring["render"]; designKickoff?: DesignWiring["kickoff"]; appStudioRepository?: AppStudioWiring["repository"]; appStudioKickoff?: AppStudioWiring["kickoff"];
   /** Tests replace the pane CLI kickoff of a Mail Copilot run. */
   mailCopilotKickoff?: (pane: Pane, run: MailCopilotRun) => Promise<void>;
   /** false: no Gmail history polling (tests call the sync themselves). */
@@ -780,6 +817,7 @@ const publicPaths = new Set([
   "/logout",
   "/api/setup/status",
   "/api/setup/claim",
+  "/api/auth/invites/accept",
   "/api/public/waitlist",
   "/api/demo-projects/preview/:runId/:token",
   "/api/demo-projects/preview/:runId/:token/*",
@@ -808,8 +846,6 @@ const execFileAsync = promisify(execFile);
 
 const codexThreadSettingsConfirmationAttempts = 12;
 const codexThreadSettingsConfirmationIntervalMs = 250;
-
-const storageMinimumRecommendedFreeBytes = 20 * 1024 * 1024 * 1024;
 
 const emptyToolbarActionSchema = z.object({}).strict();
 
@@ -847,23 +883,20 @@ function isAllowedAppDiagnosticsAutomationMutation(request: FastifyRequest): boo
 
 export interface DatabaseRetentionSweepResult {
   deletedChunks: number;
-  deletedPanes: number;
   batches: number;
 }
 
+// Closed panes are never pruned here (Record Retention Invariant 2026-10-20): only POST /api/admin/panes/prune deletes them.
 export async function runDatabaseRetentionSweep(input: {
   store: SpaceStore;
   olderThanDays?: number;
-  olderThanHoursForPanes?: number;
   batchLimit?: number;
   maxBatches?: number;
 }): Promise<DatabaseRetentionSweepResult> {
   const olderThanDays = input.olderThanDays ?? 7;
-  const olderThanHoursForPanes = input.olderThanHoursForPanes ?? 24;
   const batchLimit = input.batchLimit ?? 500;
   const maxBatches = input.maxBatches ?? 10;
   let totalDeletedChunks = 0;
-  let totalDeletedPanes = 0;
   let totalBatches = 0;
 
   const pruneChunksFn = (input.store as {
@@ -872,13 +905,6 @@ export async function runDatabaseRetentionSweep(input: {
       batchSize?: number;
     }) => Promise<{ deletedChunks: number }> | { deletedChunks: number };
   }).pruneExpiredCliTranscriptChunks;
-
-  const prunePanesFn = (input.store as {
-    pruneClosedPanes?: (opts?: {
-      olderThanHours?: number;
-      batchSize?: number;
-    }) => Promise<{ deletedPanes: number }> | { deletedPanes: number };
-  }).pruneClosedPanes;
 
   if (typeof pruneChunksFn === "function") {
     let chunkBatches = 0;
@@ -894,23 +920,8 @@ export async function runDatabaseRetentionSweep(input: {
     totalBatches = Math.max(totalBatches, chunkBatches);
   }
 
-  if (typeof prunePanesFn === "function") {
-    let paneBatches = 0;
-    while (paneBatches < maxBatches) {
-      const result = await prunePanesFn.call(input.store, {
-        olderThanHours: olderThanHoursForPanes,
-        batchSize: batchLimit
-      });
-      totalDeletedPanes += result.deletedPanes;
-      paneBatches += 1;
-      if (result.deletedPanes < batchLimit) break;
-    }
-    totalBatches = Math.max(totalBatches, paneBatches);
-  }
-
   return {
     deletedChunks: totalDeletedChunks,
-    deletedPanes: totalDeletedPanes,
     batches: totalBatches
   };
 }
@@ -1146,14 +1157,12 @@ function requiresCsrf(request: FastifyRequest): boolean {
   return (
     routeUrl.startsWith("/api/") &&
     routeUrl !== "/api/auth/login" &&
-    routeUrl !== "/api/auth/google/credential" &&
+    routeUrl !== "/api/auth/google/credential" && routeUrl !== "/api/auth/desktop-handoff" &&
     routeUrl !== "/api/voice/realtime/history/search" &&
     routeUrl !== "/api/voice/realtime/logs" &&
     routeUrl !== "/api/voice/client-error" &&
-    !routeUrl.startsWith("/api/asteroids/benchmark/") &&
-    !routeUrl.startsWith("/api/harness/") &&
-    routeUrl !== "/api/harness/*"
-  );
+    !routeUrl.startsWith("/api/asteroids/benchmark/")
+  ) || isHarnessRootHttpPath(routeUrl);
 }
 
 function resolveDemoPublicOrigin(request: { headers: Record<string, unknown> }, config: SpaceApiConfig): string {
@@ -1174,7 +1183,7 @@ function createDemoProjectsService(input: {
   const repository =
     config.runtimeStore === "postgres" && config.databaseUrl
       ? PostgresDemoProjectsRepository.fromConnectionString(config.databaseUrl, {
-          max: Math.min(config.databasePoolMax, 2),
+          max: 2,
           idleTimeoutMillis: config.databasePoolIdleTimeoutMs,
           connectionTimeoutMillis: config.databasePoolConnectionTimeoutMs
         })
@@ -1206,7 +1215,6 @@ function createDefaultStore(config: SpaceApiConfig): SpaceStore {
       mcpServerConfigs: config.mcpServerConfigs ?? [],
       mcpConfigError: config.mcpConfigError ?? null
     }, {
-      max: config.databasePoolMax,
       idleTimeoutMillis: config.databasePoolIdleTimeoutMs,
       connectionTimeoutMillis: config.databasePoolConnectionTimeoutMs
     });
@@ -1262,51 +1270,6 @@ function createDefaultActivityLogService(config: SpaceApiConfig, store: SpaceSto
     : new InMemoryActivityLogRepository();
   return new ActivityLogService({ repository });
 }
-
-function usedPercent(sizeBytes: number, availableBytes: number): number {
-  if (sizeBytes <= 0) return 0;
-  return Math.round(((sizeBytes - availableBytes) / sizeBytes) * 1000) / 10;
-}
-
-async function collectStorageMount(targetPath: string) {
-  const [fsStats, pathStats] = await Promise.all([statfs(targetPath), stat(targetPath)]);
-  const sizeBytes = fsStats.blocks * fsStats.bsize;
-  const availableBytes = fsStats.bavail * fsStats.bsize;
-  return {
-    path: targetPath,
-    deviceId: String(pathStats.dev),
-    sizeBytes,
-    availableBytes,
-    usedPercent: usedPercent(sizeBytes, availableBytes)
-  };
-}
-
-async function collectStorageReadiness(): Promise<StorageReadiness> {
-  const [root, app] = await Promise.all([collectStorageMount("/"), collectStorageMount("/opt/spaceapp")]);
-  const dedicatedAppVolume = root.deviceId !== app.deviceId;
-  const freeSpaceBlocked = app.availableBytes < storageMinimumRecommendedFreeBytes;
-  const rootWarn = root.usedPercent >= 80;
-  const status = !dedicatedAppVolume || freeSpaceBlocked ? "BLOCKED" : rootWarn ? "WARN" : "VERIFIED";
-  const statusReason = !dedicatedAppVolume
-    ? "Dedicated /opt/spaceapp volume is not detected; production/browser-heavy launch requires isolated dedicated app storage with at least 20GB free."
-    : freeSpaceBlocked
-      ? "Dedicated /opt/spaceapp volume exists but available space is below the 20GB minimum recommendation."
-      : rootWarn
-        ? "Root filesystem is above the 80% warning threshold."
-        : "Storage readiness meets the current Space launch thresholds.";
-
-  return storageReadinessSchema.parse({
-    id: "space-storage",
-    status,
-    statusReason,
-    root,
-    app,
-    dedicatedAppVolume,
-    minimumRecommendedFreeBytes: storageMinimumRecommendedFreeBytes,
-    checkedAt: new Date().toISOString()
-  });
-}
-
 
 
 export async function createApp(options: CreateAppOptions = {}): Promise<FastifyInstance> {
@@ -1459,6 +1422,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       return { status: identity.authStatus === "CONNECTED" ? "UNKNOWN" : "NOT_CONNECTED", plan: null, remainingPercent: null, resetAt: null, windows: [] };
     }
   });
+  const claudeDirectPins = createClaudeDirectPins(process.env.VITEST === "true" ? null : join(dirname(config.cliAccountBalancerStateFile), "claude-direct-pins.json"));
   const appDiagnosticsService =
     options.appDiagnosticsService ?? createDefaultAppDiagnosticsService(config, store);
   const activityLogService =
@@ -1529,9 +1493,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       timeoutMs: config.browserEvidenceTimeoutMs
     });
   const browserSessionManager: BrowserSessionManagerWithHostHealth = withBrowserPageLifecycle(options.browserSessionManager ??
-    createConfiguredBrowserSessionManager({ store, config }), store);
+    withHostBoundBrowserInput(createConfiguredBrowserSessionManager({ store, config }), config), store);
   const memoryEmbeddingGenerator =
-    options.memoryEmbeddingGenerator ?? ((input: string) => createMemoryEmbedding(config, input));
+    options.memoryEmbeddingGenerator ?? ((input: string, purpose: "document" | "query" = "document") =>
+      createMemoryEmbedding(config, input, { taskType: purpose === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT" }));
   const codexGoals = options.codexGoals ?? createCodexGoalsAdapter(config.codexGoalsDbPath);
   const spawnedCodexAppServerControl =
     config.codexAppServerEnabled && config.codexAppServerAllowStdioSpawn && config.codexAppServerHome
@@ -1688,20 +1653,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     : [];
   const dotsRepository = store instanceof PostgresSpaceStore && config.databaseUrl
     ? PostgresDotsRepository.fromConnectionString(config.databaseUrl) : null;
-  const dotMemoryRepository = dotsRepository && config.databaseUrl ? PostgresDotMemoryRepository.fromConnectionString(config.databaseUrl) : null;
+  const dotMemoryRepository = dotsRepository && config.databaseUrl ? PostgresDotMemoryRepository.fromConnectionString(config.databaseUrl, config.memoryEmbeddingModel) : null;
   // Stage 8: the user's Dot settings and each Dot's feed across rooms.
   const dotHomeRepository = dotsRepository && config.databaseUrl ? PostgresDotHomeRepository.fromConnectionString(config.databaseUrl) : null;
-  const roomOwnerDot = async (roomId: string, dotId: string) => {
-    const owner = (await store.getRoom(roomId)).ownerUserId;
-    const dot = owner && dotsRepository ? await dotsRepository.get(owner, dotId) : null;
-    return owner && dot ? { owner, dot } : null;
-  };
+  const roomOwnerDot = (roomId: string, dotId: string) => findRoomOwnerDot(store, dotsRepository ?? null, roomId, dotId);
   const dotMemoryService = dotsRepository && dotMemoryRepository ? createDotMemoryService({
     store, dots: dotsRepository, memories: dotMemoryRepository,
     // Embeddings only when semantic memory is verified; text search works without them.
-    embed: async (text) => {
+    embed: async (text, purpose) => {
       const [smoke, vector] = await Promise.all([store.getLatestMemoryEmbeddingSmoke(), store.getMemoryVectorReadiness(config.memoryEmbeddingDimensions)]);
-      return isSemanticMemoryReady(smoke, vector) ? await memoryEmbeddingGenerator(text) : null;
+      return isSemanticMemoryReady(smoke, vector) ? await memoryEmbeddingGenerator(text, purpose) : null;
     },
     audit: async (request, action, metadata) => {
       if (request) await recordAudit(store, request, { action, targetType: "dot", targetId: String(metadata.dotId ?? ""), metadata });
@@ -1738,6 +1699,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           conversationContext: feed ? dotConversationContext(dot.name, feed) : null,
           onAccepted: async () => { if (feed?.notices.length) await dotHomeRepository!.markNoticesDelivered(dot.dotId, feed.notices.map((notice) => notice.entryId)); } };
       },
+      dotIdentity: (session) => sessionDotIdentity(store, dotsRepository ?? null, session),
       dotRuntime: async (session) => {
         if (!dotHomeRepository || !session.dotId) return null;
         // Agent Proof and recovery rooms, and evaluation runs, keep the model and permissions their pane chose.
@@ -1836,25 +1798,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       monthlyPath: config.spaceMemoryMonthlyPath,
       lockPath: config.spaceMemoryLockPath
     });
-  const canonicalSearch = config.runtimeStore === "postgres" && config.databaseUrl && config.memoryGraphEnabled &&
-    config.memoryEmbeddingProvider && config.memoryEmbeddingModel && config.memoryEmbeddingDimensions === 1536
-    ? new CanonicalMemorySearch({
-        canonical: canonicalMemory,
-        repository: CanonicalMemoryEmbeddings.fromConnectionString(config.databaseUrl),
-        provider: config.memoryEmbeddingProvider, model: config.memoryEmbeddingModel,
-        ready: async () => {
-          if (!config.memoryEmbeddingSmokeEnabled) return false;
-          const vector = await store.getMemoryVectorReadiness(config.memoryEmbeddingDimensions);
-          let smoke = await store.getLatestMemoryEmbeddingSmoke();
-          if (!smoke || Date.now() - Date.parse(smoke.checkedAt) > 24 * 60 * 60 * 1000) {
-            const result = await runMemoryEmbeddingSmoke(config, { pgvectorReady: vector.status === "VERIFIED" });
-            smoke = await store.recordMemoryEmbeddingSmoke({ ...result, actorUserId: null, traceId: "memory:canonical-index", checkedAt: result.finishedAt });
-          }
-          return isSemanticMemoryReady(smoke, vector);
-        },
-        embed: texts => createMemoryEmbeddings(config, texts)
-      })
-    : null;
+  const { canonicalSearch, backfill: memoryEmbeddingBackfill } = createMemoryEmbeddingIndexing({ config, store, canonicalMemory,
+    dotMemories: dotMemoryRepository, backfill: options.memoryEmbeddingBackfill });
   const memoryGraphService =
     options.memoryGraphService ??
     createMemoryGraphService({
@@ -1926,9 +1871,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   let setupConnections!: SetupConnectionsService;
 
   let taskTitleInputNotifier: ((paneId: string) => void) | undefined;
+  const roomShares = createRoomShareAccess({ store, enabled: config.multiUserEnabled === true });
+  const cliUserHosting = createCliUserHosting({ store, config, paneById: (paneId) => getPaneById(store, paneId) });
+  // Non-null only on public installs: their core image has no CLIs (OpenCode included), so CLI calls go to the CLI container.
+  const publicCredentialHost = createPublicCredentialHost(config);
+  const runOpenCode = publicCredentialHost?.openCodeText ?? runOpenCodeText;
   const cliTerminalManager = new CliTerminalManager({
     store,
     config,
+    credentialHost: publicCredentialHost,
+    observeOnly: (pane, userId) => roomShares.observeOnly(pane, userId), ...cliUserHosting.terminal,
     discoverRuntimes: () => cliRuntimeRegistryCache.read(),
     // Reattaching an allocated session must not await probes for unrelated CLIs.
     // Runtime visibility and session ownership are still checked on every request.
@@ -2152,7 +2104,6 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         }
       );
     });
-  const publicCredentialHost = createPublicCredentialHost(config);
   cliRuntimeRegistryCache = createCliRuntimeRegistryCache(config, { probeCredentialStatus: publicCredentialHost?.status });
   setupConnections =
     options.setupConnections ??
@@ -2162,8 +2113,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         cliRuntimeRegistryCache.invalidate();
         return cliRuntimeRegistryCache.read();
       },
-      observeCredential: (runtime) => observeCliRuntimeCredential(runtime),
-      checkCredential: (runtime) => checkCliRuntimeCredential(runtime)
+      observeCredential: (runtime) => observeCliRuntimeCredential(runtime, publicCredentialHost?.execute),
+      checkCredential: (runtime) => checkCliRuntimeCredential(runtime, publicCredentialHost?.execute)
     });
   const setupConnectionCheckRuns =
     options.setupConnectionCheckRuns ??
@@ -2309,13 +2260,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     profileExists: async (runtimeId, profileId) => isCliAccountProfileRuntimeId(runtimeId)
       && Boolean(await store.getCliAccountProfile(runtimeId, profileId))
   });
-  const toolbarUsageProvider =
-    options.toolbarUsageProvider ?? createGatewayCodexUsageProvider({ repository: gatewayRepositoryFor() });
+  const toolbarUsageProvider = options.toolbarUsageProvider ?? createGatewayCodexUsageProvider({ repository: gatewayRepositoryFor() });
   const taskTitleRepository = store instanceof PostgresSpaceStore && config.databaseUrl
     ? PostgresTaskTitleRepository.fromConnectionString(config.databaseUrl)
     : new InMemoryTaskTitleRepository();
   const taskTitleProviders = new TaskTitleProviders({store,config,repository:taskTitleRepository,opencodeStateRoot:options.opencodeStateRoot,usage:toolbarUsageProvider});
-  const taskTitles = new TaskTitleService({nativeTitles:new NativeTaskTitles(async session=>(await cliTerminalManager.activeSessionPids([session])).get(session.sessionId)??null),store,repository:taskTitleRepository,providers:taskTitleProviders,codex:codexParity,eventBus,opencodeStateRoot:options.opencodeStateRoot,
+  const taskTitles = new TaskTitleService({summaryAllowed:cliUserHosting.ownerModels.pane,nativeTitles:new NativeTaskTitles(async session=>(await cliTerminalManager.activeSessionPids([session])).get(session.sessionId)??null),store,repository:taskTitleRepository,providers:taskTitleProviders,codex:codexParity,eventBus,opencodeStateRoot:options.opencodeStateRoot,
     harness:{read:(paneId,sessionId)=>readHarnessTaskTitle(config,paneId,sessionId),rename:async(paneId,sessionId,title)=>renameHarnessTaskTitle(config,paneId,sessionId,title,(await store.getPane(paneId)).taskMetadata?.harnessSessionId)},
     resolveCodexThread:session=>resolvePaneCodexThreadId({store,session,traceId:makeSpaceId("trace"),findThreadId:options.findCodexThreadId}),
     readCodexName:async(sessionId,threadId)=>{
@@ -2403,6 +2353,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     store,
     stateRoot: options.opencodeStateRoot,
     codexHome: config.codexAppServerHome ?? "/var/lib/spaceapp-user/.codex",
+    tokenUsage: tokenUsageSourcesFor(gatewayRepositoryFor, config.instanceJobs["token-usage-claude"]),
     liveSessions: async () => {
       const health = await Promise.all([
         cliTerminalManager.hostHealth("cli:codex").catch(() => null),
@@ -2430,6 +2381,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     }
   });
   const opencodeModelBenchService = options.opencodeModelBenchService ?? new OpencodeModelBenchService({
+    execVerbose: publicCredentialHost
+      ? (provider) => publicCredentialHost.openCodeModels(provider).then((stdout) => openCode2Models(stdout, provider)).catch(() => [])
+      : undefined,
     repository: store instanceof PostgresSpaceStore
       ? PostgresSystemAnalyticsRepository.fromConnectionString(
           config.databaseUrl ?? (() => {
@@ -2678,7 +2632,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     });
   };
   const loadNativeCliModels = createNativeCliModelCatalog();
-  const readPaneNativeModelSettings = async (session: PaneCliSession): Promise<PaneCliModelSettings> => {
+  const readScreenNativeModelSettings = async (session: PaneCliSession): Promise<PaneCliModelSettings> => {
     const runtime = findRuntime(await cliRuntimeRegistryCache.read(), session.runtimeId);
     if (!runtime?.detectedCommandPath || !isDirectOperatorParityRuntime(session.runtimeId)) {
       throw new SpaceConflictError("This CLI does not expose a model catalog.");
@@ -2702,6 +2656,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       isTurnActive: roomTerminalState(screen.text) === "RUNNING"
     };
   };
+  const readPaneNativeModelSettings = (session: PaneCliSession) => withOmpSessionModel(readScreenNativeModelSettings(session), session, cliTerminalManager, store);
   /** Switches a native-picker CLI to an advertised model and effort with screen readback, then
    * records it on the session and the pane (the pane's next session starts on it). Callers serialize. */
   const applyNativePaneModel = async (input: {
@@ -2738,8 +2693,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     });
     // Preserve the confirmed model even if its separate effort command fails.
     await store.updatePaneCliSession(active.sessionId, { modelId: model.id, reasoningEffort: "unknown" }, traceId);
-    // Gemini, OMP and Claude apply the effort together with the model.
-    if (active.runtimeId !== 'cli:gemini' && active.runtimeId !== 'cli:omp' && active.runtimeId !== 'cli:claude') await switchNativeCliReasoning({ model, effort: input.reasoningEffort, runtimeId: active.runtimeId, assertCurrent,
+    // Gemini, OMP, Claude and Droid apply the effort together with the model.
+    if (active.runtimeId !== 'cli:gemini' && active.runtimeId !== 'cli:omp' && active.runtimeId !== 'cli:claude' && active.runtimeId !== 'cli:droid') await switchNativeCliReasoning({ model, effort: input.reasoningEffort, runtimeId: active.runtimeId, assertCurrent,
       read: () => cliTerminalManager.observeRoomScreen(active.sessionId, true),
       write: data => cliTerminalManager.sendInput(active.sessionId, data, traceId, null, `reasoning-picker:${traceId}:${step++}`)
     });
@@ -2891,7 +2846,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     return control;
   };
   const openCodeChatControlPromises = new Map<string, Promise<OpenCodeServerControl>>();
+  // Dev runs as stable's user: it must never read stable's OpenCode access files or reach stable's shared server.
+  const assertChatOpenCodeHere = () => { if (config.instance === "dev") throw new SpaceFeatureDisabledError("OPENCODE_SESSION_CONTROL_UNAVAILABLE", "OpenCode Chat is unavailable on dev: it runs only on the stable instance."); };
   const resolveChatOpenCodeCatalogControl = async (): Promise<OpenCodeServerControl> => {
+    assertChatOpenCodeHere();
     const stateRoot = options.opencodeStateRoot ?? opencodeDirectParityRoot + "/state";
     const sharedControl = await resolveOpenCodeTitleFallbackControl(stateRoot);
     if (sharedControl && await openCodeServerIsHealthy(sharedControl)) return sharedControl;
@@ -2901,6 +2859,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     );
   };
   const resolveChatPaneOpenCodeControl = async (spaceAgentSessionId: string): Promise<OpenCodeServerControl> => {
+    assertChatOpenCodeHere();
     if (!/^agent_session:[A-Za-z0-9_-]+$/.test(spaceAgentSessionId)) {
       throw new SpaceFeatureDisabledError(
         "OPENCODE_SESSION_CONTROL_UNAVAILABLE",
@@ -2998,7 +2957,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           supportedReasoningEfforts: ["default", ...listedVariants.filter(variant => variant !== "default")],
           reasoningOptions: (listedVariants.length ? ["default", ...listedVariants.filter(variant => variant !== "default")] : []).map((reasoningEffort) => ({ reasoningEffort }))
         }];
-      });
+      // Space Gateway's models first, so a picker search finds them ahead of the hundreds of OpenRouter rows.
+      }).sort((left, right) => Number(!left.id.startsWith("space-gateway")) - Number(!right.id.startsWith("space-gateway")));
     } catch {
       throw new SpaceFeatureDisabledError(
         "OPENCODE_SESSION_CONTROL_UNAVAILABLE",
@@ -3065,9 +3025,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   ) => cliTerminalManager.runSerializedTerminalMutation(session.sessionId, async () => {
     if (!model.supportedReasoningEfforts.includes(effort)) throw new SpaceConflictError("This reasoning level is not advertised by OpenCode.");
     const control = await resolveOpenCodeServerControl(session);
-    if (await fetchOpenCodeSessionIsTurnActive(control, control.nativeSessionId)) {
-      throw new SpaceConflictError("Wait for the OpenCode turn to finish before changing model settings.");
-    }
+    const turnActive = await readOpenCodeSessionTurnActive(control, control.nativeSessionId);
+    if (turnActive !== false) throw new SpaceConflictError(turnActive ? "Wait for the OpenCode turn to finish before changing model settings." : "OpenCode did not report whether a turn is running; try again.");
     const assertCurrent = async () => {
       const current = await store.getActivePaneCliSession(pane.id);
       if (!current?.isActive || current.sessionId !== session.sessionId || current.status === "EXITED" || current.status === "ERROR") {
@@ -3075,50 +3034,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       }
       await assertControl?.(current);
     };
-    let step = 0;
-    // Nudge the fullscreen TUI into repainting before scraping it: a fresh
-    // frame survives bounded host replays that otherwise hold deltas only.
-    // Best effort; the gate below still decides whether keys are safe.
-    const preScreen = await cliTerminalManager.observeRoomScreen(session.sessionId).catch(() => null);
-    if (!preScreen || !openCodeComposerLine(preScreen.text)) {
-      await cliTerminalManager.refreshRoomScreen(session.sessionId);
-    }
-    // The native TUI keeps its own selection in sync, but its screen scrape
-    // can miss the composer (unknown geometry, wrapped footer, slow attach)
-    // even when the session control is healthy. Only an unreadable screen
-    // falls through to the reliable server-side switch; every other guard
-    // (turn active, approval, session change, unconfirmed menu) still aborts.
-    // Reasoning-only change: the requested model is already active on the
-    // server, so skip the native model menu and switch just the variant.
-    // Re-selecting the same model flashes an extra model switch in the TUI
-    // without changing anything.
-    const settledBeforeSwitch = await fetchOpenCodeCurrentModel(control, control.nativeSessionId).catch(() => null);
-    const skipModelStep = Boolean(settledBeforeSwitch && `${settledBeforeSwitch.providerID}/${settledBeforeSwitch.id}` === model.id);
-    let nativeTuiConfirmed = false;
-    try {
-      await switchOpenCodeTuiSettings({ model, effort, skipModelStep, assertCurrent,
-        models: allModels ?? [model],
-        read: () => cliTerminalManager.observeRoomScreen(session.sessionId),
-        write: data => cliTerminalManager.sendInput(session.sessionId, data, traceId, null, `opencode-picker:${traceId}:${step++}`)
-      });
-      nativeTuiConfirmed = true;
-    } catch (error) {
-      if (!(error instanceof OpenCodeNativeInputNotReadyError)) throw error;
-      // Never switch a booting session blind: its TUI applies defaults on
-      // first render and would overwrite a mid-boot server-side change.
-      const settled = await fetchOpenCodeCurrentModel(control, control.nativeSessionId).catch(() => null);
-      if (!settled) throw error;
-    }
+    // OpenCode 2's TUI follows the server's session model live, so the server switch below is the whole change.
     await assertCurrent();
-    // Legacy OpenCode attach maintains its own selection. Persist server metadata
-    // only after the same native TUI has independently confirmed both settings.
     const ref = parseOpenCodeCompositeModelId(model.id)!;
     try {
       await switchOpenCodeSessionModel(control, control.nativeSessionId, ref.providerId, ref.modelId, effort,
         model.supportedReasoningEfforts.filter(value => value !== "default"));
     } catch {
-      if (!nativeTuiConfirmed) throw new SpaceConflictError("OpenCode server rejected the model switch. Reopen the picker to refresh its current settings.");
-      throw new SpaceConflictError("OpenCode applied its native selection but could not synchronize the session metadata. Reopen the picker to refresh its current settings.");
+      throw new SpaceConflictError("OpenCode server rejected the model switch. Reopen the picker to refresh its current settings.");
     }
     // The server applies selections asynchronously and the TUI menu markers
     // can be graphics-wrapped: confirm the settled server model AND effort
@@ -3136,16 +3059,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       serverConfirmed = await serverSelectionMatches();
     }
     if (!serverConfirmed) {
-      throw new SpaceConflictError(nativeTuiConfirmed
-        ? "OpenCode did not apply the selected model. Reopen the picker to refresh its current settings."
-        : "OpenCode server did not confirm the selected model. Reopen the picker to refresh its current settings.");
+      throw new SpaceConflictError("OpenCode server did not confirm the selected model. Reopen the picker to refresh its current settings.");
     }
     await store.updatePaneCliSession(session.sessionId, {modelId:model.id,reasoningEffort:effort}, traceId);
     try { await store.updatePane(pane.id, {modelId:model.id}, traceId); } catch {}
-    if (!nativeTuiConfirmed) {
-      await store.updatePaneCliSession(session.sessionId, {statusReason:"OpenCode model applied on the server without native TUI confirmation."}, traceId);
-    }
-    return { nativeTuiConfirmed };
   });
   const roomPlanInventoryProvider = options.roomPlanInventoryProvider ?? createRoomPlanInventoryProvider({
     store,
@@ -3165,7 +3082,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     apiKey: roomTaskEvaluatorKey,
     model: "gpt-5.6-sol"
   });
-  async function resumePaneCliTask(pane: Pane, input: { taskId?: string; threadId?: string }, traceId: string, request?: FastifyRequest, requireNative = false) {
+  async function resumePaneCliTask(pane: Pane, input: { taskId?: string; threadId?: string; accountProfileId?: string | null }, traceId: string, request?: FastifyRequest, requireNative = false) {
     const active = await store.getActivePaneCliSession(pane.id);
     const targetRuntimeId = pane.terminalRuntimeId ?? "cli:codex";
     await cliRuntimeVisibility.assertEnabled(targetRuntimeId);
@@ -3276,7 +3193,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           cwd: sameRuntime ? sourceTask.revision.cwd ?? pane.cwd ?? "/etc" : pane.cwd ?? "/etc",
           codexThreadId: null,
           cliTaskId: sourceTask.taskId,
-          ...(sourceAccountProfileId ? { accountProfileId: sourceAccountProfileId } : {}),
+          ...(input.accountProfileId !== undefined ? { accountProfileId: input.accountProfileId }
+            : sourceAccountProfileId ? { accountProfileId: sourceAccountProfileId } : {}),
           status: "IDLE",
           statusReason: "CLI session allocated; waiting for terminal transport attach."
         },
@@ -3349,8 +3267,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       }
       const updatedPane = await store.updatePane(
         pane.id,
-        // A Job Copilot pane keeps its own title; its name (e.g. "Cody") is the pane name either way.
-        { ...(pane.mode === "JOB_APPLY" ? {} : { title: paneTitle }), cwd: session.cwd, terminalRuntimeId: runtime.id },
+        // A copilot, Design or App Studio pane keeps its own title; its name (e.g. "Cody") is the pane name either way.
+        { ...(pane.mode === "TERMINAL" ? { title: paneTitle } : {}), cwd: session.cwd, terminalRuntimeId: runtime.id },
         traceId
       );
       const latestEvent = await getLatestRoomEvent(store, updatedPane.roomId);
@@ -3394,7 +3312,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   async function roomCliSession(pane: Pane, expectedSessionId?: string) {
     await assertPaneCliRuntimeEnabled(pane);
-    if (pane.mode !== "TERMINAL" || pane.terminalRuntimeId === "cli:root") throw new SpaceConflictError("Room CLI controls require an AI terminal.");
+    if (!isCliPane(pane) || pane.terminalRuntimeId === "cli:root") throw new SpaceConflictError("Room CLI controls require an AI terminal.");
     if ((await store.getPane(pane.id)).isClosed) throw new SpaceConflictError("Reopen the pane before controlling its CLI.");
     let session = await store.getActivePaneCliSession(pane.id);
     if (!session) {
@@ -3404,13 +3322,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     return session;
   }
   async function roomOpenCodeInspection(control: OpenCodeServerControl) {
-    const [response, busy] = await Promise.all([
-      openCodeServerFetch(control, `/session/${encodeURIComponent(control.nativeSessionId)}/message?limit=512`),
+    const [messages, busy] = await Promise.all([
+      fetchOpenCodeSessionMessages(control, control.nativeSessionId, 512).catch(() => { throw new SpaceConflictError("OpenCode task history is unavailable."); }),
       fetchOpenCodeSessionIsTurnActive(control, control.nativeSessionId)
     ]);
-    if (!response.ok) throw new SpaceConflictError("OpenCode task history is unavailable.");
-    const data: unknown = await response.json();
-    const messages = Array.isArray(data) ? data : [];
     const tasks = openCodeTaskTimeline(messages, busy, nowIso());
 
     const transcriptLines: string[] = [];
@@ -3450,6 +3365,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     base.promptFingerprint = roomPromptFingerprint(base.text);
     base.commands = roomTerminalCommands(screen.text);
     const rawState = roomTerminalState(screen.text);
+    let claudeNative: Awaited<ReturnType<typeof loadClaudeNativeTurns>> = null;
     base.state = pane.isClosed || session.status === "EXITED" ? "EXITED" : session.status === "ERROR" ? "ERROR" : (rawState === "UNKNOWN" && screen.text.trim() === "" && session.runtimeId !== "cli:gemini" ? "IDLE" : rawState);
     if (isCodexDirectParityRuntime(session.runtimeId)) {
       base.tasks = session.codexThreadId ? await findCodexTaskTimeline({ codexHome: codexDirectParityCodexHome,
@@ -3475,9 +3391,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           base.models = settings.settings.models; base.modelId = settings.settings.current?.modelId ?? null;
           base.configuredModelId = pane.modelId; base.effectiveModelId = base.modelId; base.modelVerificationStatus = base.modelId ? "VERIFIED" : "UNKNOWN";
         }
-        const agents = await openCodeServerFetch(control, "/agent").catch(() => null);
-        if (agents?.ok) { const data = await agents.json().catch(() => null) as Array<{ name?: string; mode?: string; hidden?: boolean }> | null;
-          if (Array.isArray(data)) base.modes = data.filter((agent) => !agent.hidden && agent.mode !== "subagent" && agent.name).map((agent) => agent.name!); }
+        const modes = await fetchOpenCodeAgentNames(control).catch(() => []);
+        if (modes.length) base.modes = modes;
         if (base.state !== "EXITED" && base.state !== "ERROR") {
           const terminalMode = roomOpenCodeTerminalState(screen.text, settings?.settings?.isTurnActive ?? false, base.modes ?? []);
           base.state = settings?.settings?.isTurnActive
@@ -3581,7 +3496,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       base.modes = ["workspace", "read-only", "yolo", "plan"];
     } else if (isClaudeDirectParityRuntime(session.runtimeId)) {
       const pids = await cliTerminalManager.activeSessionPids([session]).catch(() => null);
-      const native = await loadClaudeNativeTurns({
+      const native = claudeNative = await loadClaudeNativeTurns({
         paneId: pane.id, sessionId: session.sessionId, rootPid: pids?.get(session.sessionId) ?? null
       }, { fresh: freshness?.fresh === true }).catch(() => null);
       if (native) {
@@ -3598,7 +3513,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     if (session.runtimeId === "cli:claude") base.modes = ["default", "plan", "accept edits", "bypass permissions", "auto"];
     if (session.runtimeId === "cli:omp" || session.runtimeId === "cli:droid") base.modes = ["build", "plan"];
     if (session.runtimeId === "cli:qoder") base.modes = ["yolo", "auto mode", "don't ask", "default", "accept edits", "plan"];
+    base.modelId = await inspectedNativeModelId(session, readPaneNativeModelSettings, cliTerminalManager) ?? base.modelId;
     base.nativeMode = roomTerminalMode(session.runtimeId, screen.text, base.modes);
+    base.usageLimited = cliUsageLimited(screen.text, claudeNative, session.startedAt);
     roomCliObservationCache.set(pane.id, { expires: Date.now() + 15_000, data: base });
     return base;
   }
@@ -3625,11 +3542,17 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           throw new SpaceConflictError("The pane's question changed since it was inspected; inspect it again before answering.");
         if (!action.expectedPromptFingerprint && roomTerminalState(before.text) !== "WAITING_FOR_INPUT")
           throw new SpaceConflictError("The pane is not waiting for an answer; inspect it again.");
-        if (action.answer) await cliTerminalManager.sendInput(session.sessionId, action.answer, traceId, null, `${traceId}:answer`);
-        if (action.submit !== false) {
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          await roomCliSession(pane, action.expectedSessionId);
-          await cliTerminalManager.sendInput(session.sessionId, "\r", traceId, null, `${traceId}:submit-answer`);
+        // Text with Enter is a prompt; a single key ("1", "y") or text without Enter goes as keys, for menus.
+        if (action.submit !== false && action.answer.length > 1) {
+          await submitCliPrompt(cliTerminalManager, session.sessionId, action.answer, traceId, `${traceId}:answer`,
+            { assertCurrent: () => roomCliSession(pane, action.expectedSessionId) });
+        } else {
+          if (action.answer) await cliTerminalManager.sendInput(session.sessionId, action.answer, traceId, null, `${traceId}:answer`);
+          if (action.submit !== false) {
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            await roomCliSession(pane, action.expectedSessionId);
+            await cliTerminalManager.sendInput(session.sessionId, "\r", traceId, null, `${traceId}:submit-answer`);
+          }
         }
       }
       if (action.command) {
@@ -3700,8 +3623,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           },
           createdAt: nowIso()
         });
-        try { await store.recordRoomEvent(watchdogEvent); } catch {}
-        eventBus.publish(watchdogEvent);
+        const recorded = await Promise.resolve(store.recordRoomEvent(watchdogEvent)).catch(() => null);
+        eventBus.publish(recorded ?? watchdogEvent);
         throw new SpaceConflictError(alertMessage);
       }
       throw error;
@@ -3713,6 +3636,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     if ((await store.planExecutions.listActive()).some(execution => execution.paneId === paneId))
       throw new SpaceConflictError("This pane has a managed plan execution. Change the exact stage through its override endpoint.");
   };
+  const claudeAccountSwitchDeps: ClaudeAccountSwitchDeps = { store, inspect: (target) => inspectRoomCli(target, { fresh: true }), now: nowIso, interrupt: (id) => cliTerminalManager.interrupt(id),
+    resume: (target, input, trace) => resumePaneCliTask(target, input, trace, undefined, true), ensureReady: (target, trace, selection) => cliTerminalManager.ensurePaneControlReady(target, trace, selection) };
   const roomPaneController = createRoomPaneController({
     store, chat: spaceAgentAdapter, listRuntimes: () => cliTerminalManager.listRuntimes(),
     isEnabled: (runtimeId) => cliRuntimeVisibility.isEnabled(runtimeId),
@@ -3755,7 +3680,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
             },
             assertCurrent: async ({before}) => {
               const current = await roomCliSession(pane, action.expectedSessionId);
-              if (current.codexThreadId !== before.settings.threadId || current.cwd !== session.cwd)
+              // Like the pane picker: a fresh TUI's task reaches the DB only after its first turn is saved.
+              const liveThreadId = before.primaryThreadId !== undefined ? await before.directControl.readCurrentThreadId?.() : current.codexThreadId;
+              if (liveThreadId !== before.settings.threadId || current.cwd !== session.cwd)
                 throw new SpaceConflictError("The native Codex thread changed before model control.");
             },
             updateSettings: async ({before,model,reasoning},beforeSend) => {
@@ -3765,8 +3692,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
             updateRouter: async ({before,model,reasoning}) => {
               // Keep the TUI's collaboration-mode router in sync with this explicit
               // selection while managed creation is excluded from the pane.
+              // The fence checked the live thread; the router guards the DB's (null until a fresh TUI's first turn is saved).
               await cliTerminalManager.updateCodexNativeModelSettings({ sessionId: session.sessionId,
-                expectedThreadId: before.settings.threadId, models: before.settings.models, modelId: model.id, reasoningEffort: reasoning, traceId });
+                expectedThreadId: before.session.codexThreadId, models: before.settings.models, modelId: model.id, reasoningEffort: reasoning, traceId });
             },
             finish: async ({before,model,reasoning}) => {
               if (before.settings.threadId) await waitForCodexThreadSettings({ threadId: before.settings.threadId, cwd: session.cwd, sessionId: session.sessionId, modelId: model.id, reasoningEffort: reasoning, models: before.settings.models });
@@ -3911,8 +3839,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
               await store.updatePaneCliSession(session.sessionId, { accountProfileId: targetProfile }, traceId);
             }
           }
+        } else if (session.runtimeId === "cli:claude") {
+          if (await switchClaudePaneAccount(claudeAccountSwitchDeps, pane, session, action.accountProfileId, traceId)) roomCliObservationCache.delete(pane.id);
         } else {
-          throw new SpaceConflictError("Account profile switching is currently supported on Gemini panes.");
+          throw new SpaceConflictError("Account profile switching is supported on Gemini and Claude Code panes.");
         }
       }
       return { observation: await inspectRoomCli(pane) };
@@ -3938,9 +3868,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           }
         }
         const ready = await cliTerminalManager.ensurePaneControlReady(pane, traceId);
-        const result = await commandRoomCli(pane, { type: "cli_command", paneId: pane.id, expectedSessionId: ready.sessionId,
-          command: "/resume", ...(source ? { selection: source.title } : {}), when: "AFTER_TURN" }, traceId);
-        return { ...result, phase: "NATIVE_RESUME_MENU", verification: "Inspect the selected native task before reporting resume complete." };
+        return resumeRoomCliFromMenu({ paneId: pane.id, ready, source, command: (selection) => commandRoomCli(pane, { type: "cli_command", paneId: pane.id,
+          expectedSessionId: ready.sessionId, command: "/resume", ...(selection ? { selection } : {}), when: "AFTER_TURN" }, traceId) });
       }
       const session = await store.getActivePaneCliSession(pane.id) ?? (await store.listPaneCliSessions(pane.id,1))[0];
       const ref = taskId ?? session?.cliTaskId;
@@ -4160,11 +4089,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const session=await roomCliSession(pane);
     if(isOpenCodeDirectParityRuntime(session.runtimeId)){
       const control=await resolveOpenCodeServerControl(session);
-      if(await fetchOpenCodeSessionIsTurnActive(control,control.nativeSessionId))throw new SpaceConflictError("OpenCode already has an active turn.");
-      const res=await openCodeServerFetch(control,`/session/${encodeURIComponent(control.nativeSessionId)}/prompt_async`,{
-        method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({parts:[{type:"text",text}]})
-      });
-      if(!res.ok)throw new SpaceConflictError("OpenCode rejected prompt injection.");
+      const turnActive=await readOpenCodeSessionTurnActive(control,control.nativeSessionId);if(turnActive!==false)throw new SpaceConflictError(turnActive?"OpenCode already has an active turn.":"OpenCode did not report whether a turn is running; try again.");
+      if(!(await sendOpenCodePrompt(control,control.nativeSessionId,text)))throw new SpaceConflictError("OpenCode rejected prompt injection.");
       for(let attempt=0;attempt<2;attempt++){
         await new Promise(r=>setTimeout(r,30));
         if(await fetchOpenCodeSessionIsTurnActive(control,control.nativeSessionId)){
@@ -4183,18 +4109,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
             clientUserMessageId:`space-control:${traceId}:${pane.id}`.slice(0,200)});
           return {sessionId:session.sessionId,nativeTaskRef:before.settings.threadId,turnId:turn.turnId,state:turn.status,submitted:true};
         }
-        await cliTerminalManager.sendInput(session.sessionId,text,traceId,null,`${traceId}:${pane.id}:prompt`);
-        await new Promise(resolve=>setTimeout(resolve,40));
-        await cliTerminalManager.sendInput(session.sessionId,"\r",traceId,null,`${traceId}:${pane.id}:submit`);
+        await submitCliPrompt(cliTerminalManager,session.sessionId,text,traceId,`${traceId}:${pane.id}`);
         return {sessionId:session.sessionId,nativeTaskRef:before?.settings?.threadId??session.sessionId,state:"RUNNING",submitted:true};
       });
     }
     return cliTerminalManager.runSerializedTerminalMutation(session.sessionId,async()=>{
       const observed=await inspectRoomCli(pane);
       if(observed.state==="RUNNING")throw new SpaceConflictError("CLI already has an active turn.");
-      await cliTerminalManager.sendInput(session.sessionId,text,traceId,null,`${traceId}:${pane.id}:prompt`,true);
-      await new Promise(resolve=>setTimeout(resolve,40));
-      await cliTerminalManager.sendInput(session.sessionId,"\r",traceId,null,`${traceId}:${pane.id}:submit`);
+      await submitCliPrompt(cliTerminalManager,session.sessionId,text,traceId,`${traceId}:${pane.id}`,{waitForComposer:true,gapMs:40});
       return {sessionId:session.sessionId,nativeTaskRef:observed.nativeTaskRef??session.sessionId,state:"RUNNING",submitted:true};
     });
     } finally {
@@ -4212,11 +4134,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       if (!control) return null;
       if (!control.directory && session.cwd) control.directory = session.cwd;
       const busy = await fetchOpenCodeSessionIsTurnActive(control, control.nativeSessionId, session.cwd ?? undefined).catch(() => false);
-      return { busy, messages: async () => {
-        const response = await openCodeServerFetch(control, `/session/${encodeURIComponent(control.nativeSessionId)}/message?limit=2`);
-        const data: unknown = response.ok ? await response.json() : [];
-        return Array.isArray(data) ? data : [];
-      } };
+      return { busy, messages: () => fetchOpenCodeSessionMessages(control, control.nativeSessionId, 2).catch(() => []) };
     },
     geminiTurns: async session => {
       const pids = await cliTerminalManager.activeSessionPids([session]).catch(() => null);
@@ -4237,6 +4155,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   };
   const roomAgentSnapshots = createRoomAgentSnapshotProvider({ listPanes: async roomId => store.listPanes(roomId), readActivity: readDashboardAgents });
   const spaceControl = createSpaceControl({store,repository:controlRepository,controller:roomPaneController,decisionsService,phase:2,pluginsService,queueDisconnected:true,
+    captureScreenshot: process.env.VITEST === "true" ? undefined : createControlScreenshotCapture({ instance: config.instance, cookieName, sessionSecret: auth.sessionSecret, artifactRoot: config.browserEvidenceArtifactRoot, resolveUser: controlUser, createArtifact: async (input) => store.createArtifact(input) }),
     publish:async roomId=>{const event=await getLatestRoomEvent(store,roomId);if(event)eventBus.publish(event);},
     publishEvent: (event) => eventBus.publish(event),
     resolveActor: controlUser,
@@ -4386,6 +4305,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           assertBrowserPaneCompatible(pane);
           const context={holderType:"OPERATOR" as const,holderId:actor.id};
           if(action.operation==="browser.content"){
+            // The Vault fence covers in-process reads too (Room Agent, Nous): no page text while a fill is in the page.
+            if(await vault.protection.ownerOf(pane.id)&&!(await vault.protection.release(pane.id)))throw new SpaceConflictError("This browser holds a Vault fill: its page is not read until it shows the next page.");
             const result=await browserSessionManager.action(pane,{type:"extract_text"},makeSpaceId("trace"),context);
             return {paneId:pane.id,text:safeBrowserObservationText(result.text),currentUrl:safeBrowserObservationUrl(result.session.currentUrl)};
           }
@@ -4509,8 +4430,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
             throw new SpaceConflictError(`Nothing to open: all requested pane types are currently unavailable.`);
           }
 
-          let selectedGeminiAccount: { id: string; email: string | null; remainingPercent: number | null } | null = null;
-          if (counts.gemini && counts.gemini > 0) {
+          const geminiGateway = counts.gemini ? await gatewayCliAccounts.openProfileId("cli:gemini", (action.input as any)?.accountProfileId) : null;
+          let selectedGeminiAccount: { id: string; email: string | null; remainingPercent: number | null } | null = geminiGateway ? { id: geminiGateway, email: null, remainingPercent: null } : null;
+          if (!geminiGateway && counts.gemini && counts.gemini > 0) {
             const usageList = await antigravityUsageProvider().catch(() => ({ data: [] }));
             const availableAccounts = usageList.data.filter((acc) => {
               const isConnected = acc.status === "CONNECTED";
@@ -4518,7 +4440,6 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
               const remWeekly = acc.gemini?.weeklyRemainingPercent ?? 0;
               return isConnected && rem5h > 0 && remWeekly > 0;
             });
-
             const requestedProfileId = typeof (action.input as any)?.accountProfileId === "string" ? (action.input as any).accountProfileId : null;
             if (requestedProfileId) {
               const match = availableAccounts.find((a) => a.id === requestedProfileId);
@@ -4704,10 +4625,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           });
         }
         if(action.operation.startsWith("ops.")){
-          const toolNames={"ops.status":"space_status","ops.logs":"space_logs","ops.test":"space_scoped_test","ops.verify":"space_live_verify","ops.deploy":"space_deploy_commit","ops.proof":"space_authenticated_ui_proof"} as const;
-          const tool=toolNames[action.operation as keyof typeof toolNames];
-          if(!tool)throw new SpaceConflictError("Unknown protected operation.");
-          return controlInvoke(actor.id,"POST","/api/mcp/tools/execute",{roomId,toolId:`space_ops:${tool}`,arguments:action.input,
+          const toolIds={"ops.status":"space-readonly:space_status","ops.logs":"space-readonly:space_logs","ops.test":"space_ops:space_scoped_test","ops.verify":"space_ops:space_live_verify","ops.proof":"space-readonly:space_authenticated_ui_proof"} as const; // The API's MCP registry (SPACE_MCP_SERVERS_JSON) serves the read-only ops tools as space-readonly.
+          const toolId=toolIds[action.operation as keyof typeof toolIds];
+          if(!toolId)throw new SpaceConflictError("Unknown protected operation.");
+          return controlInvoke(actor.id,"POST","/api/mcp/tools/execute",{roomId,toolId,arguments:action.input,
             ...(action.approvalReason?{approvalReason:action.approvalReason}:{})});
         }
         if(action.operation==="asteroids.control"){
@@ -4766,6 +4687,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           if (qs) targetUrl += (targetUrl.includes("?") ? "&" : "?") + qs;
         }
         const invokeBody = route.method === "GET" ? undefined : { ...(action.input as any) };
+        if (action.operation === "panes.update" && invokeBody && "accountProfileId" in invokeBody && (await store.getPane(effectiveId!)).mode === "TERMINAL") {
+          throw new SpaceConflictError("panes.update does not change a CLI pane's account: use configure with accountProfileId on the pane.");
+        }
         if (invokeBody && route.path.includes(":id") && "id" in invokeBody) {
           delete invokeBody.id;
         }
@@ -4794,7 +4718,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     inspectExtra:async(actor,input)=>{
       await controlUser(actor.id);
       if(input.section==="ROOMS")return store.listRooms();
-      if(input.section==="SKILLS")return {installed:await controlSkills(input.query),registered:input.query?undefined:await store.listSkills()};
+      if(input.section==="SKILLS")return controlSkillsPage(await store.listSkills(),input);
       if(input.section==="QUOTA"){
         if(input.paneId){const pane=await store.getPane(input.paneId);if(pane.roomId!==input.roomId)throw new SpaceConflictError("Pane is outside this room.");return controlQuota(pane);}
         const antiUsage = await antigravityUsageProvider().catch(()=>({data:[]}));
@@ -4960,10 +4884,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     publish: publishLatestRoomEvent
   });
   const roomAgentModelSelection = createCachedModelSelection({ codexLbBaseUrl: config.codexLbBaseUrl, codexLbKeyFile: config.codexLbKeyFile });
+  const roomCoordination = createRoomCoordination({ store, controlRepository, deployQueueRoot: options.deployQueueRoot,
+    devQueueRoot: options.releasesOptions?.devQueueRoot, describeRoom: (roomId) => roomAgentService.describeRoom(roomId) });
   // The Room Agent's tools act as the operator through the same Space Control, pane controller and room commands as Live.
   const roomAgentTools = createRoomAgentTools({
     listPanes: async (roomId) => store.listPanes(roomId, true),
-    describeRoom: (roomId) => roomAgentService.describeRoom(roomId),
+    describeRoom: roomCoordination.describeRoom, releaseTrain: roomCoordination.releaseTrain,
     inspectPane: (pane) => roomPaneController.inspect(pane, { fresh: true }),
     interruptPane: (pane, traceId) => roomPaneController.interrupt(pane, traceId),
     answerCli: (pane, input, traceId) => commandRoomCli(pane, input.key
@@ -4990,12 +4916,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     store,
     publish: (event) => eventBus.publish(event),
     tools: roomAgentTools,
-    describeRoom: (roomId) => roomAgentService.describeRoom(roomId),
+    describeRoom: roomCoordination.describeRoom,
     snapshot: (roomId) => roomAgentService.snapshot(roomId),
     paneTypes: async () => (await roomPaneCommands.catalog()).filter((entry) => entry.available).map((entry) => entry.definition.typeId),
     modelSelection: roomAgentModelSelection,
     model: options.roomAgentChatModel ?? createGatewayChatModel({ baseUrl: config.codexLbBaseUrl, keyFile: config.codexLbKeyFile }),
-    textModel: options.roomAgentChatModel ?? createOpenCodeTextModel(),
+    textModel: options.roomAgentChatModel ?? createOpenCodeTextModel({ run: runOpenCode }),
     log: { warn: (details, message) => app.log.warn(details, message) }
   });
   const roomAgentService = createRoomAgentService({
@@ -5006,7 +4932,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     codexLbBaseUrl: config.codexLbBaseUrl,
     codexLbKeyFile: config.codexLbKeyFile,
     modelSelection: roomAgentModelSelection,
-    chat: roomAgentChat,
+    chat: roomAgentChat, chatAllowed: cliUserHosting.ownerModels.room,
     snapshotProvider: roomAgentSnapshots,
     monitorRepository: roomAgentMonitorRepository,
     refreshControlReceipts:async(roomId)=>{
@@ -5026,52 +4952,41 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   // Stored events are durable room events, so every API process and the docks of other tabs see them.
   // Space notifications: one record per thing a pane or service wants the operator to see, fanned out to the
-  // channels the owner turned on (in-app, desktop, Telegram). Panes raise them through the service; room events
+  // channels the owner turned on (in-app, desktop, Telegram, push). Panes raise them through the service; room events
   // from the browser host and the watchdog are bridged below.
   const notificationsRepository = options.notificationsRepository ?? (store instanceof PostgresSpaceStore && config.databaseUrl
     ? PostgresSpaceNotificationsRepository.fromConnectionString(config.databaseUrl) : new InMemorySpaceNotificationsRepository());
+  const nousRef: { current: NousWiring | null } = { current: null };
   const notificationService = createNotificationService({
     repository: notificationsRepository, eventBus,
+    nous: { held: async (owner) => Boolean(await nousRef.current?.active(owner)), raised: (notification) => nousRef.current?.notification(notification) },
     userSettings: (userId) => Promise.resolve(store.getUserSettings(userId)),
     recordRoomEvent: (input) => Promise.resolve(store.recordRoomEvent(input)),
+    push: options.notificationPush !== undefined ? options.notificationPush : await loadFcmServiceAccount(config.fcmServiceAccountFile).then((account) => account && createFcmSender(account)),
     log: { warn: (meta, message) => app.log.warn(meta, message) }
   });
   const notificationPrune = setInterval(() => { void notificationService.prune().catch((error: unknown) => app.log.warn({ err: error }, "Notification prune failed.")); }, 3_600_000);
   notificationPrune.unref();
+  const stopMorningBatches = notificationService.startMorningBatches(async () => [...new Set((await store.listRooms()).map((room) => room.ownerUserId).filter((id): id is string => Boolean(id)))]);
   const roomOwner = async (roomId: string): Promise<string | null> => (await Promise.resolve(store.getRoom(roomId)).catch(() => null))?.ownerUserId ?? null;
   const stopNotificationProducers = eventBus.subscribe((event) => {
-    if ((event.type !== "BROWSER_HANDOFF_REQUESTED" && event.type !== "ROOM_WATCHDOG_ALERT") || !event.roomId) return;
+    if (event.type !== "ROOM_WATCHDOG_ALERT" || !event.roomId) return;
     const roomId = event.roomId;
     void (async () => {
       const owner = await roomOwner(roomId);
       if (!owner) return;
-      const handoff = event.type === "BROWSER_HANDOFF_REQUESTED";
       await notificationService.raise({
-        ownerUserId: owner, roomId, paneId: event.paneId ?? null, source: handoff ? "BROWSER_HANDOFF" : "ROOM_WATCHDOG", kind: event.type,
-        severity: handoff ? "ATTENTION" : "URGENT", title: handoff ? "The browser needs you" : "Room watchdog alert", body: event.message.slice(0, 2000),
-        link: { roomId, ...(event.paneId ? { paneId: event.paneId } : {}) }, dedupeKey: handoff && event.paneId ? `browser-handoff:${event.paneId}` : `event:${event.id}`,
-        payload: {}, telegram: null
+        ownerUserId: owner, roomId, paneId: event.paneId ?? null, source: "ROOM_WATCHDOG", kind: event.type, severity: "URGENT", title: "Room watchdog alert",
+        body: event.message.slice(0, 2000), link: { roomId, ...(event.paneId ? { paneId: event.paneId } : {}) }, dedupeKey: `event:${event.id}`, payload: {}, telegram: null
       });
     })().catch((error: unknown) => app.log.warn({ err: error, eventId: event.id }, "Notification producer failed."));
   });
+  const roomAgentEventRouting = createRoomAgentEventRouting({ roomOwner, nousActive: async (owner) => Boolean(await nousRef.current?.active(owner)),
+    notifications: notificationService, telegram: roomAgentMonitorRepository, log: { warn: (details, message) => app.log.warn(details, message) } });
   const roomAgentMonitorOnEvent = async (event: RoomAgentEvent) => {
-    // What needs the operator also goes to Telegram when the integration is on (one message per event).
-    if (event.status === "ESCALATED") {
-      await roomAgentMonitorRepository.enqueueTelegramNotice(event).catch((error) => app.log.warn({ err: error, eventId: event.eventId }, "Room Agent Telegram notice failed."));
-    }
-    // Attention events are notifications too (badges, toast, desktop); the monitor keeps its own Telegram path above.
-    void (async () => {
-      const owner = await roomOwner(event.roomId);
-      if (!owner) return;
-      const dedupeKey = `room-agent-event:${event.eventId}`;
-      if (event.severity === "ATTENTION" && (event.status === "OPEN" || event.status === "ESCALATED")) {
-        await notificationService.raise({ ownerUserId: owner, roomId: event.roomId, paneId: event.paneId, source: "ROOM_AGENT", kind: event.kind, severity: "ATTENTION",
-          title: event.title, body: (event.decision ?? event.detail ?? "").slice(0, 2000), link: { roomId: event.roomId, surface: "room-agent", ...(event.paneId ? { paneId: event.paneId } : {}) },
-          dedupeKey, payload: { eventId: event.eventId, status: event.status }, telegram: false });
-      } else if (event.status !== "OPEN") {
-        await notificationService.resolve(owner, dedupeKey);
-      }
-    })().catch((error: unknown) => app.log.warn({ err: error, eventId: event.eventId }, "Room Agent notification failed."));
+    nousRef.current?.monitorEvent(event);
+    // Telegram and notifications for what needs the operator, or nothing while Nous works on the owner's behalf.
+    await roomAgentEventRouting.route(event);
     const recorded = await store.recordRoomEvent({ roomId: event.roomId, paneId: event.paneId, turnId: null, traceId: makeSpaceId("trace"),
       type: "ROOM_AGENT_UPDATED", message: event.title, payload: { kind: "MONITOR_EVENT", eventId: event.eventId, eventKind: event.kind,
         severity: event.severity, status: event.status } });
@@ -5088,8 +5003,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     answer: (pane, input) => commandRoomCli(pane, { type: "cli_command", paneId: pane.id, expectedSessionId: input.expectedSessionId,
       answer: input.answer, submit: input.submit, expectedPromptFingerprint: input.expectedPromptFingerprint, when: "NOW" }, makeSpaceId("trace")),
     complete: async (systemPrompt, content) => completeRoomAgentPrompt({ systemPrompt, content, codexLbBaseUrl: config.codexLbBaseUrl,
-      codexLbKeyFile: config.codexLbKeyFile, modelSelection: await roomAgentModelSelection(), timeoutMs: 20_000 }),
+      codexLbKeyFile: config.codexLbKeyFile, modelSelection: await roomAgentModelSelection(), timeoutMs: 45_000, runOpenCode }),
+    coordinate: (event) => roomCoordination.coordinate(event, { owner: roomOwner, chat: roomAgentChat, send: roomAgentService.send }),
     onEvent: (event) => roomAgentMonitorOnEvent(event),
+    deferTo: async (event) => Boolean(await nousRef.current?.handles(event)),
     log: { warn: (details, message) => app.log.warn(details, message) }
   });
   const roomAgentMonitor = createRoomAgentMonitor({
@@ -5097,6 +5014,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     listRooms: async () => store.listRooms(),
     readActivity: readDashboardAgents,
     onEvent: (event) => roomAgentMonitorOnEvent(event),
+    readOverlaps: roomCoordination.readOverlaps,
     onAttention: (event) => { void roomAgentAutopilot.handle(event); },
     onAttentionSweep: (roomIds) => roomAgentAutopilot.sweep(roomIds),
     onActivity: (roomId) => eventBus.publish(eventSchema.parse({ id: makeSpaceId("event"), roomId, paneId: null, turnId: null, workflowId: null,
@@ -5197,8 +5115,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       }
     }
   });
-  // SEC-011: logouts and "log out everywhere" survive API restarts. Revocations stay effective in
-  // memory while the database is unreachable; loading is retried until it succeeds.
+  // SEC-011: logouts and "log out everywhere" survive API restarts. Until the persisted revocations load,
+  // every session is refused (fail closed, review 2026-10-16); loading is retried until it succeeds.
   const sessionRevocationRepository = store instanceof PostgresSpaceStore && config.databaseUrl
     ? PostgresSessionRevocationRepository.fromConnectionString(config.databaseUrl) : null;
   let sessionRevocationRetry: NodeJS.Timeout | null = null;
@@ -5208,13 +5126,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       await defaultSessionRevocationStore.attachPersistence(sessionRevocationRepository);
     } catch (error) {
       app.log.error({ err: error, event: "session_revocations.load_failed" }, "Persisted session revocations could not be loaded; retrying.");
-      sessionRevocationRetry = setTimeout(() => void attachSessionRevocations(), 30_000);
+      sessionRevocationRetry = setTimeout(() => void attachSessionRevocations(), 5_000);
       sessionRevocationRetry.unref?.();
     }
   };
   await attachSessionRevocations();
   const persistRevocation = (pending: Promise<void>) => pending.catch((error: unknown) => {
-    app.log.error({ err: error, event: "session_revocations.persist_failed" }, "A session revocation is effective now but was not persisted.");
+    app.log.error({ err: error, event: "session_revocations.persist_failed" }, "A session revocation is effective now but was not persisted; retrying.");
+    throw error;
   });
   reportCliTerminalManagerTelemetry = (telemetry) => {
     observability.observeCliTerminalEvent({
@@ -5317,9 +5236,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     dbRetentionSweepRunning = true;
     try {
       const result = await runDatabaseRetentionSweep({ store });
-      if (result.deletedChunks > 0 || result.deletedPanes > 0) {
+      if (result.deletedChunks > 0) {
         app.log.info(
-          { deletedChunks: result.deletedChunks, deletedPanes: result.deletedPanes, batches: result.batches },
+          { deletedChunks: result.deletedChunks, batches: result.batches },
           "Database retention sweep completed."
         );
       }
@@ -5352,12 +5271,6 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     timeWindow: "1 minute",
     keyGenerator: (request) => requestIpForLog(request) ?? "unknown"
   });
-  // Lifecycle hooks stay behind the global limiter (route-rate-limits).
-  app.addHook("onClose", async () => {
-    if (sessionRevocationRetry) clearTimeout(sessionRevocationRetry);
-    defaultSessionRevocationStore.detachPersistence();
-    await sessionRevocationRepository?.dispose();
-  });
   const defaultRouteRateLimitOptions = {
     config: {
       rateLimit: {
@@ -5386,8 +5299,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     (_request, body, done) => done(null, body)
   );
 
-  const userRoleCache = new Map<string, { role: "ADMIN" | "USER" | "OPERATOR"; cachedAt: number }>();
-  const USER_ROLE_CACHE_TTL_MS = 60_000;
+  const sessionAccess = createSessionAccess({ store });
+  // Connector tokens and copilot mailbox passwords: sealed with the dedicated connector key; older values open with the
+  // secrets they were sealed with (SPACE_CONNECTOR_SECRET, else the session secret).
+  const connectorCrypto = createConnectorCrypto({ key: readConnectorKey(config.connectorKeyFile), legacySecrets: [process.env.SPACE_CONNECTOR_SECRET, auth.sessionSecret] });
+  const userRoleCache = sessionAccess.roleCache;
 
   app.addHook("onRequest", async (request, reply) => {
     observability.onRequest(request);
@@ -5396,33 +5312,34 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     requestTraceContexts.remember(request.id, request.traceContext);
     reply.header("x-request-id", request.id);
     let sessionUser = verifySession(request.cookies[cookieName], auth.sessionSecret);
+    // A proof session the broker signed without a scope (before scopes existed, or MEDIA_CAPTURE's) counts as UI_PROOF.
+    if (sessionUser?.id === "user:operator-proof" && !sessionUser.brokerScope) sessionUser.brokerScope = "UI_PROOF";
+    // An agent's broker session reaches only the routes of its scope (packages/contracts/src/broker-scopes.ts), checked on
+    // the route the router matched (an unmatched URL is refused); a read-only session writes nothing.
+    if (sessionUser?.brokerScope && (!request.routeOptions.url
+      || !brokerScopeAllows(sessionUser.brokerScope, request.method, `${request.routeOptions.url}?${new URLSearchParams(request.query as Record<string, string>)}`))) {
+      return sendApiError(reply, 403, "BROKER_SCOPE_DENIED", "This agent session may not call this route.");
+    }
+    // Every read-only session writes nothing: the broker's proof sessions and the capture sessions space_screenshot signs
+    // for its caller's own id (security addendum step 4). App Diagnostics sessions keep exactly their own diagnostics
+    // writes; the APP_DIAGNOSTICS gate below allows those and refuses the rest.
+    if (sessionUser?.proofScope === "READ_ONLY" && sessionUser.automationScope !== "APP_DIAGNOSTICS" && !["GET", "HEAD"].includes(request.method)) {
+      return sendApiError(reply, 403, "READ_ONLY_SESSION", "This read-only session cannot change anything.");
+    }
+    // A used operator session slides to a fresh 30-day expiry; an older cookie moves to it on its next request
+    // (security addendum step 12). Agent, proof and capture sessions are never renewed.
+    if (sessionUser && !sessionUser.brokerScope && !sessionUser.proofScope && !sessionUser.automationScope) {
+      const renewed = renewSessionIfDue(request.cookies[cookieName], auth.sessionSecret);
+      if (renewed) reply.setCookie(cookieName, renewed, { httpOnly: true, secure: auth.secureCookies, sameSite: "lax", path: "/", maxAge: operatorSessionTtlSeconds });
+    }
     if (sessionUser) {
       if (sessionUser.id === "user:operator-proof") {
+        // It acts in the operator's rooms; the audit log still names the agent session (request-audit.ts).
+        request.sessionPrincipal = sessionUser.id;
         sessionUser.id = "user:operator";
       }
-      const now = Date.now();
-      const cached = userRoleCache.get(sessionUser.id);
-      if (cached && now - cached.cachedAt < USER_ROLE_CACHE_TTL_MS) {
-        sessionUser.role = cached.role;
-      } else if (store.getControlActor) {
-        try {
-          const dbActor = await store.getControlActor(sessionUser.id);
-          if (dbActor) {
-            userRoleCache.set(sessionUser.id, { role: dbActor.role, cachedAt: now });
-            sessionUser.role = dbActor.role;
-          }
-        } catch (error) {
-          // Never trust the role embedded in a long-lived token when the store
-          // cannot confirm it: reuse the last confirmed role, otherwise USER.
-          const stale = userRoleCache.get(sessionUser.id);
-          sessionUser.role = stale?.role ?? "USER";
-          request.log.warn(
-            { err: error, userId: sessionUser.id, appliedRole: sessionUser.role },
-            "User role lookup failed; applying least-privilege role."
-          );
-        }
-      }
-      request.user = sessionUser;
+      const resolved = await sessionAccess.resolve(sessionUser, request.log);
+      if (resolved) request.user = resolved;
     }
   });
 
@@ -5446,6 +5363,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     stopTaskTitleEvents();
     await taskTitles.close();
     await canonicalSearch?.close();
+    await memoryEmbeddingBackfill?.close();
     if (artifactRetentionTimer) clearInterval(artifactRetentionTimer);
     if (appDiagnosticsRetentionTimer) clearInterval(appDiagnosticsRetentionTimer);
     if (durableEventPollTimer) clearInterval(durableEventPollTimer);
@@ -5475,6 +5393,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     if (config.instanceJobs["space-control-ticks"]) await spaceControl.start();
     if (config.roomAgentMonitorEnabled && (options.startRoomAgentMonitor ?? !options.store)) roomAgentMonitor.start();
     canonicalSearch?.start();
+    memoryEmbeddingBackfill?.start();
     healthMonitor.start();
     if (options.agentToolsOptions?.rootWriterCommand) {
       try {
@@ -5560,26 +5479,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     }
   });
 
-  const ownedRoomRoutePrefix = "/api/rooms/:id";
-  const ownedPaneRoutePrefix = "/api/panes/:id";
-  // USER accounts may only touch rooms they own (and the panes inside them).
-  // Enforced centrally so every /api/rooms/:id* and /api/panes/:id* route is
-  // covered without repeating the check in each handler.
-  const assertOwnedRoomOrPaneRoute = async (request: FastifyRequest, routePath: string): Promise<void> => {
-    const params = request.params as Record<string, unknown> | undefined;
-    const id = params?.id;
-    if (typeof id !== "string" || id.length === 0) {
-      return;
-    }
-    if (routePath.startsWith(ownedRoomRoutePrefix)) {
-      await assertRoomAccess(id, request.user);
-      return;
-    }
-    if (routePath.startsWith(ownedPaneRoutePrefix)) {
-      const pane = await getPaneById(store, id);
-      await assertRoomAccess(pane.roomId, request.user);
-    }
-  };
+  // USER accounts may only touch rooms they own and what is inside them, checked centrally for every route.
+  // assertRoomAccess is declared further down; the hook runs after it exists.
+  const assertOwnedRoomOrPaneRoute = createOwnedResourceGuard({
+    assertRoomAccess: (roomId, user) => assertRoomAccess(roomId, user),
+    paneRoomId: async (paneId) => (await getPaneById(store, paneId)).roomId,
+    artifactRoomId: async (artifactId) => (await store.getArtifact(artifactId)).roomId,
+    shareOf: roomShares.shareOf, paneOwner: roomShares.explicitPaneOwner
+  });
 
   const publicBrowserOrigins = t3PublicOrigins(config.browserEvidenceTargetOrigin);
   app.addHook("preHandler", async (request, reply) => {
@@ -5587,7 +5494,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       return;
     }
     if (isInternalApiRequest(request)) {
-      if (secureTokenMatches(config.internalApiToken, request.headers[internalTokenHeader])) {
+      // Internal callers (worker, gateway) run on this host: the token alone never opens these routes from elsewhere
+      // (security addendum step 9; request.ip is the real client behind the web proxy and nginx).
+      if (isLoopbackRequest(request) && secureTokenMatches(config.internalApiToken, request.headers[internalTokenHeader])) {
         return;
       }
       const disabled = !config.internalApiToken;
@@ -5599,14 +5508,19 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       );
     }
     if (requestRoutePath(request)==="/api/cli/control/mcp") {
-      const claims=verifyControlToken(config.internalApiToken,request.headers[controlTokenHeader]);
+      const claims=verifyControlToken(agentTokenSecret(config),request.headers[controlTokenHeader]);
       if(!claims)return sendApiError(reply,401,"CONTROL_TOKEN_INVALID","An active Space control token is required.");
-      const session=await store.getPaneCliSession(claims.cliSessionId);
-      if(!session||!supportsControlRuntime({mode:"TERMINAL",terminalRuntimeId:session.runtimeId} as any)||!session.isActive||session.purpose!=="NORMAL"||session.roomId!==claims.roomId||session.paneId!==claims.paneId||["EXITED","ERROR"].includes(session.status))
-        return sendApiError(reply,403,"CONTROL_SESSION_INACTIVE","CLI session is no longer eligible for control.");
-      const grant=await controlRepository.get("grant","shared",claims.roomId);
-      const actorId=(grant?.value as {actorId?:string}|undefined)?.actorId;
-      if(!actorId)return sendApiError(reply,403,"CONTROL_NOT_GRANTED","The operator has not enabled room control access.");
+      // A Harness agent acts for its open Harness pane (harness-agent-tokens.ts); every other token for its CLI session.
+      if(isHarnessAgentSessionId(claims.cliSessionId)){
+        if(!await harnessAgentPrincipal(store,claims))return sendApiError(reply,403,"CONTROL_SESSION_INACTIVE","The Harness pane is no longer eligible for control.");
+      }else{
+        const session=await store.getPaneCliSession(claims.cliSessionId);
+        if(!session||!supportsControlRuntime({mode:"TERMINAL",terminalRuntimeId:session.runtimeId} as any)||!session.isActive||session.purpose!=="NORMAL"||session.roomId!==claims.roomId||session.paneId!==claims.paneId||["EXITED","ERROR"].includes(session.status))
+          return sendApiError(reply,403,"CONTROL_SESSION_INACTIVE","CLI session is no longer eligible for control.");
+      }
+      const actorId=((await controlRepository.get("grant","shared",claims.roomId))?.value as {actorId?:string}|undefined)?.actorId;
+      if(!actorId)return sendApiError(reply,403,"CONTROL_NOT_GRANTED","The operator has not enabled CLI control in this room. The operator turns it on by asking this room's Room Agent or Nous to allow CLI control (access.cli) and confirming.");
+      if(!await cliUserHosting.controlActorAllowed(claims.paneId,actorId))return sendApiError(reply,403,"CONTROL_PANE_NOT_GRANTED","CLI control acts as the operator who allowed it, so it is not available in a pane another account opened.");
       request.user=await controlUser(actorId);controlCliRooms.set(request,claims.roomId);return;
     }
     if (isCliBrowserBridgeRequest(request)) {
@@ -5616,13 +5530,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     if (routePath.startsWith("/api/") && !request.user) {
       return sendApiError(reply, 401, "UNAUTHENTICATED", "Authentication is required.");
     }
-    if (request.user?.role === "USER") {
-      await assertOwnedRoomOrPaneRoute(request, routePath);
-    }
+    const refused = request.user?.role === "USER" ? await assertOwnedRoomOrPaneRoute(request, routePath) : null;
+    if (refused) return sendApiError(reply, refused.status, refused.code, refused.message);
     if (
       request.user?.automationScope === "APP_DIAGNOSTICS" &&
       routePath.startsWith("/api/") &&
-      request.routeOptions.url !== "/api/:method" &&
       !isAllowedAppDiagnosticsAutomationMutation(request)
     ) {
       return sendApiError(
@@ -5633,19 +5545,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       );
     }
     if (request.user && requiresSameSiteBrowser(request, routePath) && isOtherSiteBrowserRequest(request, publicBrowserOrigins)) {
+      // The page that was refused, so a client on an origin the API does not accept can be found (2026-10-19 403 loop).
+      request.log.warn({ origin: String(request.headers.origin ?? "").slice(0, 200) || null, secFetchSite: request.headers["sec-fetch-site"] ?? null, route: routePath }, "origin rejected");
       return sendApiError(reply, 403, "ORIGIN_REJECTED", "Requests from another site cannot use this Space session.");
     }
     if (request.user && requiresCsrf(request)) {
-      if (
-        request.routeOptions.url === "/api/:method" ||
-        request.routeOptions.url === "/api/harness/*" ||
-        routePath.startsWith("/api/harness/") ||
-        isHarnessRootHttpPath(routePath)
-      ) {
-        return;
-      }
       const submittedToken = request.headers[csrfHeaderName];
-      if (!verifyCsrfToken(request.cookies[cookieName], submittedToken, auth.sessionSecret)) {
+      if (!harnessSameOriginRequest(request, routePath) && !verifyCsrfToken(request.cookies[cookieName], submittedToken, auth.sessionSecret)) {
         return sendApiError(reply, 403, "CSRF_INVALID", "A valid CSRF token is required for this action.");
       }
     }
@@ -5810,7 +5716,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           avatarUrl: dbActor.avatarUrl ?? null
         };
         if (needsCookieRefresh && auth.sessionSecret) {
-          const token = signSession(user, auth.sessionSecret);
+          // A role change re-signs the session but keeps it the same session: its issue time and the client's CSRF token.
+          const current = request.cookies[cookieName];
+          const token = signSession(user, auth.sessionSecret, Date.now(), { iat: signedSessionPayload(current, auth.sessionSecret)?.iat,
+            lc: createCsrfToken(current, auth.sessionSecret) ?? undefined });
           reply.setCookie(cookieName, token, {
             httpOnly: true,
             secure: auth.secureCookies,
@@ -5985,8 +5894,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   app.addHook("onClose", async () => { await sourceControlService.close(); });
 
   registerHarnessRoutes(app, config, store, {
-    authorizeUpgrade: (upgradeRequest) =>
-      Boolean(verifySession(cookieValueFromHeader(upgradeRequest.headers.cookie, cookieName), auth.sessionSecret))
+    agentTokens: { config },
+    authorizeUpgrade: (upgradeRequest) => {
+      const user = verifySession(cookieValueFromHeader(upgradeRequest.headers.cookie, cookieName), auth.sessionSecret);
+      return !isOtherSiteUpgradeRequest(upgradeRequest.headers, publicBrowserOrigins) && Boolean(user) && harnessRoleAllowed(user?.role)
+        // The Harness is a UI pane: a proof session may open it, an admin action's session never.
+        && (!user?.brokerScope || user.brokerScope === "UI_PROOF") && !(user?.id === "user:operator-proof" && user.proofScope);
+    }
   });
 
   registerFilesRoutes(app, { hostModeEnabled: config.filesHostModeEnabled, store });
@@ -6015,7 +5929,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const forwardedProto = request.headers["x-forwarded-proto"];
     const forwardedHost = request.headers["x-forwarded-host"];
     const host = (Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost) ?? request.headers["host"] ?? `127.0.0.1:${config.port}`;
-    const proto = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) ?? (auth.secureCookies ? "https" : "http");
+    const proto = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) ?? (auth.secureCookies === true ? "https" : "http");
     return `${String(proto).split(",")[0]!.trim()}://${String(host).split(",")[0]!.trim()}`;
   };
   const connectorStateTools = {
@@ -6036,13 +5950,15 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   registerAdminUserRoutes(app, {
     store, userRoleCache, routeOptions: defaultRouteRateLimitOptions,
-    recordAudit: (request, input) => recordAudit(store, request, input)
+    recordAudit: (request, input) => recordAudit(store, request, input),
+    multiUserEnabled: config.multiUserEnabled === true,
+    revokeUserSessions: (userId) => persistRevocation(defaultSessionRevocationStore.revokeUser(userId)).finally(() => sessionAccess.forget(userId))
   });
 
   app.addHook("onClose", async () => { await sharedGatewayRepository?.dispose(); });
   let gatewayAdminService = options.gatewayAdminService;
   if (!gatewayAdminService) {
-    gatewayAdminService = createGatewayAdminService({ repository: gatewayRepositoryFor(), gatewayUrl: config.gatewayUrl, internalToken: config.internalApiToken });
+    gatewayAdminService = createGatewayAdminService({ repository: gatewayRepositoryFor(), gatewayUrl: config.gatewayUrl, internalToken: config.gatewayAdminToken || config.internalApiToken });
   }
   registerGatewayAdminRoutes(app, {
     service: gatewayAdminService, routeOptions: defaultRouteRateLimitOptions,
@@ -6055,6 +5971,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   registerClientErrorRoutes(app);
   registerInstallTelemetryRoutes(app, { onActive: (fields) => installTelemetry.active.observe(fields) });
+  registerFirstAnswerWatch(app, { reporter: installTelemetry.firstAnswer, rooms: async () => store.listRooms(), readRoom: readDashboardAgents });
 
   registerTraceRoutes(app, { store, routeOptions: defaultRouteRateLimitOptions });
 
@@ -6063,10 +5980,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     websocketRouteOptions: defaultWebsocketRateLimitOptions
   });
 
-  registerTaskItemRoutes(app, {
-    store, routeOptions: defaultRouteRateLimitOptions,
-    recordAudit: (request, input) => recordAudit(store, request, input)
-  });
+  registerTaskItemRoutes(app, { store, routeOptions: defaultRouteRateLimitOptions, recordAudit: (request, input) => recordAudit(store, request, input),
+    schedules: config.instanceJobs["task-schedules"] ? { inspect: (pane) => roomPaneController.inspect(pane, { fresh: true }),
+      answer: (pane, input) => commandRoomCli(pane, { type: "cli_command", paneId: pane.id, ...input, when: "NOW" }, makeSpaceId("trace")) } : null });
 
   registerLinkInspectRoutes(app, { routeOptions: defaultRouteRateLimitOptions });
 
@@ -6097,7 +6013,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   const assertRoomAccess = async (roomId: string, user: AuthUser | null | undefined): Promise<Room> => {
     const room = await store.getRoom(roomId);
-    if (user?.role === "USER" && (!room.ownerUserId || room.ownerUserId !== user.id)) {
+    if (user?.role === "USER" && (!room.ownerUserId || room.ownerUserId !== user.id) && !await roomShares.shareOf(roomId, user.id)) {
       throw new SpaceNotFoundError(`Room ${roomId} was not found.`);
     }
     return room;
@@ -6105,8 +6021,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   registerRoomListRoutes(app, {
     store, activityLogService, cliRuntimeVisibility, readDashboardAgents,
-    visibleCliRuntimeIds, routeOptions: defaultRouteRateLimitOptions, assertRoomAccess
+    visibleCliRuntimeIds, routeOptions: defaultRouteRateLimitOptions, assertRoomAccess, agentPaneEnabled: config.agentPaneEnabled,
+    sharedRooms: roomShares.sharedRooms
   });
+  registerRoomShareRoutes(app, { store, access: roomShares, routeOptions: defaultRouteRateLimitOptions,
+    recordAudit: (request, input) => recordAudit(store, request, input),
+    closeUserRoomSockets: (userId, roomId) => void cliTerminalManager.closeUserRoomSockets(userId, roomId) });
 
   const cliRenderAi=createCliRenderAiController({store,root:config.browserEvidenceArtifactRoot,inspect:inspectRoomCli,quota:controlQuota,send:controlSend,interrupt:pane=>roomPaneController.interrupt(pane,"cli-render-expired")});
   app.addHook("onClose",async()=>cliRenderAi.close());
@@ -6358,7 +6278,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   registerCliRuntimeRoutes(app, {
     config, store, cliRuntimeRegistryCache, cliVpnBroker, deepSeekHarnessServiceController,
     routeOptions: defaultRouteRateLimitOptions, assertCliVpnAvailable, runningDeepSeekHarnessPid,
-    assertDeepSeekHarnessIsolated, readDeepSeekHarnessMaintenanceStatus, readCliVpnApplications
+    assertDeepSeekHarnessIsolated, readDeepSeekHarnessMaintenanceStatus, readCliVpnApplications,
+    userRegistry: cliUserHosting.userRegistry
   });
 
   registerAgentToolRoutingRoutes(app, {
@@ -6366,15 +6287,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     recordAudit: (request, input) => recordAudit(store, request, input)
   });
 
-  app.get("/api/admin/deploy-queue", defaultRouteRateLimitOptions, async (request, reply) => {
-    if (request.user?.role !== "ADMIN") return sendApiError(reply, 403, "ADMIN_REQUIRED", "The deploy queue requires ADMIN.");
-    return readDeployQueue(options.deployQueueRoot, Date.now(), {
-      paneTitle: async (paneId) => { const pane = await store.getPane(paneId); return pane.paneName || pane.title; },
-      roomName: async (roomId) => (await store.getRoom(roomId)).name
-    });
-  });
+  roomCoordination.registerRoutes(app, defaultRouteRateLimitOptions);
   registerInstanceReleaseRoutes(app, {
-    store, releases: options.releasesOptions, managedHere: config.instance === "stable", routeOptions: defaultRouteRateLimitOptions
+    store, releases: options.releasesOptions, managedHere: config.instance === "stable", routeOptions: defaultRouteRateLimitOptions, sessionSecret: auth.sessionSecret
   });
 
   app.post("/api/agent-tools/launch", defaultRouteRateLimitOptions, async (request, reply) => {
@@ -6578,10 +6493,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     return codexCliModeDefaultsService.read();
   });
 
-  registerPaneCliTerminalRoutes(app, {
+  registerPaneCliRoutes(app, {
     config, store, observability, cliRuntimeRegistryCache, cliTerminalManager, cliRuntimeVisibility, assertRootAdmin,
     assertPaneCliRuntimeEnabled, cliPaneReopener, routeOptions: defaultRouteRateLimitOptions,
-    websocketRouteOptions: defaultWebsocketRateLimitOptions, cliAccountBalancer
+    websocketRouteOptions: defaultWebsocketRateLimitOptions, cliAccountBalancer, repository: controlRepository,
+    assertRoomAccess, paneOwner: roomShares.explicitPaneOwner, assertCliHttpMutationControl,
+    waitForCodexThreadSettings, readPaneNativeModelSettings, applyNativePaneModel, readPaneCliModelSettings,
+    resolveOpenCodeServerControl, readPaneOpenCodeModelSettings, applyOpenCodePaneSelection, roomOpenCodeTasks,
+    assertNoManagedModelMutation, roomPaneController
   });
 
   const planExecutionTarget = async (owner: string, paneId: string, expectedSessionId?: string) => {
@@ -6638,15 +6557,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     }
   });
 
-  registerPaneCliModelRoutes(app, {
-    config, store, cliRuntimeRegistryCache, cliTerminalManager, assertCliHttpMutationControl,
-    waitForCodexThreadSettings, readPaneNativeModelSettings, applyNativePaneModel, readPaneCliModelSettings,
-    resolveOpenCodeServerControl, readPaneOpenCodeModelSettings, applyOpenCodePaneSelection, roomOpenCodeTasks,
-    assertNoManagedModelMutation, roomPaneController, assertRootAdmin, assertPaneCliRuntimeEnabled,
-    routeOptions: defaultRouteRateLimitOptions
-  });
-
-  registerPaneStreamRoutes(app, {
+  const browserControlActivity = registerPaneStreamRoutes(app, {
     config, store, browserSessionManager, routeOptions: defaultRouteRateLimitOptions,
     websocketRouteOptions: defaultWebsocketRateLimitOptions
   });
@@ -6658,7 +6569,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     taskTitleProviders, taskTitles, roomPaneCommands, spaceControl, roomAgentService, assertRootAdmin,
     routeOptions: defaultRouteRateLimitOptions, assertRoomAccess, youtubePlaybackStore,
     readDeepSeekHarnessMaintenanceStatus, youtubeSessionStarts, youtubeAccountOperations,
-    initializeNewPaneGoogleAccount, cliPaneReopener, resumePreviousJobCopilotSession,
+    initializeNewPaneGoogleAccount: async (userId, pane) => { await roomShares.notePaneCreator(pane, userId); await initializeNewPaneGoogleAccount(userId, pane); },
+    cliPaneReopener, resumePreviousJobCopilotSession,
     rememberCliNativeRef: async (session) => { if (isClaudeDirectParityRuntime(session.runtimeId)) await readClaudeLiveTurns(session); }
   });
 
@@ -6666,11 +6578,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   const jobApplyRepository = config.databaseUrl ? PostgresJobApplyRepository.fromConnectionString(config.databaseUrl) : new InMemoryJobApplyRepository();
   app.addHook("onClose", () => jobApplyRepository.dispose());
   app.addHook("onClose", () => notificationsRepository.dispose());
-  app.addHook("onClose", () => { clearInterval(notificationPrune); stopNotificationProducers(); });
+  app.addHook("onClose", () => { clearInterval(notificationPrune); stopMorningBatches(); stopNotificationProducers(); });
+  app.addHook("onClose", startBrowserHandoffNotifications({ store, notifications: notificationService, eventBus, roomOwner, log: app.log }));
   const jobApplyPaneRooms = new Map<string, string>();
   const jobApplyService = options.jobApplyService ?? createJobApplyService({
     repository: jobApplyRepository,
-    crypto: createConnectorCrypto(process.env.SPACE_CONNECTOR_SECRET || auth.sessionSecret),
+    crypto: connectorCrypto,
     store,
     artifactRoot: config.browserEvidenceArtifactRoot,
     jobApplyRoot: config.jobApplyRoot,
@@ -6695,6 +6608,15 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           id: makeSpaceId("event"), roomId, paneId: event.paneId, turnId: null, workflowId: null, traceId: `job-apply:${event.id}`,
           type: "JOB_APPLY_UPDATED", message: event.message, payload: { event }, createdAt: event.createdAt
         }));
+        // A question answered, a review decided or a handoff resolved closes its "needs you" notification.
+        const needsYouKey = (kind: string, id: unknown) => `job-apply:${kind}:${String(id ?? event.id)}`;
+        const resolves = event.type === "ANSWERED" ? needsYouKey("question", event.payload.questionId) : event.type === "REVIEW_DECIDED" ? needsYouKey("review", event.payload.reviewId)
+          : event.type === "HANDOFF_RESOLVED" ? needsYouKey("handoff", event.paneId) : null;
+        if (resolves) {
+          const owner = await roomOwner(roomId);
+          if (owner) await notificationService.resolve(owner, resolves);
+          return;
+        }
         // Mail triage reaches Telegram only when an application email asks for something.
         const mailNeedsYou = event.type === "MAIL" && event.payload.category === "ACTION_NEEDED";
         if (!mailNeedsYou && !["HANDOFF_REQUESTED", "QUESTION", "REVIEW_REQUESTED", "RUN_FINISHED", "RUN_STOPPED"].includes(event.type)) return;
@@ -6707,9 +6629,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         if (!owner) return;
         const needsYou = mailNeedsYou || event.type === "HANDOFF_REQUESTED" || event.type === "QUESTION" || event.type === "REVIEW_REQUESTED";
         await notificationService.raise({ ownerUserId: owner, roomId, paneId: event.paneId, source: "JOB_COPILOT", kind: event.type, severity: needsYou ? "ATTENTION" : "INFO",
-          title: needsYou ? `Job Copilot needs you (${pane.title})` : `Job Copilot: ${event.type === "RUN_FINISHED" ? "run finished" : "run stopped"} (${pane.title})`,
+          title: needsYou ? `${pane.title} needs you` : `${pane.title}: ${event.type === "RUN_FINISHED" ? "run finished" : "run stopped"}`,
           body: event.message.slice(0, 2000), link: { roomId, paneId: event.paneId, target: `job-apply-event:${event.id}` },
-          dedupeKey: needsYou ? `job-apply:${event.type}:${event.id}` : null, payload: { eventId: event.id }, telegram: false });
+          dedupeKey: !needsYou ? null : event.type === "QUESTION" ? needsYouKey("question", event.payload.questionId) : event.type === "REVIEW_REQUESTED" ? needsYouKey("review", event.payload.reviewId)
+            : event.type === "HANDOFF_REQUESTED" ? needsYouKey("handoff", event.paneId) : `job-apply:${event.type}:${event.id}`, payload: { eventId: event.id }, telegram: false });
         if (!notifications.telegram) return;
         await telegramIntegrationManager.notify(`Job Copilot (${pane.title}): ${event.message}`).catch((error: unknown) => {
           app.log.warn({ err: error, paneId: event.paneId }, "Job Copilot Telegram notification failed");
@@ -6717,31 +6640,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       })().catch((error: unknown) => app.log.warn({ err: error }, "Job Copilot event listener failed"));
     }
   });
-  // Job Copilot mail triage: every 15 minutes, application emails of each owner's Google accounts that allowed
-  // organizing mail are filed under the Job Applications labels (stable only; a dev copy would act on real Gmail).
-  let jobApplyMailTriageTimer: NodeJS.Timeout | null = null;
-  let jobApplyMailTriageFirst: NodeJS.Timeout | null = null;
-  let jobApplyMailTriageRunning = false;
-  const runJobApplyMailTriage = async () => {
-    if (jobApplyMailTriageRunning) return;
-    jobApplyMailTriageRunning = true;
-    try {
-      await jobApplyService.triageMailForAllOwners((owner, error) => app.log.warn({ err: error, owner }, "Job Copilot mail triage failed for an owner"));
-    } finally {
-      jobApplyMailTriageRunning = false;
-    }
-  };
-  app.addHook("onReady", async () => {
-    if (!config.instanceJobs["job-apply-mail-triage"] || options.jobApplyMailTriage === false || !config.optionalModules.has("job-copilot")) return;
-    jobApplyMailTriageFirst = setTimeout(() => void runJobApplyMailTriage().catch((error) => app.log.warn({ err: error }, "Job Copilot mail triage failed")), 2 * 60_000);
-    jobApplyMailTriageFirst.unref();
-    jobApplyMailTriageTimer = setInterval(() => void runJobApplyMailTriage().catch((error) => app.log.warn({ err: error }, "Job Copilot mail triage failed")), 15 * 60_000);
-    jobApplyMailTriageTimer.unref();
-  });
-  app.addHook("onClose", async () => {
-    if (jobApplyMailTriageFirst) clearTimeout(jobApplyMailTriageFirst);
-    if (jobApplyMailTriageTimer) clearInterval(jobApplyMailTriageTimer);
-  });
+  // Job Copilot mail triage every 15 minutes (stable only; a dev copy would act on real Gmail).
+  scheduleJobApplyMailTriage(app, { enabled: config.instanceJobs["job-apply-mail-triage"] && options.jobApplyMailTriage !== false && config.optionalModules.has("job-copilot"), triage: (onError) => jobApplyService.triageMailForAllOwners(onError) });
   if (config.optionalModules.has("job-copilot")) registerJobApplyRoutes(app, jobApplyService, {
     store,
     routeOptions: defaultRouteRateLimitOptions,
@@ -6751,12 +6651,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       if (!session || session.purpose !== "NORMAL" || !session.isActive || session.status === "EXITED" || session.status === "ERROR") {
         throw new SpaceConflictError("Open the copilot's terminal first: the pane has no running CLI session to receive the run.");
       }
-      const prompt = `Job Copilot run ${run.id} started in this pane. Read the space-job-applications skill (SKILL.md), then loop: call space_jobapply space_job_next until it returns done=true; for each application follow the skill's steps (space_job_memory_recall before asking, space_job_fields_record on every step, evidence before VERIFIED) and close it with space_job_report.`;
+      const prompt = `Job Copilot run ${run.id} started in this pane. Read the space-job-applications skill (SKILL.md), then loop: call space_jobapply space_job_next until it returns done=true (without MCP tools in this session, call them on demand: JSON {"serverId","toolName","arguments"} on stdin to space-capability call); for each application follow the skill's steps (space_job_memory_recall before asking, space_job_fields_record on every step, evidence before VERIFIED) and close it with space_job_report.`;
       const traceId = `job-apply:${run.id}`;
       await cliTerminalManager.runSerializedTerminalMutation(session.sessionId, async () => {
-        await cliTerminalManager.sendInput(session.sessionId, prompt, traceId, null, `${traceId}:kickoff`);
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        await cliTerminalManager.sendInput(session.sessionId, "\r", traceId, null, `${traceId}:kickoff-submit`);
+        await submitCliPrompt(cliTerminalManager, session.sessionId, prompt, traceId, `${traceId}:kickoff`);
       });
     }),
     authenticatedOwner: async (request) => {
@@ -6776,7 +6674,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   const mailCopilotRepository = options.mailCopilotRepository ?? (config.databaseUrl ? PostgresMailCopilotRepository.fromConnectionString(config.databaseUrl) : new InMemoryMailCopilotRepository());
   app.addHook("onClose", () => mailCopilotRepository.dispose());
   const mailCopilotPaneRooms = new Map<string, string>();
+  const mailCopilotKickoff = createMailCopilotKickoff({ store, terminal: cliTerminalManager, send: options.mailCopilotKickoff });
   const mailCopilotService = createMailCopilotService({
+    kickoff: mailCopilotKickoff,
     google: () => options.mailCopilotGoogle ?? connectorServiceRef.current,
     gmailFetch: options.mailCopilotGmailFetch,
     repository: mailCopilotRepository,
@@ -6819,23 +6719,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     if (config.instanceJobs["mail-copilot-sync"] && options.mailCopilotSync !== false && config.optionalModules.has("mail-copilot")) mailCopilotSync.start();
   });
   app.addHook("onClose", async () => mailCopilotSync.stop());
+  registerCodexQuotaResetWatch(app, { enabled: config.instanceJobs["codex-quota-reset-notify"], usage: toolbarUsageProvider, store, notifications: notificationService });
+  registerGatewayDownWatch(app, { enabled: config.instanceJobs["gateway-down-notify"], gatewayUrl: config.gatewayUrl, store, notifications: notificationService });
+  registerMemoryMaintenanceFailureWatch(app, { enabled: config.instanceJobs["memory-maintenance-notify"] && config.memoryGraphEnabled && config.memoryMaintenanceEnabled,
+    address: config.temporalAddress, namespace: config.temporalNamespace, store, notifications: notificationService });
   if (config.optionalModules.has("mail-copilot")) registerMailCopilotRoutes(app, mailCopilotService, {
     store,
     routeOptions: defaultRouteRateLimitOptions,
-    // The run's kickoff goes through the pane CLI input path Room Agent uses (typed line + Enter).
-    kickoff: options.mailCopilotKickoff ?? (async (pane, run) => {
-      const session = await store.getActivePaneCliSession(pane.id);
-      if (!session || session.purpose !== "NORMAL" || !session.isActive || session.status === "EXITED" || session.status === "ERROR") {
-        throw new SpaceConflictError("Open the copilot's terminal first: the pane has no running CLI session to receive the run.");
-      }
-      const prompt = `Mail Copilot run ${run.id} started in this pane. Read the space-mail-copilot skill (SKILL.md), then loop: call space_mailcopilot space_mail_next until it returns done=true; for each item read context.habits (how the operator handled this sender and this kind of mail on this account) and recall memory (space_mail_memory_recall), decide within the pane's autonomy (Assist: draft and space_mail_review_request, never send on your own), learn what the operator teaches you, and close the item with space_mail_report.`;
-      const traceId = `mail-copilot:${run.id}`;
-      await cliTerminalManager.runSerializedTerminalMutation(session.sessionId, async () => {
-        await cliTerminalManager.sendInput(session.sessionId, prompt, traceId, null, `${traceId}:kickoff`);
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        await cliTerminalManager.sendInput(session.sessionId, "\r", traceId, null, `${traceId}:kickoff-submit`);
-      });
-    }),
+    kickoff: mailCopilotKickoff.send,
     authenticatedOwner: async (request) => {
       if (!request.user || !verifySession(request.cookies[cookieName], auth.sessionSecret)) {
         throw new GitControlError("UNAUTHENTICATED", "Sign in to use Mail Copilot.", 401);
@@ -6847,14 +6738,33 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     parseQuery,
     audit: (request, action, targetId, metadata) => recordAudit(store, request, { action, targetType: "mail_copilot", targetId, metadata })
   });
-  const marketingCopilotService = !config.optionalModules.has("marketing-copilot") ? undefined : registerMarketingCopilot(app, { store, eventBus, terminal: cliTerminalManager, databaseUrl: config.databaseUrl, repository: options.marketingCopilotRepository, kickoff: options.marketingCopilotKickoff, routeOptions: defaultRouteRateLimitOptions, parseBody, parseQuery, log: app.log, notifications: notificationService, roomOwner, scheduler: config.instanceJobs["marketing-copilot-scheduler"] && options.marketingCopilotScheduler !== false, metrics: config.instanceJobs["marketing-copilot-metrics"] && options.marketingCopilotMetrics !== false,
+  const paneBrowserAccounts: { current: PaneBrowserAccountControl | null } = { current: null };
+  const marketingCopilotService = !config.optionalModules.has("marketing-copilot") ? undefined : registerMarketingCopilot(app, { store, eventBus, paneBrowserAccounts, artifactRoot: config.browserEvidenceArtifactRoot, terminal: cliTerminalManager, databaseUrl: config.databaseUrl, repository: options.marketingCopilotRepository, kickoff: options.marketingCopilotKickoff, routeOptions: defaultRouteRateLimitOptions, parseBody, parseQuery, log: app.log, notifications: notificationService, roomOwner, scheduler: config.instanceJobs["marketing-copilot-scheduler"] && options.marketingCopilotScheduler !== false, metrics: config.instanceJobs["marketing-copilot-metrics"] && options.marketingCopilotMetrics !== false,
     assertPaneAccess: async (request, pane) => { await assertRoomAccess(pane.roomId, request.user); }, audit: (request, action, targetId, metadata) => recordAudit(store, request, { action, targetType: "marketing_copilot", targetId, metadata }),
     authenticatedOwner: async (request) => { if (!request.user || !verifySession(request.cookies[cookieName], auth.sessionSecret)) throw new GitControlError("UNAUTHENTICATED", "Sign in to use Marketing Copilot.", 401); return (await store.upsertUser(request.user)).id; } });
+  const freelanceCopilotService = !config.optionalModules.has("freelance-copilot") ? undefined : registerFreelanceCopilot(app, { store, eventBus, terminal: cliTerminalManager, databaseUrl: config.databaseUrl, repository: options.freelanceCopilotRepository, kickoff: options.freelanceCopilotKickoff, crypto: connectorCrypto, mailboxes: options.freelanceCopilotMailboxes ?? createImapMailboxFactory(), routeOptions: defaultRouteRateLimitOptions, parseBody, parseQuery, log: app.log, notifications: notificationService, roomOwner, scheduler: config.instanceJobs["freelance-copilot-scheduler"] && options.freelanceCopilotScheduler !== false,
+    assertPaneAccess: async (request, pane) => { await assertRoomAccess(pane.roomId, request.user); }, audit: (request, action, targetId, metadata) => recordAudit(store, request, { action, targetType: "freelance_copilot", targetId, metadata }),
+    authenticatedOwner: async (request) => { if (!request.user || !verifySession(request.cookies[cookieName], auth.sessionSecret)) throw new GitControlError("UNAUTHENTICATED", "Sign in to use Freelance Copilot.", 401); return (await store.upsertUser(request.user)).id; } });
 
-  const paneBrowserAccounts: { current: PaneBrowserAccountControl | null } = { current: null };
+  const designService = !config.optionalModules.has("design") ? undefined : registerDesign(app, { store, eventBus, terminal: cliTerminalManager, databaseUrl: config.databaseUrl, repository: options.designRepository,
+    generate: options.designGenerate, render: options.designRender, kickoff: options.designKickoff, notifications: notificationService, roomOwner, artifactRoot: config.browserEvidenceArtifactRoot,
+    brandRoot: fileURLToPath(new URL("../../web/public/brand", import.meta.url)), gatewayUrl: config.gatewayUrl, gatewayKeyFile: config.designGatewayKeyFile,
+    routeOptions: defaultRouteRateLimitOptions, parseBody, parseQuery, log: app.log,
+    marketingPostExists: marketingCopilotService ? async (owner, postId) => Boolean(await marketingCopilotService.getPost(owner, postId).catch(() => null)) : undefined,
+    attachToMarketingPost: marketingCopilotService ? async (owner, postId, assets) => { await marketingCopilotService.attachAssets(owner, postId, assets); } : undefined,
+    invoke: controlInvoke, inspect: (pane) => roomPaneController.inspect(pane, { fresh: true }), start: (pane) => roomPaneController.start(pane, makeSpaceId("trace")),
+    assertPaneAccess: async (request, pane) => { await assertRoomAccess(pane.roomId, request.user); }, audit: (request, action, targetId, metadata) => recordAudit(store, request, { action, targetType: "design", targetId, metadata }),
+    authenticatedOwner: async (request) => { if (!request.user || !verifySession(request.cookies[cookieName], auth.sessionSecret)) throw new GitControlError("UNAUTHENTICATED", "Sign in to use the Design pane.", 401); return (await store.upsertUser(request.user)).id; } });
+  const appStudioService = !config.optionalModules.has("app-studio") ? undefined : registerAppStudio(app, { store, eventBus, terminal: cliTerminalManager, databaseUrl: config.databaseUrl, repository: options.appStudioRepository,
+    kickoff: options.appStudioKickoff, notifications: notificationService, artifactRoot: config.browserEvidenceArtifactRoot, routeOptions: defaultRouteRateLimitOptions, parseBody, parseQuery, log: app.log,
+    inspect: (pane) => roomPaneController.inspect(pane, { fresh: true }), assertPaneAccess: async (request, pane) => { await assertRoomAccess(pane.roomId, request.user); },
+    audit: (request, action, targetId, metadata) => recordAudit(store, request, { action, targetType: "app_studio", targetId, metadata }),
+    authenticatedOwner: async (request) => { if (!request.user || !verifySession(request.cookies[cookieName], auth.sessionSecret)) throw new GitControlError("UNAUTHENTICATED", "Sign in to use App Studio.", 401); return (await store.upsertUser(request.user)).id; } });
+
+  const vault = registerVault(app, { config, auth, store, browser: browserSessionManager, routeOptions: defaultRouteRateLimitOptions, overrides: options.vault });
   registerCliBrowserBridgeRoutes(app, {
-    options, config, store, eventBus, browserSessionManager, cliRuntimeVisibility,
-    routeOptions: defaultRouteRateLimitOptions, paneBrowserAccounts, marketingCopilotService, jobApplyService: config.optionalModules.has("job-copilot") ? jobApplyService : undefined, mailCopilotService: config.optionalModules.has("mail-copilot") ? mailCopilotService : undefined
+    options, config, store, eventBus, browserSessionManager, cliRuntimeVisibility, controlActivity: browserControlActivity, vault, nous: nousRef,
+    routeOptions: defaultRouteRateLimitOptions, paneBrowserAccounts, marketingCopilotService, freelanceCopilotService, designService, appStudioService, jobApplyService: config.optionalModules.has("job-copilot") ? jobApplyService : undefined, mailCopilotService: config.optionalModules.has("mail-copilot") ? mailCopilotService : undefined
   });
 
   async function withYouTubeAccountLock<T>(paneId: string, operation: () => Promise<T>): Promise<T> {
@@ -6883,25 +6793,24 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const key = profileId.split(":")[3];
     return key && /^[a-f0-9]{64}$/.test(key) ? key : null;
   }
-  // What a pane opens: its explicit choice, else the user's primary Google account
-  // (one shared profile for every pane), else the pane's own profile.
-  async function resolvePaneBrowserAccount(userId: string, pane: Pane): Promise<PaneBrowserAccount> {
-    const selectedProfileId = await paneGoogleAccountSelection(userId, pane);
+  // What a pane opens: its explicit choice (Freelance: the account's Freelance profile, in its own Chrome with its routes),
+  // else the user's primary Google account (one shared profile for every pane), else the pane's own profile. `choice`: one tab's account.
+  async function resolvePaneBrowserAccount(userId: string, pane: Pane, choice?: string | null): Promise<PaneBrowserAccount> {
+    const selectedProfileId = choice !== undefined ? choice : await paneGoogleAccountSelection(userId, pane);
     if (selectedProfileId === privatePaneProfileId) return { selectedProfileId, profileKey: null };
     const account = await selectedGoogleBrowserAccount(userId, pane, selectedProfileId);
-    if (account) return { selectedProfileId, account, profileKey: null };
+    if (account) return pane.mode === "FREELANCE_COPILOT" ? { selectedProfileId, profileKey: createHash("sha256").update(JSON.stringify([userId, account.id])).digest("hex"), sharedProfileKey: freelanceProfileKey(userId, account.id) } : { selectedProfileId, account, profileKey: null };
     if (selectedProfileId !== null) {
       if (!await store.getCliAccountProfile("cli:gemini", selectedProfileId)) {
         throw new SpaceConflictError("The selected Google account is no longer available. Choose another account.");
       }
       const key = youtubeAccountProfileKey(await youtubeAccountOwner(userId, pane), selectedProfileId)!;
-      // A CLI (Gemini) account is one Chrome profile for all of the user's panes; proof rooms stay per pane.
+      // A CLI (Gemini) account is one Chrome profile for all of the user's panes (Freelance: one of its own); proof rooms stay per pane.
       // The per-pane key stays alongside so an older Browser Host keeps the pane's own legacy profile.
-      return (await store.getRoom(pane.roomId)).kind === "AGENT_PROOF"
-        ? { selectedProfileId, profileKey: key }
-        : { selectedProfileId, profileKey: key, sharedProfileKey: key };
+      if ((await store.getRoom(pane.roomId)).kind === "AGENT_PROOF") return { selectedProfileId, profileKey: key };
+      return { selectedProfileId, profileKey: key, sharedProfileKey: pane.mode === "FREELANCE_COPILOT" ? freelanceProfileKey(userId, selectedProfileId) : key };
     }
-    if ((await store.getRoom(pane.roomId)).kind !== "AGENT_PROOF") {
+    if (pane.mode !== "FREELANCE_COPILOT" && (await store.getRoom(pane.roomId)).kind !== "AGENT_PROOF") { // Freelance: its own profile and routes
       const primary = (await store.listGoogleAccounts(userId)).find(candidate => candidate.isPrimary);
       if (primary) return { selectedProfileId: null, account: primary, profileKey: null };
     }
@@ -6911,7 +6820,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   // user's Google accounts, that sign-in moves once into the account's shared profile
   // so every Browser and YouTube pane reuses it.
   async function adoptPaneSignIn(userId: string, pane: Pane, resolved: PaneBrowserAccount, actor: BrowserHostActorContext): Promise<PaneBrowserAccount> {
-    if (resolved.selectedProfileId === privatePaneProfileId || resolved.sharedProfileKey || (await store.getRoom(pane.roomId)).kind === "AGENT_PROOF") return resolved;
+    if (pane.mode === "FREELANCE_COPILOT" || resolved.selectedProfileId === privatePaneProfileId || resolved.sharedProfileKey || (await store.getRoom(pane.roomId)).kind === "AGENT_PROOF") return resolved;
     const byDefault = Boolean(resolved.account) && resolved.selectedProfileId === null;
     const active = await store.getActivePaneBrowserSession(pane.id);
     if (active) {
@@ -6975,15 +6884,15 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       return resolved.account?.id ?? resolved.selectedProfileId;
     } catch { return null; }
   }
-  // The newest closed Job/Marketing Copilot pane of the room and kind (pruning keeps it): a new one continues its browser
+  // The newest closed Job/Marketing/Freelance Copilot pane of the room and kind (pruning keeps it): a new one continues its browser
   // account, tabs and view (Job Copilot also its terminal). shortcut: same room only; look across rooms if that becomes common.
   async function previousCopilotPane(pane: Pane): Promise<Pane | null> {
-    if (pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT") return null;
+    if (pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT") return null;
     const closed = (await store.listPanes(pane.roomId, true)).filter((entry) => entry.mode === pane.mode && entry.isClosed && entry.id !== pane.id);
     return closed.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id))[0] ?? null;
   }
   async function initializeNewPaneGoogleAccount(userId: string, pane: Pane): Promise<void> {
-    if (pane.mode !== "BROWSER" && pane.mode !== "YOUTUBE" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT") return;
+    if (pane.mode !== "BROWSER" && pane.mode !== "YOUTUBE" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT") return;
     const owner = await youtubeAccountOwner(userId, pane);
     const room = await store.getRoom(pane.roomId);
     const accounts = room.kind === "AGENT_PROOF" ? [] : await store.listGoogleAccounts(userId);
@@ -7033,7 +6942,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       proofRoom ? new Map<string, string | null>() : geminiAccountEmails(gemini.map(profile => profile.profileId)),
       proofRoom ? [] : Promise.all(gemini.map(profile => geminiAccountBrowserStatus(userId, profile.profileId)))
     ]);
-    return [...accounts.map(account => ({
+    const choices = [...accounts.map(account => ({
       profileId: account.id,
       displayName: `Google account · ${account.displayName || account.email}`,
       label: account.displayName || account.email,
@@ -7045,6 +6954,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       label: displayName,
       ...(proofRoom ? {} : { email: emails.get(profileId) ?? null, browserStatus: geminiStatuses[index]! })
     }))];
+    if (pane.mode !== "FREELANCE_COPILOT" || proofRoom) return choices; // Freelance: the sign-in of the account's Freelance profile.
+    return Promise.all(choices.map(async choice => ({ ...choice, browserStatus: await cliAccountBrowserStatus(sharedCliProfilePathFor(config.browserSessionsProfileRoot, freelanceProfileKey(userId, choice.profileId))) })));
   }
 
   // CLI agents attach element-level automation to a pane browser through this proxy; operator control drops it.
@@ -7054,18 +6965,22 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     isBrowserPane,
     assertRuntimeEnabled: (runtimeId) => cliRuntimeVisibility.assertEnabled(runtimeId),
     log: app.log,
-    onConnected: (request, resolution) => recordAudit(store, request, {
-      action: "pane.cli.browser_cdp_attach",
-      targetType: "pane",
-      targetId: resolution.pane.id,
-      metadata: { roomId: resolution.claims.roomId, cliPaneId: resolution.claims.paneId, cliSessionId: resolution.claims.cliSessionId, sessionId: resolution.session.sessionId }
-    })
+    onConnected: (request, resolution) => {
+      browserControlActivity.noteAgent(resolution.pane.id, resolution.claims.paneId);
+      return recordAudit(store, request, {
+        action: "pane.cli.browser_cdp_attach",
+        targetType: "pane",
+        targetId: resolution.pane.id,
+        metadata: { roomId: resolution.claims.roomId, cliPaneId: resolution.claims.paneId, cliSessionId: resolution.claims.cliSessionId, sessionId: resolution.session.sessionId }
+      });
+    }
   });
-  cliBrowserCdpProxy.register(app, defaultRouteRateLimitOptions);
+  cliBrowserCdpProxy.register(app, defaultRouteRateLimitOptions); vault.protection.onProtected((paneId) => cliBrowserCdpProxy.closeForPane(paneId, "VAULT_PROTECTED", "This browser is protected for the Vault."));
 
+  registerBrowserCensusRoutes(app, { store, browserSessionManager, controlActivity: browserControlActivity, geminiEmails: geminiAccountEmails, routeOptions: defaultRouteRateLimitOptions });
   paneBrowserAccounts.current = registerPaneBrowserRoutes(app, {
     config, readGeminiAccountProfileDetails, store, browserSessionManager, routeOptions: defaultRouteRateLimitOptions, cliBrowserCdpProxy,
-    youtubePlaybackStore, youtubeAccountStore, browserAccountStore, youtubeSessionStarts, youtubeAccountOperations,
+    controlActivity: browserControlActivity, youtubePlaybackStore, youtubeAccountStore, browserAccountStore, youtubeSessionStarts, youtubeAccountOperations,
     withYouTubeAccountLock, youtubeAccountOwner, selectedGoogleBrowserAccount, paneGoogleAccountSelection,
     resolvePaneBrowserAccount, adoptPaneSignIn, effectivePaneProfileId, browserAccountChoices, previousCopilotPane,
     onJobCopilotAccountSelected: async (userId, email) => { await jobApplyService.setGoogleAccount(userId, email); }
@@ -7085,7 +7000,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     config, deletingCliAccountProfileKeys, cliAccountProfileKey, store, eventBus, codexCliModeDefaultsService,
     spaceAgentAdapter, cliRuntimeRegistryCache, cliTerminalManager, assertCliHttpMutationControl,
     cliRuntimeVisibility, resolveOpenCodeServerControl, resumePaneCliTask, spaceControl, assertRootAdmin,
-    assertPaneCliRuntimeEnabled, routeOptions: defaultRouteRateLimitOptions, cliAccountBalancer, cliPaneReopener
+    assertPaneCliRuntimeEnabled, routeOptions: defaultRouteRateLimitOptions, cliAccountBalancer, cliPaneReopener, claudeDirectPins,
+    onUserCliHost: cliUserHosting.onUserCliHost
   });
 
   const spaceControlRoutes = registerSpaceControlRoutes(app,spaceControl,{cliRoom:request=>controlCliRooms.get(request)??null,resolveActor:controlUser});
@@ -7146,10 +7062,17 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     },
     log: (event, detail) => app.log.info({ event, ...detail }, "CLI account Auto")
   });
+  // Operator order 2026-10-20: Claude panes at their account's usage limit move to Space Gateway and continue (claude-limit-move.ts).
+  const claudeLimitMove = createClaudeLimitMove(claudeLimitMoveDeps({ store, monitor: roomAgentMonitorRepository, pinnedDirect: (paneId) => claudeDirectPins.has(paneId),
+    inspect: (pane, fresh) => roomPaneController.inspect(pane, { fresh }), paneReports: () => nousRef.current?.paneReports, onEvent: roomAgentMonitorOnEvent,
+    gatewayProfileReady: async () => Boolean((await gatewayCliAccounts.gatewayProfile("cli:claude"))?.ready), gatewayAccounts: () => resolveGatewayAdminService().listAccounts(),
+    switchToGateway: async (pane, session) => { await switchClaudePaneAccount(claudeAccountSwitchDeps, pane, session, CLAUDE_GATEWAY_PROFILE, makeSpaceId("trace")); roomCliObservationCache.delete(pane.id); },
+    answer: (pane, input) => commandRoomCli(pane, { type: "cli_command", paneId: pane.id, ...input, when: "NOW" }, makeSpaceId("trace")),
+    onAttention: (event) => { void roomAgentAutopilot.handle(event); }, log: (event, detail) => app.log.info({ event, ...detail }, "Claude usage limit move") }));
   let cliAccountAutoSwitchTimer: NodeJS.Timeout | null = null;
   app.addHook("onReady", async () => {
     if (process.env.NODE_ENV === "test" || process.env.VITEST === "true") return;
-    cliAccountAutoSwitchTimer = setInterval(() => void cliAccountAutoSwitch.tick(), 30_000);
+    cliAccountAutoSwitchTimer = setInterval(() => { void cliAccountAutoSwitch.tick(); void claudeLimitMove.tick(); }, 30_000);
     cliAccountAutoSwitchTimer.unref();
   });
   app.addHook("onClose", async () => { if (cliAccountAutoSwitchTimer) clearInterval(cliAccountAutoSwitchTimer); });
@@ -7274,7 +7197,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   const microsoftConnectorConfigured = Boolean(process.env.SPACE_MICROSOFT_CLIENT_ID && process.env.SPACE_MICROSOFT_CLIENT_SECRET);
   const connectorService = connectorAccountsRepository ? createConnectorService({
     accounts: connectorAccountsRepository,
-    crypto: createConnectorCrypto(process.env.SPACE_CONNECTOR_SECRET || auth.sessionSecret),
+    crypto: connectorCrypto,
     google: auth.googleClientId ? createGoogleConnector({ clientId: auth.googleClientId, clientSecret: auth.googleClientSecret }) : null,
     microsoft: microsoftConnectorConfigured ? createMicrosoftConnector({ clientId: process.env.SPACE_MICROSOFT_CLIENT_ID!,
       clientSecret: process.env.SPACE_MICROSOFT_CLIENT_SECRET!, tenant: process.env.SPACE_MICROSOFT_TENANT || "common" }) : null,
@@ -7647,7 +7570,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     },
     goalTool: dotGoalService ? (sessionId, toolId, args) => dotGoalService.tool(sessionId, toolId, args) : undefined,
     computerBrowser: dotComputerService ? (session, owner, args) => dotComputerService.browser(session, owner, args) : undefined,
-    delegate: dotDelegationService ? (session, owner, args) => dotDelegationService.delegate(session, owner, args) : undefined,
+    delegate: dotDelegationService ? (session, owner, args) => dotDelegationService.delegate(session, owner, args) : undefined, designRequest: designService && dotDesignRequest(designService),
     memoryTool: dotMemoryService ? (session, owner, toolId, args) => dotMemoryService.tool(session, owner, toolId, args) : undefined,
     memoryScope: dotMemoryService ? (owner, dotId, memoryId) => dotMemoryService.scope(owner, dotId, memoryId) : undefined,
     publishDeliverable: dotDeliverablesService ? (owner, dotId, input) => dotDeliverablesService.publish(owner, dotId,
@@ -7694,7 +7617,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   registerRoomAgentRoutes(app, {
     store, controlRepository, controlUser, roomAgentService, chat: roomAgentChat, routeOptions: defaultRouteRateLimitOptions,
-    monitor: { repository: roomAgentMonitorRepository, forget: (roomId) => roomAgentMonitor.forget(roomId),
+    monitor: { repository: roomAgentMonitorRepository, forget: (roomId) => roomAgentMonitor.forget(roomId), sentToNous: roomAgentEventRouting.sentToNous,
       changed: async (event) => roomAgentMonitorOnEvent(event),
       // The operator's own answer needs no guardrail: it is the operator's approval.
       answer: async (event, input) => {
@@ -7719,8 +7642,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     websocketRouteOptions: defaultWebsocketRateLimitOptions, assertRoomAccess
   });
 
-  const { livePersonalMemory } = registerLiveRoutes(app, { config, auth, store, roomPaneController, roomAgentService, routeOptions: defaultRouteRateLimitOptions, assertRoomAccess });
-  registerCouncil(app, { config, auth, store, parseBody, parseQuery, routeOptions: defaultRouteRateLimitOptions, claudeUsageProvider, jobApplyRepository, jobApplyService, livePersonalMemory, canonicalMemory });
+  const { livePersonalMemory, liveHistory } = registerLiveRoutes(app, { config, auth, store, roomPaneController, roomAgentService, routeOptions: defaultRouteRateLimitOptions, assertRoomAccess, readDashboardAgents });
+  const councilService = registerCouncil(app, { config, auth, store, parseBody, parseQuery, routeOptions: defaultRouteRateLimitOptions, claudeUsageProvider, jobApplyRepository, jobApplyService, livePersonalMemory, canonicalMemory, notifications: notificationService });
+  nousRef.current = registerNous(app, { config, vault, autonomous: config.instanceJobs.nous, auth, store, parseBody, parseQuery, routeOptions: defaultRouteRateLimitOptions, readActivity: readDashboardAgents,
+    roomTools: roomAgentTools, inspectPane: (pane) => roomPaneController.inspect(pane, { fresh: true }), releaseTrain: roomCoordination.releaseTrain, notifications: notificationService, runner: options.nousRunner, vaultBrokerReinstall: options.vaultBrokerReinstall, monitorEvents: roomAgentMonitorRepository,
+    answerCli: (pane, input, traceId) => commandRoomCli(pane, { type: "cli_command", paneId: pane.id, expectedSessionId: input.sessionId, answer: input.answer, submit: true, ...(input.fingerprint ? { expectedPromptFingerprint: input.fingerprint } : {}), when: "NOW" }, traceId), activeSessionPids: (sessions) => cliTerminalManager.activeSessionPids(sessions), ops: { health: healthMonitor, services: systemServicesProvider, tokenUsage: (range) => systemAnalyticsService.models(range, "all"), gateway: () => gatewayAdminService!.status(), ...(gatewayAdminService ? { gatewayAdmin: gatewayAdminService } : {}) },
+    copilots: { mail: mailCopilotService, marketing: marketingCopilotService, freelance: freelanceCopilotService, job: jobApplyService, design: designService, appStudio: appStudioService }, invoke: controlInvoke, eventBus, health: healthMonitor, controlRepository, sessionPids: (sessions) => cliTerminalManager.activeSessionPids(sessions), apiBaseUrl: cliAgentFilesApiBaseUrl(config), claudeUsageProvider, paneBoardJob: config.instanceJobs["nous-pane-board"], paneBoardRunner: options.paneBoardRunner, council: councilService, liveHistory });
 
   registerVoiceAttachmentRoutes(app, { config, store, routeOptions: defaultRouteRateLimitOptions });
 
@@ -7729,7 +7656,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     routeOptions: defaultRouteRateLimitOptions
   });
 
-  registerEventRoutes(app, { store, eventBus, routeOptions: defaultRouteRateLimitOptions });
+  registerEventRoutes(app, { store, eventBus, routeOptions: defaultRouteRateLimitOptions, roomShares });
 
   async function readToolbarProviderTargets() {
     const [providers, settings] = await Promise.all([store.listProviders(), store.getProviderSettings()]);
@@ -7740,7 +7667,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       const health = provider.status === "VERIFIED" ? "HEALTHY" : provider.status === "ERROR" ? "UNAVAILABLE" : "UNKNOWN";
       // Codex runs through Space Gateway; the codex-lb route these providers named is retired.
       const canSwitch = false;
-      const reason = supported ? "Codex runs through Space Gateway." : "Provider does not expose a supported Codex-LB route.";
+      const reason = supported ? "Codex runs through Space Gateway." : "Provider does not expose a supported Space Gateway route.";
       return {
         providerId: provider.id,
         displayName: provider.displayName,
@@ -7935,7 +7862,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     recordAudit: (request, input) => recordAudit(store, request, input)
   });
   registerCliMaintenanceRoutes(app, {
-    store, cliMaintenanceManager, cliUpdateAllRunner,
+    store, cliMaintenanceManager, cliUpdateAllRunner, notifications: notificationService,
     recordAudit: (request, input) => recordAudit(store, request, input)
   });
   const maintenanceAutopilotTesting = process.env.NODE_ENV === "test" || process.env.VITEST === "true";
@@ -8075,7 +8002,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
   registerMemoryRoutes(app, {
     config, store, eventBus, memoryEmbeddingGenerator, canonicalMemory, canonicalSearch, memoryGraphService,
-    routeOptions: defaultRouteRateLimitOptions
+    memoryEmbeddingBackfill, dotMemoryEmbeddings: dotMemoryRepository, routeOptions: defaultRouteRateLimitOptions
   });
   registerSharedTaskRoutes(app, {
     store, codexGoals, cliRuntimeVisibility, routeOptions: defaultRouteRateLimitOptions

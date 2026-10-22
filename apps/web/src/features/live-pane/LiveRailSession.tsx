@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
-import { Mic, MicOff, Phone, PhoneOff, Trash2, Wrench, X } from "lucide-react";
+import { Mic, MicOff, Phone, PhoneOff, Trash2, Wrench, X } from "../ui-theme/app-icons.js";
 import { LiveStatsWindow } from "./LiveStatsWindow.js";
 import { useLiveCoordinator, useLiveSessionState } from "./LiveSessionProvider.js";
 import { SpaceToggle } from "../ui-controls/SpaceToggle.js";
@@ -27,7 +27,7 @@ export function LiveRailSession() {
   const { item: captionItem, visible: captionVisible } = useLiveCaption(state?.transcripts ?? []);
   const captionsAllowed = state?.enabled === true && !captionsDisabled && !conversationOpen;
   const [captionAnchor, setCaptionAnchor] = useState<{ right: number; top: number } | null>(null);
-  const [conversationPosition, setConversationPosition] = useState(() => ({ left: window.innerWidth <= 768 ? 8 : 280, top: window.innerWidth <= 768 ? 8 : 120 }));
+  const [conversationPosition, setConversationPosition] = useState(() => ({ left: window.innerWidth <= 767 ? 8 : 280, top: window.innerWidth <= 767 ? 8 : 120 }));
   const [statsOpen, setStatsOpen] = useState(false);
   const [statsPosition, setStatsPosition] = useState({ left: 340, top: 140 });
   const conversationBodyRef = useRef<HTMLDivElement | null>(null);

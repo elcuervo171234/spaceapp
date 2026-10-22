@@ -26,6 +26,7 @@ import {
 } from "@space/contracts";
 import { SpaceConflictError, type SpaceStore } from "@space/runtime";
 import type { JobApplyService } from "./service.js";
+import { settleEndedOperatorLease } from "../browser-control-activity.js";
 
 // Agent-facing routes of the Job Applications pane. They are reached with the
 // pane-scoped CLI browser bridge token; the owner is the room owner. The agent
@@ -34,7 +35,8 @@ export const cliJobApplyPathPrefix = "/api/cli/job-apply/";
 
 export interface CliBridgeClaims { roomId: string; paneId: string; cliSessionId: string }
 export interface JobApplyAgentRouteDependencies {
-  store: Pick<SpaceStore, "getRoom" | "getPane" | "getActivePaneBrowserSession" | "getActiveBrowserControlLease" | "getActiveBrowserHandoffRequest">;
+  store: Pick<SpaceStore, "getRoom" | "getPane" | "getActivePaneBrowserSession" | "getActiveBrowserControlLease" | "getActiveBrowserHandoffRequest"
+    | "getBrowserControlLease" | "updateBrowserControlLease" | "updateBrowserHandoffRequest">;
   routeOptions: Record<string, unknown>;
   requireBridge(request: FastifyRequest, reply: FastifyReply): Promise<{ claims: CliBridgeClaims } | null>;
   parseBody<TSchema extends z.ZodTypeAny>(schema: TSchema, body: unknown): z.infer<TSchema>;
@@ -89,7 +91,11 @@ const profileFilesSchema = z.object({ cvArtifactId: artifactIdSchema.optional(),
 export function registerJobApplyAgentRoutes(app: FastifyInstance, service: JobApplyService, deps: JobApplyAgentRouteDependencies): void {
   const { routeOptions, parseBody, parseQuery } = deps;
 
-  async function owner(claims: CliBridgeClaims): Promise<string> {
+  // Like the other copilots, only the Job Copilot pane's own agent reads its data; anyPane is for queueing postings.
+  async function owner(claims: CliBridgeClaims, anyPane = false): Promise<string> {
+    if (!anyPane && (await deps.store.getPane(claims.paneId))?.mode !== "JOB_APPLY") {
+      throw new SpaceConflictError("Job Copilot tools belong to the CLI session of a Job Copilot pane.");
+    }
     const room = await deps.store.getRoom(claims.roomId);
     if (!room.ownerUserId) throw new SpaceConflictError("This room has no owner; open the Job Copilot pane from a signed-in operator account.");
     return room.ownerUserId;
@@ -110,13 +116,14 @@ export function registerJobApplyAgentRoutes(app: FastifyInstance, service: JobAp
     const bridge = await deps.requireBridge(request, reply);
     if (!bridge) return undefined;
     const ownerId = await owner(bridge.claims);
-    const [profile, cv, settings] = await Promise.all([service.getProfile(ownerId), service.cvText(ownerId), paneSettings(bridge.claims.paneId)]);
+    const [profile, cv, photo, settings] = await Promise.all([service.getProfile(ownerId), service.cvText(ownerId), service.photo(ownerId), paneSettings(bridge.claims.paneId)]);
     const coverLetterPath = profile.coverLetterArtifactId ? await service.artifactPath(profile.coverLetterArtifactId) : null;
     return {
       candidate: profile.candidate,
       qaBank: profile.qaBank,
       cv: { artifactId: cv.artifactId, path: cv.path, chars: cv.text?.length ?? 0 },
       coverLetter: { artifactId: profile.coverLetterArtifactId, path: coverLetterPath },
+      photo,
       mailboxConnected: jobApplyMailboxConnected(profile),
       google: profile.google,
       googleAccounts: profile.googleAccounts,
@@ -326,7 +333,7 @@ export function registerJobApplyAgentRoutes(app: FastifyInstance, service: JobAp
     // (the pane queue lists rows without a pane too) queues for every Job Copilot pane of the owner.
     const bridgePane = await deps.store.getPane(bridge.claims.paneId);
     const paneId = input.paneId ?? (bridgePane?.mode === "JOB_APPLY" ? bridge.claims.paneId : null);
-    const result = await service.createApplication(await owner(bridge.claims), { ...input, paneId }, { paneId: bridge.claims.paneId });
+    const result = await service.createApplication(await owner(bridge.claims, true), { ...input, paneId }, { paneId: bridge.claims.paneId });
     if (result.created) await deps.audit(request, "job_apply.agent.application_start", result.application.id, { ats: input.ats });
     return result;
   });
@@ -464,6 +471,7 @@ export function registerJobApplyAgentRoutes(app: FastifyInstance, service: JobAp
     if (pane.roomId !== bridge.claims.roomId) throw new SpaceConflictError("Browser pane is not in this room.");
     const session = await deps.store.getActivePaneBrowserSession(pane.id);
     if (!session) return { paneId, browserRunning: false, held: false, lease: null, handoff: null };
+    await settleEndedOperatorLease(deps.store, session.sessionId);
     const [lease, handoff] = await Promise.all([
       deps.store.getActiveBrowserControlLease(session.sessionId),
       deps.store.getActiveBrowserHandoffRequest(session.sessionId)

@@ -178,6 +178,18 @@ test("help and version aliases expose the complete stable command surface", asyn
   }
 });
 
+test("backup resumes the paused writers even when the backup fails", async () => {
+  const calls = [];
+  const { options } = await installation({
+    execute: async (spec) => {
+      calls.push(spec.args);
+      return spec.args.includes("scripts/portable-backup.mjs") ? 23 : 0;
+    }
+  });
+  assert.equal(await run(["backup"], options), 23);
+  assert.deepEqual(calls.map((args) => args.find((arg) => ["pause", "run", "unpause"].includes(arg))), ["pause", "run", "unpause"]);
+});
+
 test("up, down, status, logs, backup, and open delegate to their fixed native contracts", async () => {
   const calls = [];
   const { root, options } = await installation({
@@ -191,12 +203,17 @@ test("up, down, status, logs, backup, and open delegate to their fixed native co
   for (const command of ["up", "down", "status", "logs", "backup"]) {
     assert.equal(await run([command], options), 0);
   }
-  assert.deepEqual(calls.map((spec) => spec.args.slice(-3)), [
+  assert.deepEqual(calls.slice(0, 4).map((spec) => spec.args.slice(-3)), [
     ["up", "-d", "--remove-orphans"],
     ["--profile", "workflows", "down"],
     ["--profile", "workflows", "ps"],
-    ["logs", "--tail", "200"],
-    ["spaceapp-core", "node", "scripts/portable-backup.mjs"]
+    ["logs", "--tail", "200"]
+  ]);
+  // backup: writers paused, a one-off container dumps, writers resumed.
+  assert.deepEqual(calls.slice(4).map((spec) => spec.args.slice(-5)), [
+    ["pause", "spaceapp-core", "spaceapp-cli", "spaceapp-browser", "temporal"],
+    ["SPACE_DATABASE_URL_FILE=/run/secrets/database-url", "--entrypoint", "node", "spaceapp-core", "scripts/portable-backup.mjs"],
+    ["unpause", "spaceapp-core", "spaceapp-cli", "spaceapp-browser", "temporal"]
   ]);
 
   for (const [platform, expectedSpec] of [
@@ -425,4 +442,26 @@ test("factory-reset command reinitializes installation on valid confirmation", a
   assert.equal(exitCode, 0);
   assert.match(stdout.value(), /SpaceApp factory reset complete/);
   assert.ok(calls.some((spec) => spec.args?.includes("down") || spec.args?.includes("-v")));
+});
+
+test("factory-reset asks a separate confirmation when the safety backup fails, and stops when the purge fails", async () => {
+  const backupFails = async (spec) => spec.args?.includes("scripts/portable-backup.mjs") ? 1 : 0;
+  const plain = await installation({ execute: backupFails });
+  assert.equal(await run(["factory-reset"], { ...plain.options, stdin: ttyStdin("FACTORY-RESET") }), 0);
+  assert.match(plain.stdout.value(), /safety backup FAILED/);
+  assert.match(plain.stdout.value(), /Factory reset cancelled/);
+
+  const explicit = await installation({ execute: backupFails });
+  assert.equal(await run(["factory-reset"], { ...explicit.options, stdin: ttyStdin("FACTORY-RESET-WITHOUT-BACKUP") }), 0);
+  assert.match(explicit.stdout.value(), /SpaceApp factory reset complete/);
+
+  const purgeFails = await installation({
+    execute: async (spec, io) => {
+      if (spec.args?.includes("pg_dump")) { io.stdout.write("-- PostgreSQL database dump\nSELECT 1;\n"); return 0; }
+      return spec.args?.includes("down") ? 3 : 0;
+    }
+  });
+  assert.equal(await run(["factory-reset"], { ...purgeFails.options, stdin: ttyStdin("FACTORY-RESET") }), 3);
+  assert.doesNotMatch(purgeFails.stdout.value(), /factory reset complete/);
+  await stat(join(purgeFails.root, "config.json"));
 });

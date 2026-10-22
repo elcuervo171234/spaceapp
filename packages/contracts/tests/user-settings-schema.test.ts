@@ -26,6 +26,27 @@ describe("userSettingsSchema & updateUserSettingsInputSchema", () => {
     expect(defaultUserSettings.promptVariablesAutoExpandOnSubmit).toBe(true);
   });
 
+  it("accepts the Liquid Glass theme and its Glass Planet background", () => {
+    const settings = userSettingsSchema.parse({ uiTheme: "liquid-glass", uiBackground: "liquid-glass" });
+    expect([settings.uiTheme, settings.uiBackground]).toEqual(["liquid-glass", "liquid-glass"]);
+    expect(updateUserSettingsInputSchema.parse({ uiTheme: "liquid-glass", uiBackground: "liquid-glass" })).toEqual({ uiTheme: "liquid-glass", uiBackground: "liquid-glass" });
+  });
+
+  it("accepts the Jarvis and Aira themes and their backgrounds", () => {
+    for (const id of ["jarvis", "aira"] as const) {
+      const settings = userSettingsSchema.parse({ uiTheme: id, uiBackground: id });
+      expect([settings.uiTheme, settings.uiBackground]).toEqual([id, id]);
+      expect(updateUserSettingsInputSchema.parse({ uiTheme: id, uiBackground: id })).toEqual({ uiTheme: id, uiBackground: id });
+    }
+  });
+
+  it("keeps the Liquid Glass tint between ultra clear (0) and fully tinted (100), 50 by default", () => {
+    expect(defaultUserSettings.liquidGlassTint).toBe(50);
+    expect(updateUserSettingsInputSchema.parse({ liquidGlassTint: 0 }).liquidGlassTint).toBe(0);
+    expect(updateUserSettingsInputSchema.parse({ liquidGlassTint: 100 }).liquidGlassTint).toBe(100);
+    for (const tint of [-1, 101, 12.5]) expect(() => updateUserSettingsInputSchema.parse({ liquidGlassTint: tint })).toThrow();
+  });
+
   it("validates full custom user settings object with all per-user fields", () => {
     const custom = {
       uiTheme: "codex",

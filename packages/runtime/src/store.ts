@@ -1,5 +1,5 @@
 import { t3CodePaneMetadataSchema, type T3CodePaneMetadata } from "@space/contracts";
-import { jobApplyPaneMetadataSchema, mailCopilotPaneMetadataSchema, marketingCopilotPaneMetadataSchema, type JobApplyPaneMetadata, type MailCopilotPaneMetadata, type MarketingCopilotPaneMetadata } from "@space/contracts";
+import { jobApplyPaneMetadataSchema, mailCopilotPaneMetadataSchema, marketingCopilotPaneMetadataSchema, freelanceCopilotPaneMetadataSchema, designPaneMetadataSchema, appStudioPaneMetadataSchema, type AppStudioPaneMetadata, type DesignPaneMetadata, type JobApplyPaneMetadata, type MailCopilotPaneMetadata, type MarketingCopilotPaneMetadata, type FreelanceCopilotPaneMetadata } from "@space/contracts";
 import { type PlanExecutionEvent } from "./plan-execution-repository.js";
 import { managedPlanProjection } from "./plan-execution-projection.js";
 import { InMemoryPlanExecutionRepository, type PlanExecutionRepository } from "./plan-execution-repository.js";
@@ -85,6 +85,9 @@ import {
   taskItemSchema,
   updateTaskItemInputSchema,
   upsertTaskItemInputSchema,
+  taskScheduleNextRunAt,
+  ownerWorkingTimeZone,
+  resolveTaskScheduleZone,
   listUserLinksQuerySchema,
   listMemoryCacheLinksQuerySchema,
   memoryCacheLinkSchema,
@@ -158,6 +161,9 @@ import {
 import type {
   AdminOperationRun,
   AdminUserItem,
+  UserInvite,
+  UserInviteRole,
+  RoomShare,
   AgentPaneBinding,
   AgentPaneHistoryItem,
   AgentPaneStoredSession,
@@ -290,6 +296,7 @@ import type {
   SpaceConfigRoom,
   ExportConfigOptions,
   ImportConfigOptions,
+  ConfigSection,
   ImportConfigResult,
   SourceControlConnection,
   SourceControlProvider,
@@ -363,7 +370,7 @@ import {
   type CliAuthCapture,
   type ConfigImportHooks
 } from "./configuration-secrets.js";
-import { prepareConfigImport, remapRoomKeyedSettings } from "./configuration-import.js";
+import { assertConfigReplaceConfirmed, configImportIncludes, mergeImportedUserSettings, prepareConfigImport, remapRoomKeyedSettings } from "./configuration-import.js";
 
 export const ACTIVE_PANE_CAP = 16;
 export const PANE_CLI_TRANSCRIPT_CHUNK_CAP = 200;
@@ -565,12 +572,25 @@ export interface MemoryEntryRecord {
 
 export interface CreateMemoryEntryOptions {
   embedding?: number[];
+  /** The model that made `embedding`; a row of another model is re-embedded by the backfill. */
+  embeddingModel?: string;
 }
 
 export interface ListMemoryEntriesOptions {
   semanticReady?: boolean;
   queryEmbedding?: number[];
+  /** Semantic search compares only vectors of this model. */
+  embeddingModel?: string;
   limit?: number;
+}
+
+/** A memory_records row whose vector is missing or was made by another model. */
+export interface MemoryRecordToEmbed { id: string; title: string; body: string }
+
+export interface MemoryEmbeddingCounts {
+  total: number;
+  withoutEmbedding: number;
+  byModel: Array<{ model: string; count: number }>;
 }
 
 export interface SkillProposalRecord {
@@ -783,6 +803,16 @@ export interface OwnerCredentials {
   passwordHash: string;
 }
 
+/** A new invite; only the SHA-256 of its one-time token is kept. */
+export interface CreateUserInviteRecord {
+  tokenSha256: string;
+  email: string;
+  role: UserInviteRole;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
 export interface OwnerSetupClaimResult {
   user: AuthUser;
   onboarding: SetupOnboarding;
@@ -933,6 +963,7 @@ export interface SpaceStore {
     clipboardItemId: string,
     input: UpdatePlanProgressRequest
   ): MaybePromise<ClipboardItem>;
+  updateClipboardNoteText(ownerUserId: string, clipboardItemId: string, text: string): MaybePromise<ClipboardItem>;
   deleteClipboardItem(ownerUserId: string, clipboardItemId: string): MaybePromise<ClipboardItem>;
   clearClipboardItems(ownerUserId: string): MaybePromise<number>;
   upsertTaskItem(input: UpsertTaskItemInput): MaybePromise<TaskItem>;
@@ -941,6 +972,8 @@ export interface SpaceStore {
   updateTaskItem(ownerUserId: string, taskItemId: string, input: UpdateTaskItemInput): MaybePromise<TaskItem>;
   deleteTaskItem(ownerUserId: string, taskItemId: string): MaybePromise<TaskItem>;
   clearTaskItems(ownerUserId: string): MaybePromise<number>;
+  dueTaskSchedules(nowIso: string, limit: number): MaybePromise<Array<TaskItem & { ownerUserId: string }>>;
+  claimTaskSchedule(taskItemId: string, expectedNextRunAt: string, update: { nextRunAt: string | null; outcome: string; ran: boolean }): MaybePromise<boolean>;
   listUserLinks(ownerUserId: string, query?: ListUserLinksQuery): MaybePromise<UserLinkListResult>;
   createUserLink(input: CreateUserLinkInput): MaybePromise<UserLink>;
   updateUserLink(ownerUserId: string, linkId: string, input: UpdateUserLinkRequest): MaybePromise<UserLink>;
@@ -949,6 +982,25 @@ export interface SpaceStore {
   listUsersWithRoomCounts?(): MaybePromise<AdminUserItem[]>;
   updateUserRole?(userId: string, role: "ADMIN" | "USER"): MaybePromise<AuthUser>;
   ensureUserStarterRoom?(userId: string, email: string, traceId?: string): MaybePromise<Room | null>;
+  // Multi-user accounts (SPACE_MULTI_USER_ENABLED): invites, per-user password sign-in and disabled users.
+  createUserInvite?(input: CreateUserInviteRecord): MaybePromise<UserInvite>;
+  listUserInvites?(): MaybePromise<UserInvite[]>;
+  revokeUserInvite?(inviteId: string, revokedAt: string): MaybePromise<boolean>;
+  /** Creates the invited user with this password once; null for an unknown, used, revoked or expired token. */
+  acceptUserInvite?(input: { tokenSha256: string; passwordHash: string; now: string }): MaybePromise<AuthUser | null>;
+  /** A user who may sign in with a password (not disabled). */
+  getPasswordUser?(email: string): MaybePromise<OwnerCredentials | null>;
+  setUserDisabled?(userId: string, disabled: boolean, at: string): MaybePromise<boolean>;
+  isUserDisabled?(userId: string): MaybePromise<boolean>;
+  // Room sharing (SPACE_MULTI_USER_ENABLED). A pane's owner is the user who opened it in a room they do not own;
+  // null means the room's owner.
+  setRoomShare?(share: RoomShare): MaybePromise<RoomShare>;
+  deleteRoomShare?(roomId: string, userId: string): MaybePromise<boolean>;
+  getRoomShare?(roomId: string, userId: string): MaybePromise<RoomShare | null>;
+  listRoomShares?(roomId: string): MaybePromise<RoomShare[]>;
+  listSharedRooms?(userId: string): MaybePromise<Room[]>;
+  setPaneOwner?(paneId: string, userId: string): MaybePromise<void>;
+  getPaneOwner?(paneId: string): MaybePromise<string | null>;
   listGoogleAccounts(userId: string): MaybePromise<GoogleAccount[]>;
   linkGoogleAccount(userId: string, identity: VerifiedGoogleIdentity): MaybePromise<GoogleAccount>;
   setPrimaryGoogleAccount(userId: string, accountId: string): MaybePromise<GoogleAccount>;
@@ -1018,6 +1070,9 @@ export interface SpaceStore {
   updateJobApplyMetadata(paneId: string, metadata: JobApplyPaneMetadata): MaybePromise<Pane>;
   updateMailCopilotMetadata(paneId: string, metadata: MailCopilotPaneMetadata): MaybePromise<Pane>;
   updateMarketingCopilotMetadata(paneId: string, metadata: MarketingCopilotPaneMetadata): MaybePromise<Pane>;
+  updateFreelanceCopilotMetadata(paneId: string, metadata: FreelanceCopilotPaneMetadata): MaybePromise<Pane>;
+  updateDesignMetadata(paneId: string, metadata: DesignPaneMetadata): MaybePromise<Pane>;
+  updateAppStudioMetadata(paneId: string, metadata: AppStudioPaneMetadata): MaybePromise<Pane>;
   listPanes(roomId: string, includeClosed?: boolean): MaybePromise<Pane[]>;
   createPane(input: CreatePaneInput, traceId?: string): MaybePromise<Pane>;
   createPanes(inputs: CreatePaneInput[], traceId?: string, claim?: PaneBatchClaim): MaybePromise<Pane[]>;
@@ -1276,6 +1331,10 @@ export interface SpaceStore {
   ): MaybePromise<ImportCandidateDecisionRecord>;
   createMemoryEntry(input: CreateMemoryEntryInput, traceId?: string, options?: CreateMemoryEntryOptions): MaybePromise<MemoryEntryRecord>;
   listMemoryEntries(query?: ListMemoryQuery, options?: ListMemoryEntriesOptions): MaybePromise<MemoryEntry[]>;
+  /** Rows to (re-)embed for `model`: those without a vector first, then the newest. */
+  listMemoryRecordsToEmbed(model: string, limit: number): MaybePromise<MemoryRecordToEmbed[]>;
+  setMemoryRecordEmbedding(id: string, embedding: number[], model: string): MaybePromise<void>;
+  countMemoryRecordEmbeddings(): MaybePromise<MemoryEmbeddingCounts>;
   linkMemoryCacheRecord(input: LinkMemoryCacheInput): MaybePromise<MemoryCacheLink>;
   getMemoryCacheLink(memoryRecordId: string): MaybePromise<MemoryCacheLink | null>;
   listMemoryCacheLinks(query?: ListMemoryCacheLinksQuery): MaybePromise<MemoryCacheLink[]>;
@@ -1388,8 +1447,17 @@ export const nowIso = () => new Date().toISOString();
 export const makeSpaceId = (prefix: string) => `${prefix}:${nanoid(12)}`;
 export const hashPrompt = (prompt: string) => createHash("sha256").update(prompt).digest("hex");
 
+// Provider secrets that identify themselves by shape (security addendum step 1, 2026-10-19: a live Stripe key sat in a
+// monthly memory file and recall returned it). OpenAI-style `sk-` keys are already caught by the transcript redaction.
+const memorySecretPatterns: Array<[RegExp, string]> = [
+  [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}\b/g, "[REDACTED Stripe key]"],
+  [/\bwhsec_[A-Za-z0-9+/=]{10,}/g, "[REDACTED webhook secret]"],
+  [/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[REDACTED AWS key]"],
+  [/\b(aws_?secret_?access_?key\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}\b/gi, "$1[REDACTED]"]
+];
+
 export function redactMemoryText(value: string): string {
-  return redactPersistedTranscriptContent(value)
+  return memorySecretPatterns.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), redactPersistedTranscriptContent(value))
     .replace(/\b((?:creds|credentials)\s*:\s*[^\s]+@[^\s]+\s*\/\s*)[^\s·;,]+/gi, "$1[REDACTED]")
     .replace(/\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
     .replace(/\b(space_session(?:_dev)?=)[^;\s]+/gi, "$1[REDACTED]");
@@ -1577,6 +1645,11 @@ export function assertMemoryRollbackTarget(input: CreateMemoryChangeSetInput, ta
   ) {
     throw new SpaceConflictError(`Memory rollback ${target.id} must exactly reverse its target snapshots and hashes.`);
   }
+}
+
+/** Only copy/paste history is capped; plans and notes are removed only by an explicit delete. */
+function isPrunableClip(source: ClipboardItem["source"]): boolean {
+  return source === "COPY" || source === "PASTE";
 }
 
 function isFiniteVector(value: unknown): value is number[] {
@@ -2408,6 +2481,31 @@ export interface TraceRecords {
   events: Event[];
   auditEvents: AuditEvent[];
   workflows: WorkflowRun[];
+  /** Space-native agent runs whose workflow appears in the trace's events or workflows, then the background
+   * continuations of those runs (they keep their own trace; `continuationOf` names the run they continue). */
+  agentRuns?: Array<Pick<SpaceAgentRunRecord, "runId" | "workflowId" | "status" | "errorCode" | "createdAt" | "completedAt"> &
+    { continuationOf?: string | null }>;
+  /** Room Agent missions and task runs created under the trace: ids, status and error code only. */
+  roomAgentMissions?: TraceRoomAgentMission[];
+  roomAgentTaskRuns?: TraceRoomAgentTaskRun[];
+}
+
+export interface TraceRoomAgentMission {
+  missionId: string; roomId: string; status: string; errorCode: string | null; queuedAt: string; completedAt: string | null;
+}
+export interface TraceRoomAgentTaskRun extends TraceRoomAgentMission { runId: string }
+
+/** Background continuation generations the trace lookup follows from one run. */
+export const traceContinuationGenerations = 50;
+
+/** Workflow ids a trace names, from its workflow rows and its events (column or payload). */
+export function traceWorkflowIds(records: Pick<TraceRecords, "events" | "workflows">): string[] {
+  const ids = new Set<string>(records.workflows.map((workflow) => workflow.workflowId));
+  for (const event of records.events) {
+    const fromPayload = (event.payload as Record<string, unknown> | null | undefined)?.workflowId;
+    for (const id of [event.workflowId, fromPayload]) if (typeof id === "string" && id) ids.add(id);
+  }
+  return [...ids];
 }
 
 export function traceRecordLimits(options: ListTraceRecordsOptions = {}): { limit: number; sinceDays: number } {
@@ -2431,6 +2529,8 @@ export class InMemorySpaceStore implements SpaceStore {
   private roomAgentMissions = new Map<string, RoomAgentMissionRecord>();
   private roomAgentActions = new Map<string, RoomAgentActionRecord>();
   private roomAgentTaskRuns = new Map<string, RoomAgentTaskRunRecord>();
+  /** Trace and error code of missions (by mission id) and task runs (by mission:step), as Postgres stores them. */
+  private roomAgentTraces = new Map<string, { traceId: string | null; errorCode: string | null }>();
   private roomAgentEnqueues = new Map<string, RoomAgentEnqueueRecord>();
   private roomAgentTurnOutcomes = new Map<string, import("@space/contracts").RoomAgentTurnOutcome>();
   private agentPaneBindings = new Map<string, AgentPaneBinding>();
@@ -2462,6 +2562,10 @@ export class InMemorySpaceStore implements SpaceStore {
   private users = new Map<string, AuthUser>();
   private googleAccounts = new Map<string, GoogleAccount>();
   private userPasswordHashes = new Map<string, string>();
+  private userInvites = new Map<string, UserInvite & { tokenSha256: string }>();
+  private disabledUsers = new Set<string>();
+  private roomShares = new Map<string, RoomShare>();
+  private paneOwners = new Map<string, string>();
   private userSettings = new Map<string, UserSettings>();
   private ownerSetup: {
     tokenHash: string | null;
@@ -2509,6 +2613,8 @@ export class InMemorySpaceStore implements SpaceStore {
   private skills: Skill[];
   private importCandidates: ImportCandidate[] = [];
   private memoryEntries: MemoryEntry[] = [];
+  /** memory record id -> the model that embedded it (vectors themselves are not kept in memory). */
+  private memoryEmbeddingModels = new Map<string, string>();
   private memoryCacheLinks = new Map<string, MemoryCacheLink>();
   private memoryIssueStates = new Map<string, MemoryIssueState>();
   private memoryConsolidationRuns = new Map<string, MemoryConsolidationRun>();
@@ -3017,6 +3123,95 @@ export class InMemorySpaceStore implements SpaceStore {
     return user && passwordHash ? { user, passwordHash } : null;
   }
 
+  private hasUserWithEmail(email: string): boolean {
+    return [...this.users.values()].some((user) => user.email.toLowerCase() === email.toLowerCase());
+  }
+
+  createUserInvite(input: CreateUserInviteRecord): UserInvite {
+    if (this.hasUserWithEmail(input.email)) throw new SpaceConflictError("This email already has a SpaceApp account.");
+    const invite: UserInvite = {
+      id: makeSpaceId("user_invite"), email: input.email, role: input.role, createdBy: input.createdBy,
+      createdAt: input.createdAt, expiresAt: input.expiresAt, acceptedAt: null, acceptedUserId: null, revokedAt: null
+    };
+    this.userInvites.set(invite.id, { ...invite, tokenSha256: input.tokenSha256 });
+    return invite;
+  }
+
+  listUserInvites(): UserInvite[] {
+    return [...this.userInvites.values()]
+      .map(({ tokenSha256: _token, ...invite }) => invite)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  revokeUserInvite(inviteId: string, revokedAt: string): boolean {
+    const invite = this.userInvites.get(inviteId);
+    if (!invite || invite.acceptedAt || invite.revokedAt) return false;
+    invite.revokedAt = revokedAt;
+    return true;
+  }
+
+  acceptUserInvite(input: { tokenSha256: string; passwordHash: string; now: string }): AuthUser | null {
+    const invite = [...this.userInvites.values()].find((candidate) => candidate.tokenSha256 === input.tokenSha256);
+    if (!invite || invite.acceptedAt || invite.revokedAt || Date.parse(input.now) >= Date.parse(invite.expiresAt)) return null;
+    if (this.hasUserWithEmail(invite.email)) return null;
+    const user = authUserSchema.parse({ id: makeSpaceId("user"), email: invite.email, role: invite.role });
+    this.users.set(user.id, user);
+    this.userPasswordHashes.set(user.id, input.passwordHash);
+    invite.acceptedAt = input.now;
+    invite.acceptedUserId = user.id;
+    return user;
+  }
+
+  getPasswordUser(email: string): OwnerCredentials | null {
+    const user = [...this.users.values()].find((candidate) => candidate.email.toLowerCase() === email.toLowerCase());
+    const passwordHash = user ? this.userPasswordHashes.get(user.id) : undefined;
+    return user && passwordHash && !this.disabledUsers.has(user.id) ? { user, passwordHash } : null;
+  }
+
+  setUserDisabled(userId: string, disabled: boolean): boolean {
+    if (!this.users.has(userId)) return false;
+    if (disabled) this.disabledUsers.add(userId);
+    else this.disabledUsers.delete(userId);
+    return true;
+  }
+
+  isUserDisabled(userId: string): boolean {
+    return this.disabledUsers.has(userId);
+  }
+
+  setRoomShare(share: RoomShare): RoomShare {
+    this.getRoom(share.roomId);
+    if (!this.users.has(share.userId)) throw new SpaceNotFoundError(`User ${share.userId} was not found.`);
+    const stored = { ...share, createdAt: this.roomShares.get(`${share.roomId} ${share.userId}`)?.createdAt ?? share.createdAt };
+    this.roomShares.set(`${share.roomId} ${share.userId}`, stored);
+    return stored;
+  }
+
+  deleteRoomShare(roomId: string, userId: string): boolean {
+    return this.roomShares.delete(`${roomId} ${userId}`);
+  }
+
+  getRoomShare(roomId: string, userId: string): RoomShare | null {
+    return this.rooms.has(roomId) ? this.roomShares.get(`${roomId} ${userId}`) ?? null : null;
+  }
+
+  listRoomShares(roomId: string): RoomShare[] {
+    return [...this.roomShares.values()].filter((share) => share.roomId === roomId);
+  }
+
+  listSharedRooms(userId: string): Room[] {
+    return [...this.roomShares.values()].filter((share) => share.userId === userId && this.rooms.has(share.roomId))
+      .map((share) => this.getRoom(share.roomId));
+  }
+
+  setPaneOwner(paneId: string, userId: string): void {
+    this.paneOwners.set(paneId, userId);
+  }
+
+  getPaneOwner(paneId: string): string | null {
+    return this.paneOwners.get(paneId) ?? null;
+  }
+
   updateOwnerPassword(passwordHash: string): AuthUser {
     const credentials = this.getOwnerCredentials();
     if (!credentials) {
@@ -3041,11 +3236,13 @@ export class InMemorySpaceStore implements SpaceStore {
       (record) => record.ownerUserId === parsed.ownerUserId && record.contentHash === contentHash
     );
     const timestamp = nowIso();
+    const keepsSource = existing !== undefined && isPrunableClip(parsed.source) && !isPrunableClip(existing.item.source);
     const item = clipboardItemSchema.parse({
       id: existing?.item.id ?? makeSpaceId("clipboard"),
       text: parsed.text,
-      source: parsed.source,
-      title: parsed.title ?? null,
+      // A copy or paste of a plan's or note's text keeps its source and title, so it never becomes prunable history.
+      source: keepsSource ? existing.item.source : parsed.source,
+      title: keepsSource ? existing.item.title : parsed.title ?? null,
       minimumModel: parsed.minimumModel ?? existing?.item.minimumModel ?? null,
       minimumReasoning: parsed.minimumReasoning ?? existing?.item.minimumReasoning ?? null,
       isCompleted: existing?.item.isCompleted ?? false,
@@ -3068,8 +3265,9 @@ export class InMemorySpaceStore implements SpaceStore {
       item
     });
 
+    // Only COPY/PASTE history is capped (newest 100); plans and notes go only by an explicit delete.
     const stale = [...this.clipboardItems.values()]
-      .filter((record) => record.ownerUserId === parsed.ownerUserId)
+      .filter((record) => record.ownerUserId === parsed.ownerUserId && isPrunableClip(record.item.source))
       .sort((left, right) => right.sequence - left.sequence)
       .slice(100);
     for (const record of stale) this.clipboardItems.delete(record.item.id);
@@ -3267,6 +3465,21 @@ export class InMemorySpaceStore implements SpaceStore {
     return record.item;
   }
 
+  updateClipboardNoteText(ownerUserId: string, clipboardItemId: string, text: string): ClipboardItem {
+    const record = this.clipboardItems.get(clipboardItemId);
+    if (!record || record.ownerUserId !== ownerUserId || (record.item.source !== "MANUAL_NOTE" && record.item.source !== "AGENT_NOTE")) {
+      throw new SpaceNotFoundError(`Clipboard note ${clipboardItemId} was not found.`);
+    }
+    const contentHash = createHash("sha256").update(text).digest("hex");
+    const holder = [...this.clipboardItems.values()].find((other) => other.ownerUserId === ownerUserId && other.contentHash === contentHash);
+    if (holder && holder !== record) throw new SpaceConflictError("Another clipboard record already has this exact text.");
+    this.clipboardSequence += 1;
+    record.contentHash = contentHash;
+    record.sequence = this.clipboardSequence;
+    record.item = clipboardItemSchema.parse({ ...record.item, text, characterCount: Array.from(text).length, lastUsedAt: nowIso() });
+    return record.item;
+  }
+
   updateClipboardItemProgress(
     ownerUserId: string,
     clipboardItemId: string,
@@ -3378,6 +3591,10 @@ export class InMemorySpaceStore implements SpaceStore {
       (record) => record.ownerUserId === parsed.ownerUserId && record.contentHash === contentHash
     );
     const timestamp = nowIso();
+    const pending = existing?.item.schedule ?? null;
+    const given = resolveTaskScheduleZone(parsed.schedule, ownerWorkingTimeZone(this.getUserSettings(parsed.ownerUserId)));
+    const schedule = given !== undefined ? given : pending && { recurrence: pending.recurrence, timeZone: pending.timeZone };
+    const nextRunAt = taskScheduleNextRunAt(schedule ?? null, parsed.status, Date.now(), pending);
     const item = taskItemSchema.parse({
       id: existing?.item.id ?? makeSpaceId("task"),
       title: parsed.title,
@@ -3390,7 +3607,8 @@ export class InMemorySpaceStore implements SpaceStore {
       occurrenceCount: (existing?.item.occurrenceCount ?? 0) + 1,
       characterCount: Array.from(parsed.objective).length,
       createdAt: existing?.item.createdAt ?? timestamp,
-      lastUsedAt: timestamp
+      lastUsedAt: timestamp,
+      schedule: schedule ? { ...schedule, nextRunAt, lastRunAt: pending?.lastRunAt ?? null, lastOutcome: pending?.lastOutcome ?? null } : null
     });
     this.taskSequence += 1;
     this.taskItems.set(item.id, {
@@ -3400,8 +3618,9 @@ export class InMemorySpaceStore implements SpaceStore {
       item
     });
 
+    // Only finished, unscheduled tasks are capped (newest 100); open and scheduled tasks go only by an explicit delete.
     const stale = [...this.taskItems.values()]
-      .filter((record) => record.ownerUserId === parsed.ownerUserId)
+      .filter((record) => record.ownerUserId === parsed.ownerUserId && (record.item.status === "DONE" || record.item.status === "ARCHIVED") && !record.item.schedule)
       .sort((left, right) => right.sequence - left.sequence)
       .slice(100);
     for (const record of stale) this.taskItems.delete(record.item.id);
@@ -3442,16 +3661,38 @@ export class InMemorySpaceStore implements SpaceStore {
     if (!record || record.ownerUserId !== ownerUserId) {
       throw new SpaceNotFoundError(`Task item ${taskItemId} was not found.`);
     }
+    const pending = record.item.schedule;
+    const given = resolveTaskScheduleZone(parsed.schedule, ownerWorkingTimeZone(this.getUserSettings(ownerUserId)));
+    const schedule = given !== undefined ? given : pending && { recurrence: pending.recurrence, timeZone: pending.timeZone };
+    const nextRunAt = taskScheduleNextRunAt(schedule, parsed.status ?? record.item.status, Date.now(), pending);
     const updated = taskItemSchema.parse({
       ...record.item,
       ...(parsed.title !== undefined ? { title: parsed.title } : {}),
       ...(parsed.objective !== undefined ? { objective: parsed.objective } : {}),
       ...(parsed.status !== undefined ? { status: parsed.status } : {}),
       characterCount: parsed.objective !== undefined ? Array.from(parsed.objective).length : record.item.characterCount,
-      lastUsedAt: nowIso()
+      lastUsedAt: nowIso(),
+      schedule: schedule ? { ...schedule, nextRunAt, lastRunAt: pending?.lastRunAt ?? null, lastOutcome: pending?.lastOutcome ?? null } : null
     });
     record.item = updated;
     return updated;
+  }
+
+  dueTaskSchedules(nowIso: string, limit: number): Array<TaskItem & { ownerUserId: string }> {
+    const now = Date.parse(nowIso);
+    return [...this.taskItems.values()].map((record) => ({ ...record.item, ownerUserId: record.ownerUserId }))
+      .filter((item) => item.schedule?.nextRunAt && Date.parse(item.schedule.nextRunAt) <= now)
+      .sort((left, right) => Date.parse(left.schedule!.nextRunAt!) - Date.parse(right.schedule!.nextRunAt!))
+      .slice(0, limit);
+  }
+
+  claimTaskSchedule(taskItemId: string, expectedNextRunAt: string, update: { nextRunAt: string | null; outcome: string; ran: boolean }): boolean {
+    const record = this.taskItems.get(taskItemId);
+    const schedule = record?.item.schedule;
+    if (!record || !schedule || schedule.nextRunAt !== expectedNextRunAt) return false;
+    record.item = taskItemSchema.parse({ ...record.item, schedule: { ...schedule, nextRunAt: update.nextRunAt,
+      lastOutcome: update.outcome.slice(0, 500), lastRunAt: update.ran ? new Date().toISOString() : schedule.lastRunAt } });
+    return true;
   }
 
   deleteTaskItem(ownerUserId: string, taskItemId: string): TaskItem {
@@ -4422,7 +4663,7 @@ export class InMemorySpaceStore implements SpaceStore {
     return request;
   }
 
-  createRoomAgentMission(input: CreateRoomAgentMissionInput, _traceId = makeSpaceId("trace")): RoomAgentMissionRecord {
+  createRoomAgentMission(input: CreateRoomAgentMissionInput, traceId?: string): RoomAgentMissionRecord {
     const parsed = createRoomAgentMissionInputSchema.parse(input);
     const request = this.roomAgentRequests.get(parsed.requestId);
     if (!request || request.roomId !== parsed.roomId || request.sessionId !== parsed.sessionId) {
@@ -4437,12 +4678,13 @@ export class InMemorySpaceStore implements SpaceStore {
       updatedAt: timestamp
     });
     this.roomAgentMissions.set(mission.id, mission);
+    this.roomAgentTraces.set(mission.id, { traceId: traceId ?? null, errorCode: null });
     return mission;
   }
 
   enqueueRoomAgentMission(
     input: EnqueueRoomAgentMissionInput,
-    _traceId = makeSpaceId("trace")
+    traceId?: string
   ): RoomAgentEnqueueRecord {
     const queueItem = roomAgentSupervisorQueueItemSchema.parse(input.queueItem);
     const key = `${queueItem.turn.roomId}:${input.clientRequestId}`;
@@ -4583,7 +4825,10 @@ export class InMemorySpaceStore implements SpaceStore {
     this.spaceAgentMessages.set(promptMessage.messageId, promptMessage);
     this.spaceAgentMessages.set(responseMessage.messageId, responseMessage);
     this.roomAgentRequests.set(request.requestId, request);
-    if (!linkedMission) this.roomAgentMissions.set(mission.id, mission);
+    if (!linkedMission) {
+      this.roomAgentMissions.set(mission.id, mission);
+      this.roomAgentTraces.set(mission.id, { traceId: traceId ?? null, errorCode: null });
+    }
     this.spaceAgentRuns.set(run.runId, run);
     this.spaceAgentSessions.set(session.sessionId, {
       ...session,
@@ -4634,6 +4879,8 @@ export class InMemorySpaceStore implements SpaceStore {
     const parsed = updateRoomAgentMissionInputSchema.parse(input);
     const updated = roomAgentMissionRecordSchema.parse({ ...current, ...parsed, updatedAt: nowIso() });
     this.roomAgentMissions.set(missionId, updated);
+    const trace = this.roomAgentTraces.get(missionId) ?? { traceId: null, errorCode: null };
+    this.roomAgentTraces.set(missionId, { ...trace, errorCode: trace.errorCode ?? parsed.errorCode ?? null });
     return updated;
   }
 
@@ -4694,7 +4941,7 @@ export class InMemorySpaceStore implements SpaceStore {
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
-  upsertRoomAgentTaskRun(input: UpsertRoomAgentTaskRunInput): RoomAgentTaskRunRecord {
+  upsertRoomAgentTaskRun(input: UpsertRoomAgentTaskRunInput, traceId?: string): RoomAgentTaskRunRecord {
     const parsed = upsertRoomAgentTaskRunInputSchema.parse(input);
     const mission = this.roomAgentMissions.get(parsed.missionId);
     if (!mission || mission.roomId !== parsed.roomId) {
@@ -4709,6 +4956,8 @@ export class InMemorySpaceStore implements SpaceStore {
       updatedAt: nowIso()
     });
     this.roomAgentTaskRuns.set(key, record);
+    const trace = this.roomAgentTraces.get(key);
+    this.roomAgentTraces.set(key, { traceId: trace?.traceId ?? traceId ?? null, errorCode: trace?.errorCode ?? parsed.errorCode ?? null });
     return record;
   }
 
@@ -4773,6 +5022,33 @@ export class InMemorySpaceStore implements SpaceStore {
     return structuredClone(updated);
   }
 
+  updateFreelanceCopilotMetadata(paneId: string, metadata: FreelanceCopilotPaneMetadata): Pane {
+    const current = this.getPane(paneId);
+    if (current.mode !== "FREELANCE_COPILOT" || current.isClosed) throw new SpaceConflictError("An open Freelance Copilot pane is required.");
+    const parsed = freelanceCopilotPaneMetadataSchema.parse(metadata);
+    const updated = { ...current, freelanceCopilotMetadata: structuredClone(parsed), updatedAt: nowIso() };
+    this.panes.set(paneId, updated);
+    return structuredClone(updated);
+  }
+
+  updateDesignMetadata(paneId: string, metadata: DesignPaneMetadata): Pane {
+    const current = this.getPane(paneId);
+    if (current.mode !== "DESIGN" || current.isClosed) throw new SpaceConflictError("An open Design pane is required.");
+    const parsed = designPaneMetadataSchema.parse(metadata);
+    const updated = { ...current, designMetadata: structuredClone(parsed), updatedAt: nowIso() };
+    this.panes.set(paneId, updated);
+    return structuredClone(updated);
+  }
+
+  updateAppStudioMetadata(paneId: string, metadata: AppStudioPaneMetadata): Pane {
+    const current = this.getPane(paneId);
+    if (current.mode !== "APP_STUDIO" || current.isClosed) throw new SpaceConflictError("An open App Studio pane is required.");
+    const parsed = appStudioPaneMetadataSchema.parse(metadata);
+    const updated = { ...current, appStudioMetadata: structuredClone(parsed), updatedAt: nowIso() };
+    this.panes.set(paneId, updated);
+    return structuredClone(updated);
+  }
+
   updatePane(paneId: string, input: UpdatePaneInput, traceId = makeSpaceId("trace")): Pane {
     const current = this.panes.get(paneId);
     if (!current) {
@@ -4814,7 +5090,7 @@ export class InMemorySpaceStore implements SpaceStore {
       providerId: input.providerId === undefined ? current.providerId : input.providerId,
       modelId: input.modelId === undefined ? current.modelId : input.modelId,
       terminalRuntimeId:
-        ["TERMINAL", "JOB_APPLY", "MAIL_COPILOT", "MARKETING_COPILOT"].includes(input.mode ?? current.mode)
+        ["TERMINAL", "JOB_APPLY", "MAIL_COPILOT", "MARKETING_COPILOT", "FREELANCE_COPILOT", "DESIGN", "APP_STUDIO"].includes(input.mode ?? current.mode)
           ? input.terminalRuntimeId === undefined
             ? current.terminalRuntimeId
             : input.terminalRuntimeId
@@ -6121,8 +6397,8 @@ export class InMemorySpaceStore implements SpaceStore {
     if (!pane || pane.roomId !== parsed.roomId) {
       throw new SpaceNotFoundError(`Pane ${parsed.paneId} was not found.`);
     }
-    if (pane.mode !== "TERMINAL" && pane.mode !== "JOB_APPLY" && pane.mode !== "MAIL_COPILOT" && pane.mode !== "MARKETING_COPILOT") {
-      throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; CLI sessions require TERMINAL, JOB_APPLY, MAIL_COPILOT or MARKETING_COPILOT panes.`);
+    if (pane.mode !== "TERMINAL" && pane.mode !== "JOB_APPLY" && pane.mode !== "MAIL_COPILOT" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT" && pane.mode !== "DESIGN" && pane.mode !== "APP_STUDIO") {
+      throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; CLI sessions require TERMINAL, JOB_APPLY, MAIL_COPILOT, MARKETING_COPILOT, FREELANCE_COPILOT, DESIGN or APP_STUDIO panes.`);
     }
     if (pane.isClosed) {
       throw new SpaceConflictError(`Pane ${pane.id} is closed.`);
@@ -6407,10 +6683,10 @@ export class InMemorySpaceStore implements SpaceStore {
     const batchSize = Math.max(1, Math.min(input.batchSize ?? 500, 5000));
     const cutoff = Date.now() - olderThanHours * 3_600_000;
     const roomAgentPaneIds = new Set(this.roomAgentPaneIds.values());
-    // The newest closed Job and Marketing Copilot pane of each room stays: a new one continues its browser tabs and account.
+    // The newest closed Job, Marketing and Freelance Copilot pane of each room stays: a new one continues its browser tabs and account.
     const lastCopilot = new Map<string, Pane>();
     for (const pane of this.panes.values()) {
-      if ((pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT") || !pane.isClosed) continue;
+      if ((pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT") || !pane.isClosed) continue;
       const kept = lastCopilot.get(`${pane.roomId}:${pane.mode}`);
       if (!kept || pane.updatedAt > kept.updatedAt || (pane.updatedAt === kept.updatedAt && pane.id > kept.id)) lastCopilot.set(`${pane.roomId}:${pane.mode}`, pane);
     }
@@ -6673,8 +6949,8 @@ export class InMemorySpaceStore implements SpaceStore {
     if (!pane || pane.roomId !== parsed.roomId) {
       throw new SpaceNotFoundError(`Pane ${parsed.paneId} was not found.`);
     }
-    if (pane.mode !== "BROWSER" && pane.mode !== "YOUTUBE" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT") {
-      throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; browser sessions require BROWSER, YOUTUBE, JOB_APPLY or MARKETING_COPILOT panes.`);
+    if (pane.mode !== "BROWSER" && pane.mode !== "YOUTUBE" && pane.mode !== "JOB_APPLY" && pane.mode !== "MARKETING_COPILOT" && pane.mode !== "FREELANCE_COPILOT") {
+      throw new SpaceConflictError(`Pane ${pane.id} is ${pane.mode}; browser sessions require BROWSER, YOUTUBE, JOB_APPLY, MARKETING_COPILOT or FREELANCE_COPILOT panes.`);
     }
     if (pane.isClosed) {
       throw new SpaceConflictError(`Pane ${pane.id} is closed.`);
@@ -6990,6 +7266,9 @@ export class InMemorySpaceStore implements SpaceStore {
     );
     if (!active) return null;
     if (active.expiresAt > timestamp) return active;
+    // An accepted handoff stays the operator's while their control lease is alive, past the request's own TTL.
+    const lease = active.controlLeaseId ? this.browserControlLeases.get(active.controlLeaseId) : undefined;
+    if (active.status === "ACCEPTED" && lease?.status === "ACTIVE" && lease.expiresAt > timestamp) return active;
     this.updateBrowserHandoffRequest(active.handoffRequestId, { status: "EXPIRED" });
     return null;
   }
@@ -7365,7 +7644,7 @@ export class InMemorySpaceStore implements SpaceStore {
     const since = new Date(Date.now() - sinceDays * 86_400_000).toISOString();
     const newestFirst = <T extends { createdAt: string; id: string }>(left: T, right: T) =>
       right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id);
-    return {
+    const records = {
       events: this.events.filter((event) => event.traceId === traceId && event.createdAt >= since).sort(newestFirst).slice(0, limit),
       auditEvents: this.auditEvents.filter((event) => event.traceId === traceId).sort(newestFirst).slice(0, limit),
       workflows: [...this.workflows.values()]
@@ -7373,6 +7652,41 @@ export class InMemorySpaceStore implements SpaceStore {
         .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
         .slice(0, limit)
     };
+    const workflowIds = new Set(traceWorkflowIds(records));
+    const project = ({ runId, workflowId, status, errorCode, createdAt, completedAt }: SpaceAgentRunRecord, continuationOf: string | null) =>
+      ({ runId, workflowId, status, errorCode, createdAt, completedAt: completedAt ?? null, continuationOf });
+    const agentRuns = [...this.spaceAgentRuns.values()]
+      .filter((run) => workflowIds.has(run.workflowId))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit)
+      .map((run) => project(run, null));
+    // Background continuations keep their own trace (workflow ids embed it); follow them from the run they continue.
+    const continued = new Map<string, string>();
+    for (const enqueue of this.roomAgentEnqueues.values()) {
+      const source = enqueue.queueItem.turn.roomAgentContinuation?.sourceRunId;
+      if (source) continued.set(enqueue.run.runId, source);
+    }
+    let frontier = new Set(agentRuns.map((run) => run.runId));
+    for (let generation = 0; generation < traceContinuationGenerations && frontier.size && agentRuns.length < limit; generation += 1) {
+      const next = new Set<string>();
+      for (const [runId, source] of continued) {
+        const run = this.spaceAgentRuns.get(runId);
+        if (!frontier.has(source) || !run || agentRuns.some((item) => item.runId === runId) || agentRuns.length >= limit) continue;
+        agentRuns.push(project(run, source));
+        next.add(runId);
+      }
+      frontier = next;
+    }
+    const traced = (key: string) => this.roomAgentTraces.get(key)?.traceId === traceId;
+    const roomAgentMissions = [...this.roomAgentMissions.values()].filter((mission) => traced(mission.id))
+      .sort((left, right) => right.queuedAt.localeCompare(left.queuedAt)).slice(0, limit)
+      .map((mission) => ({ missionId: mission.id, roomId: mission.roomId, status: mission.status,
+        errorCode: this.roomAgentTraces.get(mission.id)?.errorCode ?? null, queuedAt: mission.queuedAt, completedAt: mission.completedAt ?? null }));
+    const roomAgentTaskRuns = [...this.roomAgentTaskRuns.entries()].filter(([key]) => traced(key))
+      .sort(([, left], [, right]) => right.queuedAt.localeCompare(left.queuedAt)).slice(0, limit)
+      .map(([key, run]) => ({ runId: run.runId, missionId: run.missionId, roomId: run.roomId, status: run.status,
+        errorCode: this.roomAgentTraces.get(key)?.errorCode ?? null, queuedAt: run.queuedAt, completedAt: run.completedAt ?? null }));
+    return { ...records, agentRuns, roomAgentMissions, roomAgentTaskRuns };
   }
 
   listProviders(): Provider[] {
@@ -7784,7 +8098,7 @@ export class InMemorySpaceStore implements SpaceStore {
     return { candidate: updated, events, memoryEntry, skill };
   }
 
-  createMemoryEntry(input: CreateMemoryEntryInput, traceId = makeSpaceId("trace"), _options: CreateMemoryEntryOptions = {}): MemoryEntryRecord {
+  createMemoryEntry(input: CreateMemoryEntryInput, traceId = makeSpaceId("trace"), options: CreateMemoryEntryOptions = {}): MemoryEntryRecord {
     if (input.scope === "ROOM" && input.roomId) {
       this.getRoom(input.roomId);
     }
@@ -7799,6 +8113,7 @@ export class InMemorySpaceStore implements SpaceStore {
       createdAt: timestamp
     };
     this.memoryEntries.unshift(entry);
+    if (options.embedding && options.embeddingModel) this.memoryEmbeddingModels.set(entry.id, options.embeddingModel);
     if (entry.roomId) {
       this.touchRoom(entry.roomId, timestamp);
     }
@@ -7830,6 +8145,30 @@ export class InMemorySpaceStore implements SpaceStore {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     const limit = options.limit === undefined ? null : Math.max(1, Math.min(500, Math.trunc(options.limit)));
     return limit === null ? entries : entries.slice(0, limit);
+  }
+
+  listMemoryRecordsToEmbed(model: string, limit: number): MemoryRecordToEmbed[] {
+    return this.memoryEntries
+      .filter((entry) => this.memoryEmbeddingModels.get(entry.id) !== model)
+      .sort((a, b) => Number(this.memoryEmbeddingModels.has(a.id)) - Number(this.memoryEmbeddingModels.has(b.id)) || b.createdAt.localeCompare(a.createdAt))
+      .slice(0, Math.max(1, Math.min(500, Math.trunc(limit))))
+      .map(({ id, title, body }) => ({ id, title, body }));
+  }
+
+  setMemoryRecordEmbedding(id: string, embedding: number[], model: string): void {
+    if (!isFiniteVector(embedding)) throw new SpaceConflictError("A memory embedding must be a finite vector.");
+    if (!this.memoryEntries.some((entry) => entry.id === id)) throw new SpaceNotFoundError(`Memory record ${id} was not found.`);
+    this.memoryEmbeddingModels.set(id, model);
+  }
+
+  countMemoryRecordEmbeddings(): MemoryEmbeddingCounts {
+    const byModel = new Map<string, number>();
+    for (const entry of this.memoryEntries) {
+      const model = this.memoryEmbeddingModels.get(entry.id);
+      if (model) byModel.set(model, (byModel.get(model) ?? 0) + 1);
+    }
+    return { total: this.memoryEntries.length, withoutEmbedding: this.memoryEntries.filter((entry) => !this.memoryEmbeddingModels.has(entry.id)).length,
+      byModel: [...byModel].map(([model, count]) => ({ model, count })).sort((a, b) => a.model.localeCompare(b.model)) };
   }
 
   linkMemoryCacheRecord(input: LinkMemoryCacheInput): MemoryCacheLink {
@@ -8872,9 +9211,11 @@ export class InMemorySpaceStore implements SpaceStore {
   ): Promise<ImportConfigResult> {
     const parsedBundle = spaceConfigBundleSchema.parse(bundle);
     const targetUserId = options.targetUserId || parsedBundle.source.exportedBy || "user:operator";
-    const mode = options.mode || "replace";
+    const mode = options.mode || "merge";
+    assertConfigReplaceConfirmed({ mode, confirmReplace: options.confirmReplace });
+    const take = (section: ConfigSection) => configImportIncludes(options.sections, section);
     const { secrets, warnings } = await openConfigBundleSecrets(parsedBundle, options.passphrase);
-    const prepared = await prepareConfigImport(parsedBundle, { pathRewrite: options.pathRewrite }, {
+    const prepared = await prepareConfigImport(parsedBundle, { pathRewrite: options.pathRewrite, sections: options.sections }, {
       profileExists: async (runtimeId, profileId) => {
         try { return Boolean(this.getCliAccountProfile(runtimeId as CliToggleRuntimeId, profileId)); } catch { return false; }
       }
@@ -8882,9 +9223,10 @@ export class InMemorySpaceStore implements SpaceStore {
     warnings.push(...prepared.warnings);
     const data = prepared.data;
 
+    // Replace clears only the sections this import brings.
     if (mode === "replace") {
       for (const [roomId, room] of this.rooms.entries()) {
-        if (room.ownerUserId === targetUserId) {
+        if (take("rooms") && room.ownerUserId === targetUserId) {
           this.rooms.delete(roomId);
           for (const [paneId, pane] of this.panes.entries()) {
             if (pane.roomId === roomId) {
@@ -8894,17 +9236,17 @@ export class InMemorySpaceStore implements SpaceStore {
         }
       }
       for (const [id, rec] of this.clipboardItems.entries()) {
-        if (rec.ownerUserId === targetUserId) {
+        if (take("clipboardItems") && rec.ownerUserId === targetUserId) {
           this.clipboardItems.delete(id);
         }
       }
       for (const [id, rec] of this.userLinks.entries()) {
-        if (rec.ownerUserId === targetUserId) {
+        if (take("userLinks") && rec.ownerUserId === targetUserId) {
           this.userLinks.delete(id);
         }
       }
       for (const [id, rec] of this.taskItems.entries()) {
-        if (rec.ownerUserId === targetUserId) {
+        if (take("taskItems") && rec.ownerUserId === targetUserId) {
           this.taskItems.delete(id);
         }
       }
@@ -8955,8 +9297,9 @@ export class InMemorySpaceStore implements SpaceStore {
 
     let settingsUpdated = false;
     if (data.userSettings) {
+      const imported = remapRoomKeyedSettings(data.userSettings, roomIdMap);
       this.userSettings.set(targetUserId, {
-        ...remapRoomKeyedSettings(data.userSettings, roomIdMap),
+        ...(mode === "merge" ? mergeImportedUserSettings(this.userSettings.get(targetUserId), imported) : imported),
         updatedAt: nowIso()
       });
       settingsUpdated = true;
@@ -9058,13 +9401,13 @@ export class InMemorySpaceStore implements SpaceStore {
     }
 
     let apiKeysImported = 0;
-    if (options.importApiKeys !== false && secrets.apiKeys && Object.keys(secrets.apiKeys).length > 0) {
+    if (options.importApiKeys !== false && take("apiKeys") && secrets.apiKeys && Object.keys(secrets.apiKeys).length > 0) {
       const res = writeImportedApiKeys(secrets.apiKeys, { secretsDir: options.secretsDir });
       apiKeysImported = res.imported;
       warnings.push(`Imported ${apiKeysImported} provider API key(s) to ${res.targetDir}`);
     }
 
-    const cliAuth = options.importCredentials !== false && secrets.cliAuth && hooks.applyCliAuth
+    const cliAuth = options.importCredentials !== false && take("credentials") && secrets.cliAuth && hooks.applyCliAuth
       ? await hooks.applyCliAuth(secrets.cliAuth)
       : undefined;
     const credentialsImported = cliAuth?.filter((entry) => entry.result === "imported").length ?? 0;

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   InMemorySystemAnalyticsRepository,
   PostgresSystemAnalyticsRepository,
+  type SystemAnalyticsModelEventRecord,
   type SystemAnalyticsResourceSample
 } from "../src/system-analytics-repository.js";
 import type { PgPoolLike } from "../src/space-store.js";
@@ -59,7 +60,7 @@ describe("system analytics repositories", () => {
     ]);
   });
 
-  it("expires orphan RUNNING model events after the bounded retention window", async () => {
+  it("keeps every model event (token usage, operator rule 2026-10-18) and leaves orphan RUNNING turns out of the lists", async () => {
     const repository = new InMemorySystemAnalyticsRepository();
     await repository.upsertModelEvents([{
       eventKey: "codex:orphan:turn",
@@ -84,8 +85,52 @@ describe("system analytics repositories", () => {
       updatedAt: "2026-06-01T00:00:00.000Z"
     }]);
 
+    // Older than the 31 days the sweep used to keep.
+    await repository.upsertModelEvents([modelEvent("codex:old", { startedAt: "2026-07-01T00:00:00.000Z", endedAt: "2026-07-01T00:01:00.000Z" })]);
+
     await repository.rollupAndSweep(now);
-    await expect(repository.listModelEvents("2026-01-01T00:00:00.000Z")).resolves.toEqual([]);
+    await expect(repository.listModelEvents("2026-06-15T00:00:00.000Z")).resolves.toEqual([expect.objectContaining({ eventKey: "codex:old", tokensIn: 10 })]);
+    await expect(repository.listModelEvents("2026-01-01T00:00:00.000Z")).resolves.toEqual([
+      expect.objectContaining({ eventKey: "codex:orphan:turn", tokensIn: 1 }), expect.objectContaining({ eventKey: "codex:old" })
+    ]);
+  });
+
+  const modelEvent = (eventKey: string, extra: Partial<SystemAnalyticsModelEventRecord> = {}): SystemAnalyticsModelEventRecord => ({
+    eventKey, source: "codex", runtimeId: "cli:codex", providerId: "codex", modelId: "gpt-6-astra", roomId: null, paneId: null,
+    sessionId: null, turnId: null, status: "COMPLETED", coverage: "NATIVE", turnCount: 1, startedAt: now, endedAt: now,
+    tokensIn: 10, tokensOut: 2, tokensReasoning: null, ttftMs: null, durationMs: null, updatedAt: now, ...extra
+  });
+
+  it("keeps a stored route, account and API value when a later read does not know them", async () => {
+    const repository = new InMemorySystemAnalyticsRepository();
+    await repository.upsertModelEvents([modelEvent("codex:a", { route: "GATEWAY", accountKey: "gw_account:1", costUsd: 0.5, tokensCacheRead: 4 })]);
+    await repository.upsertModelEvents([modelEvent("codex:a", { tokensOut: 3 })]);
+    await expect(repository.listModelEvents("2026-01-01T00:00:00.000Z")).resolves.toEqual([
+      expect.objectContaining({ tokensOut: 3, route: "GATEWAY", accountKey: "gw_account:1", costUsd: 0.5, tokensCacheRead: 4, tokensCacheWrite: null })
+    ]);
+  });
+
+  it("lists model events of the given providers only, or of all when none are given", async () => {
+    const memory = new InMemorySystemAnalyticsRepository();
+    await memory.upsertModelEvents([modelEvent("codex:a"), modelEvent("opencode:a", { providerId: "opencode" })]);
+    await expect(memory.listModelEvents("2026-01-01T00:00:00.000Z", ["opencode"])).resolves.toEqual([expect.objectContaining({ eventKey: "opencode:a" })]);
+    await expect(memory.listModelEvents("2026-01-01T00:00:00.000Z")).resolves.toHaveLength(2);
+    const { pool, queries } = recordingPool();
+    const repository = new PostgresSystemAnalyticsRepository(pool);
+    await repository.listModelEvents("2026-01-01T00:00:00.000Z", ["opencode"]);
+    await repository.listModelEvents("2026-01-01T00:00:00.000Z");
+    expect(queries.map((entry) => entry.values[1])).toEqual([["opencode"], null]);
+    expect(queries[0]!.sql).toContain("AND ($2::text[] IS NULL OR provider_id = ANY($2::text[]))");
+  });
+
+  it("upserts model events in batches of 500 with one row per key, keeping stored routes", async () => {
+    const { pool, queries } = recordingPool();
+    const repository = new PostgresSystemAnalyticsRepository(pool);
+    const events = Array.from({ length: 1001 }, (_, index) => modelEvent(`claude:msg_${index}`, { source: "claude" }));
+    await repository.upsertModelEvents([...events, modelEvent("claude:msg_0", { source: "claude", route: "DIRECT" })]);
+    expect(queries.map((entry) => entry.values.length)).toEqual([500 * 25, 500 * 25, 25]);
+    expect(queries[0]!.values[20]).toBe("DIRECT");
+    expect(queries[0]!.sql).toContain("route = COALESCE(EXCLUDED.route, system_analytics_model_events.route)");
   });
 
   it("uses conflict-safe inserts and transactional multi-resolution Postgres rollups", async () => {
@@ -124,7 +169,7 @@ describe("system analytics repositories", () => {
     expect(sql).toContain("resolution_seconds = 900");
     expect(sql).toContain("$1::integer");
     expect(sql).toContain("$2::integer");
-    expect(sql).toContain("status = 'RUNNING' AND updated_at");
+    expect(sql).not.toMatch(/DELETE FROM system_analytics_model_events/);
     expect(sql).toContain(") IS DISTINCT FROM (");
     expect(queries.at(-1)?.sql).toBe("COMMIT");
     expect(release).toHaveBeenCalledOnce();
@@ -196,7 +241,7 @@ describe("system analytics repositories", () => {
 
   it("advances the rollup watermark only after a committed rollup", async () => {
     let failSweep = false;
-    const { pool, rollupSinces, queries } = recordingPool((sql) => failSweep && sql.includes("DELETE FROM system_analytics_model_events"));
+    const { pool, rollupSinces, queries } = recordingPool((sql) => failSweep && sql.includes("resolution_seconds = 900 AND bucket_at <"));
     const repository = new PostgresSystemAnalyticsRepository(pool);
 
     await repository.rollupAndSweep("2026-08-11T08:00:09.000Z");

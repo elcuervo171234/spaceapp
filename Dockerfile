@@ -20,7 +20,7 @@ ENV NODE_ENV=production \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 LABEL org.opencontainers.image.source=https://github.com/oll4com/spaceapp
-LABEL org.opencontainers.image.licenses=BUSL-1.1
+LABEL org.opencontainers.image.licenses=MIT
 RUN npm install --global --ignore-scripts --no-audit --no-fund "npm@${NPM_VERSION}" \
     && install -d /tmp/npm-security-patches \
     && npm pack --ignore-scripts --no-audit --no-fund --pack-destination /tmp/npm-security-patches \
@@ -57,6 +57,7 @@ RUN npm install --global --ignore-scripts --no-audit --no-fund "npm@${NPM_VERSIO
     && useradd --uid 10001 --gid 10001 --create-home --home-dir /var/lib/spaceapp-cli --shell /bin/bash spaceapp
 WORKDIR /app
 COPY --from=build --chown=spaceapp:spaceapp /app/LICENSE /app/NOTICE /app/THIRD_PARTY_NOTICES.md ./
+COPY --from=build --chown=spaceapp:spaceapp /app/THIRD_PARTY_LICENSES ./THIRD_PARTY_LICENSES
 COPY --chown=spaceapp:spaceapp deploy/docker ./deploy/docker
 RUN chmod 0755 deploy/docker/core-entrypoint.sh deploy/docker/browser-entrypoint.sh deploy/docker/cli-entrypoint.sh \
     && install -m 0755 deploy/docker/public-cli-wrapper.sh /usr/local/bin/spaceapp-cli-wrapper \
@@ -100,7 +101,12 @@ COPY --chown=root:root starter-memory/AGENTS.md /etc/AGENTS.md
 COPY --chown=root:root starter-memory/installation-guide.md /etc/spaceapp-installation-guide.md
 RUN chmod 0644 /etc/AGENTS.md
 ARG TARGETARCH
-RUN npm install --global --no-audit --no-fund opencode-ai@1.18.4 \
+# python3-minimal (about 13 MB): agents often check their work with a short python3 script (pilot F18).
+# OpenCode 2 (@opencode/cli): its postinstall picks the native binary for the image's platform.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-minimal \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global --no-audit --no-fund @opencode/cli@2.0.32 \
     && install -d -o spaceapp -g spaceapp -m 0700 /var/lib/spaceapp-cli/vendor \
     && npm cache clean --force \
     && install -d -o spaceapp -g spaceapp -m 0700 \

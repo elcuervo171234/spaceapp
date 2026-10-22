@@ -9,12 +9,15 @@ import { CommandBar } from "./CommandBar.js";
 import { CopilotRail, RAIL_TAB_ICONS, type CopilotRailTab, type CopilotRailTabDefinition } from "./CopilotRail.js";
 import { FieldsTab } from "./FieldsTab.js";
 import { HandoffOverlay } from "./HandoffOverlay.js";
-import { browserVisible, layoutForWidth, resolveActiveTab, tabsForLayout, type JobCopilotLayout } from "./layout.js";
+import { HeldBrowserStrip } from "../copilot-kit/HandoffOverlay.js";
+import { browserVisible, resolveActiveTab, tabsForLayout } from "./layout.js";
+import { useCopilotLayout } from "../copilot-kit/copilot-layout.js";
 import { MemoryTab } from "./MemoryTab.js";
 import { QueueTab } from "./QueueTab.js";
 import { SetupWizard } from "./SetupWizard.js";
 import { StartOver } from "./StartOver.js";
-import { runProgress, todayCounts, useJobApplyData } from "./useJobApply.js";
+import { handoffPostingFor, runProgress, todayCounts, useJobApplyData } from "./useJobApply.js";
+import { useBrowserControlHeld, useLiveHandoff } from "../copilot-kit/live-handoff.js";
 import "./job-copilot-pane.css";
 
 export interface JobCopilotPaneProps {
@@ -63,21 +66,6 @@ function writeRailPreference(paneId: string, preference: RailPreference): void {
 
 const TAB_LABELS: Record<CopilotRailTab, string> = { browser: "Browser", activity: "Activity", queue: "Queue", fields: "Fields", memory: "Memory", setup: "Setup", terminal: "Terminal" };
 
-/** The pane's own width decides the layout (a narrow desktop pane stacks like a phone); SSR and jsdom start from the window. */
-function useLayout(ref: React.RefObject<HTMLDivElement | null>): JobCopilotLayout {
-  const [layout, setLayout] = useState<JobCopilotLayout>(() => layoutForWidth(typeof window === "undefined" ? 0 : window.innerWidth));
-  useEffect(() => {
-    const element = ref.current;
-    if (!element || typeof ResizeObserver === "undefined") return;
-    const apply = (width: number) => setLayout((current) => { const next = layoutForWidth(width); return next === current ? current : next; });
-    apply(element.getBoundingClientRect().width);
-    const observer = new ResizeObserver((entries) => { for (const entry of entries) apply(entry.contentRect.width); });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [ref]);
-  return layout;
-}
-
 /**
  * Job Copilot: full-bleed live browser, a command bar (agent, run state, counters) and a
  * collapsible, resizable rail with Queue, Setup and the agent terminal. The terminal element
@@ -87,7 +75,7 @@ function useLayout(ref: React.RefObject<HTMLDivElement | null>): JobCopilotLayou
 export function JobCopilotPane({ pane, isVisible, terminal, browser }: JobCopilotPaneProps) {
   const data = useJobApplyData(pane, isVisible);
   const paneRef = useRef<HTMLDivElement | null>(null);
-  const layout = useLayout(paneRef);
+  const layout = useCopilotLayout(paneRef);
   const [rail, setRail] = useState<RailPreference>(() => readRailPreference(pane.id));
   const [selectedApplicationId, setSelectedApplicationId] = useState<string | null>(null);
   const [switching, setSwitching] = useState(false);
@@ -100,9 +88,10 @@ export function JobCopilotPane({ pane, isVisible, terminal, browser }: JobCopilo
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const counts = useMemo(() => todayCounts(data.applications, data.run?.queue), [data.applications, data.run?.queue]);
   const runtimeOptions = useMemo(() => jobCopilotRuntimeOptions(data.runtimes), [data.runtimes]);
-  const handoff = data.handoff && (data.handoff.status === "REQUESTED" || data.handoff.status === "ACCEPTED") ? data.handoff : null;
+  const handoff = useLiveHandoff(data.handoff);
+  const controlHeld = useBrowserControlHeld(pane.id);
   const paused = data.settings?.settings.paused ?? false;
-  const handoffPosting = useMemo(() => data.run?.current ?? data.applications.find((application) => application.status === "NEEDS_USER" || application.status === "FILLING") ?? null, [data.applications, data.run]);
+  const handoffPosting = useMemo(() => (handoff ? handoffPostingFor(handoff.reason, data.applications, data.run?.current) : null), [handoff, data.applications, data.run]);
   const runState = data.run?.status ?? "IDLE";
   const progress = useMemo(() => runProgress(data.run), [data.run]);
   const pending = data.run?.pending ?? [];
@@ -265,7 +254,8 @@ export function JobCopilotPane({ pane, isVisible, terminal, browser }: JobCopilo
       <div className="jc-body">
         <section className="jc-browser" aria-label="Live browser" data-active={browserShown ? "true" : "false"} aria-hidden={browserShown ? undefined : "true"}>
           {browser}
-          {handoff ? <HandoffOverlay handoff={handoff} posting={handoffPosting} onTakeControl={takeControl} onReturnToAgent={returnToAgent} /> : null}
+          {handoff ? <HandoffOverlay handoff={handoff} posting={handoffPosting} onTakeControl={takeControl} onReturnToAgent={returnToAgent} />
+            : controlHeld ? <HeldBrowserStrip onReturnToAgent={returnToAgent} /> : null}
         </section>
         <div className="jc-rail-handle" role="separator" aria-orientation="vertical" aria-label="Resize the copilot rail" aria-hidden={rail.collapsed ? "true" : undefined}
           onPointerDown={onResizeStart} onPointerMove={onResizeMove} onPointerUp={onResizeEnd} onPointerCancel={onResizeEnd} onDoubleClick={() => setRail((current) => ({ ...current, width: RAIL_DEFAULT_WIDTH }))} />

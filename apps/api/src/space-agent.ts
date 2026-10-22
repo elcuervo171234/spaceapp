@@ -442,6 +442,8 @@ const browserToolDefinitions: Array<{ id: string; displayName: string; slug: str
   { id: "browser:type", displayName: "Browser type", slug: "browser.type", description: "Type into the active tab while respecting exclusive operator control." },
   { id: "browser:scroll", displayName: "Browser scroll", slug: "browser.scroll", description: "Scroll the active managed browser tab." },
   { id: "browser:set_viewport", displayName: "Browser viewport", slug: "browser.set_viewport", description: "Switch the managed browser between desktop, tablet, and mobile viewport profiles." },
+  { id: "browser:press", displayName: "Browser key", slug: "browser.press", description: "Press Enter, Tab or Shift+Tab in the managed browser." },
+  { id: "browser:masked_screenshot", displayName: "Browser masked screenshot", slug: "browser.masked_screenshot", description: "Screenshot the managed browser with every form field drawn as dots." },
   { id: "browser:diagnostics", displayName: "Browser diagnostics", slug: "browser.diagnostics", description: "Read sanitized console, network, error, frame, and navigation timeline diagnostics." },
   { id: "browser:record", displayName: "Browser recording", slug: "browser.record", description: "Record bounded WebM and frame evidence for frame-by-frame debugging across parallel browser panes." }
 ];
@@ -883,6 +885,8 @@ export function createSpaceAgentAdapter(options: {
    */
   dotTurnContext?: (session: SpaceAgentSessionRecord, workspace: string | null) => Promise<{ toolGateway: boolean; developerContext: string;
     conversationContext?: string | null; onAccepted?: () => Promise<void> } | null>;
+  /** Who a Dot is and how it speaks, for a Dot turn on another runtime (cli:claude, cli:gemini, ...), which gets no Codex context. */
+  dotIdentity?: (session: SpaceAgentSessionRecord) => Promise<string | null>;
   /** Stage 8: the model and permissions set for a Dot in SpaceApp Settings; null fields keep the session's own. */
   dotRuntime?: (session: SpaceAgentSessionRecord) => Promise<{ modelConfigId: string | null; permissionMode: PermissionMode | null } | null>;
   /** Stage 8: the Dot a pane's first session opens with (Settings → Dots); null keeps the first Dot. */
@@ -1635,6 +1639,7 @@ export function createSpaceAgentAdapter(options: {
     const nativeCodex = !session.selectedProviderId || session.selectedProviderId === codexChatProviderId;
     const dotTurn = session.dotId && input.operatorUserId && nativeCodex && options.dotTurnContext
       ? await options.dotTurnContext(session, targetDir).catch(() => null) : null;
+    const dotIdentity = session.dotId && !nativeCodex && options.dotIdentity ? await options.dotIdentity(session).catch(() => null) : null;
     // Proactive work is read-only, which only the native gateway enforces: refuse it anywhere else.
     const proactive = Boolean(session.dotId) && isDotProactiveRequest(input.clientRequestId);
     // Stage 8: only the user's own messages (typed, voice, Slack/Teams) get the Dot's other conversations and its
@@ -1655,6 +1660,7 @@ export function createSpaceAgentAdapter(options: {
       paneId: input.pane.id,
       prompt: promptWithAgentContexts(input.content, dotTurn?.toolGateway ? [userTurn ? dotTurn.conversationContext ?? null : null,
         artifactContext(attachedArtifacts, readLines, Boolean(input.content.trim()))] : [
+        dotIdentity,
         workspaceContext(targetDir),
         clipboardToolContext(effectiveTools),
         taskToolContext(effectiveTools),

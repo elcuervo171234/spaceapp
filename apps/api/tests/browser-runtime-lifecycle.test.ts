@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
@@ -22,7 +22,7 @@ vi.mock('node:fs', async importOriginal => {
 import { allocateDisplay, createBrowserSessionManager, releaseDisplay } from '../src/browser-sessions.js';
 import { getApiConfig } from '../src/config.js';
 
-async function fixture(mode: 'BROWSER' | 'YOUTUBE' = 'YOUTUBE') {
+async function fixture(mode: 'BROWSER' | 'YOUTUBE' | 'FREELANCE_COPILOT' = 'YOUTUBE') {
   const root = await mkdtemp(join(tmpdir(), 'browser-lifecycle-'));
   const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>(resolve => server.once('listening', resolve));
@@ -47,13 +47,13 @@ async function fixture(mode: 'BROWSER' | 'YOUTUBE' = 'YOUTUBE') {
     socket.send(JSON.stringify({ id, result, ...(sessionId ? { sessionId } : {}) }));
     if (method === 'Page.navigate') socket.send(JSON.stringify({ method: 'Page.loadEventFired', sessionId, params: {} }));
   }));
-  const children: Array<EventEmitter & { command: string; exitCode: number | null; signalCode: string | null; stdout: PassThrough; stderr: PassThrough; kill: (signal: string) => boolean }> = [];
+  const children: Array<EventEmitter & { command: string; args: string[]; env?: NodeJS.ProcessEnv; exitCode: number | null; signalCode: string | null; stdout: PassThrough; stderr: PassThrough; kill: (signal: string) => boolean }> = [];
   let releaseChrome: (() => void) | undefined;
   let holdChrome = false;
-  mocks.spawn.mockImplementation((command: string) => {
+  mocks.spawn.mockImplementation((command: string, args: string[] = [], options?: { env?: NodeJS.ProcessEnv }) => {
     const pid = 40_000 + children.length;
     if (command === '/fixture/Xvfb') mocks.xvfbPid = pid;
-    const child = Object.assign(new EventEmitter(), { command, pid, exitCode: null as number | null, signalCode: null as string | null, stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill(signal: string) { child.signalCode = signal; child.emit('exit', null, signal); return true; } });
+    const child = Object.assign(new EventEmitter(), { command, args, env: options?.env, pid, exitCode: null as number | null, signalCode: null as string | null, stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill(signal: string) { child.signalCode = signal; child.emit('exit', null, signal); return true; } });
     children.push(child);
     if (command === process.execPath) {
       const ready = () => child.stderr.write(`DevTools listening on ws://127.0.0.1:${port}/\n`);
@@ -101,6 +101,20 @@ describe('managed browser runtime lifecycle', () => {
       displays.forEach(display => { if (display !== null) releaseDisplay(display); });
     } finally { await f.cleanup(); }
   });
+  it('removes the logins Chrome saved in the profile before launching it, and nothing else', async () => {
+    const f = await fixture('FREELANCE_COPILOT');
+    try {
+      const profile = join(f.session.profilePath, 'Default');
+      await mkdir(profile, { recursive: true });
+      // A saved password is autofilled and reaches an agent's page snapshot (2026-10-19); synthetic files only.
+      for (const name of ['Login Data', 'Login Data-journal', 'Login Data For Account', 'Login Data For Account-wal', 'Cookies', 'Preferences']) {
+        await writeFile(join(profile, name), 'synthetic');
+      }
+      await f.manager.getActive(f.pane);
+      expect(f.children.filter(child => child.command === process.execPath)).toHaveLength(1);
+      expect((await readdir(profile)).sort()).toEqual(['Cookies', 'Preferences']);
+    } finally { await f.cleanup(); }
+  });
   it('finishes late stream cleanup after Chrome exits instead of blocking the next account', async () => {
     const f = await fixture();
     try {
@@ -132,6 +146,31 @@ describe('managed browser runtime lifecycle', () => {
       expect(f.children.filter(child => child.command === process.execPath)).toHaveLength(1);
       expect(f.children.every(child => child.exitCode !== null || child.signalCode !== null)).toBe(true);
     } finally { await f.cleanup(); }
+  });
+  it('starts a Freelance Copilot pane\'s Chrome with its per-platform routes, and other panes without them', async () => {
+    const freelance = await fixture('FREELANCE_COPILOT');
+    try {
+      await freelance.manager.getActive(freelance.pane);
+      const args = freelance.children.find(child => child.command === process.execPath)?.args ?? [];
+      const pacArg = args.find(arg => arg.startsWith('--proxy-pac-url=data:application/x-ns-proxy-autoconfig;base64,'));
+      expect(pacArg).toBeTruthy();
+      const pac = Buffer.from(pacArg!.split('base64,')[1]!, 'base64').toString('utf8');
+      expect(pac).toContain('["upwork.com","SOCKS5 10.254.242.2:1080"]');
+      expect(pac).toContain('return "SOCKS5 10.254.242.2:1080"');
+      expect(args).toContain('--force-webrtc-ip-handling-policy=disable_non_proxied_udp');
+      // The clock and languages of the Thailand exit; Chrome reports its own user agent and navigator values.
+      expect(args).toContain('--accept-lang=en-US,en,th');
+      expect(freelance.children.find(child => child.command === process.execPath)?.env?.TZ).toBe('Asia/Bangkok');
+      expect(args.some(arg => arg.startsWith('--user-agent'))).toBe(false);
+      expect(freelance.scriptSources.some(source => source.includes('navigator'))).toBe(false);
+    } finally { await freelance.cleanup(); }
+    const plain = await fixture('BROWSER');
+    try {
+      await plain.manager.getActive(plain.pane);
+      const args = plain.children.find(child => child.command === process.execPath)?.args ?? [];
+      expect(args.some(arg => arg.startsWith('--proxy-pac-url') || arg.startsWith('--accept-lang'))).toBe(false);
+      expect(plain.children.find(child => child.command === process.execPath)?.env?.TZ).toBe(process.env.TZ);
+    } finally { await plain.cleanup(); }
   });
   it('injects the YouTube ad-block document-start script by default', async () => {
     const f = await fixture();

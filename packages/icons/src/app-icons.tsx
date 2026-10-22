@@ -118,6 +118,8 @@ import {
   Link as LucideLink,
   ListFilter as LucideListFilter,
   ListTodo as LucideListTodo,
+  Vault as LucideVault,
+  ShieldOff as LucideShieldOff,
   Loader2 as LucideLoader2,
   Lock as LucideLock,
   LogOut as LucideLogOut,
@@ -142,7 +144,29 @@ import {
   Paperclip as LucidePaperclip,
   Pause as LucidePause,
   Pencil as LucidePencil,
+  Captions as LucideCaptions,
+  CaptionsOff as LucideCaptionsOff,
+  ChartColumn as LucideChartColumn,
+  MessageSquareText as LucideMessageSquareText,
+  MicOff as LucideMicOff,
+  PhoneOff as LucidePhoneOff,
+  Phone as LucidePhone,
+  Router as LucideRouter,
+  Maximize as LucideMaximize,
+  Minimize as LucideMinimize,
+  Presentation as LucidePresentation,
+  PenTool as LucidePenTool,
   Info as LucideInfo,
+  Briefcase as LucideBriefcase,
+  Megaphone as LucideMegaphone,
+  Handshake as LucideHandshake,
+  TabletSmartphone as LucideTabletSmartphone,
+  Gavel as LucideGavel,
+  NotebookPen as LucideNotebookPen,
+  Blend as LucideBlend,
+  ClipboardCheck as LucideClipboardCheck,
+  MessagesSquare as LucideMessagesSquare,
+  SquareCode as LucideSquareCode,
   TextCursorInput as LucideTextCursorInput,
   PictureInPicture as LucidePictureInPicture,
   PictureInPicture2 as LucidePictureInPicture2,
@@ -196,7 +220,6 @@ import {
   Highlighter as LucideHighlighter,
   ImagePlus as LucideImagePlus,
   PenLine as LucidePenLine,
-  Phone as LucidePhone,
   Slack as LucideSlack,
   SquarePen as LucideSquarePen,
   Redo2 as LucideRedo2,
@@ -209,7 +232,7 @@ import type { AppIconName } from "./app-icon-map.js";
 import { getLoadedAppIconPack, isAppIconPackReady, loadAppIconPack, type ModernIconPack } from "./icon-pack-registry.js";
 
 export type { LucideIcon, LucideProps } from "lucide-react";
-export { loadAppIconPack, type ModernIconPack } from "./icon-pack-registry.js";
+export { DEFAULT_ICON_PACK, loadAppIconPack, type ModernIconPack } from "./icon-pack-registry.js";
 
 const AppIconPackContext = createContext<ModernIconPack>("lucide");
 
@@ -229,34 +252,61 @@ export function AppIconProvider({ children, pack }: { children: ReactNode; pack:
   return <AppIconPackContext.Provider value={ready ? pack : "lucide"}>{children}</AppIconPackContext.Provider>;
 }
 
-const SpaceDumbbell = forwardRef<SVGSVGElement, LucideProps>(function SpaceDumbbell(
-  { size = 24, strokeWidth = 2, className, ...props },
-  ref
-) {
-  return (
-    <svg
-      {...props}
-      ref={ref}
-      viewBox="0 0 24 24"
-      width={size}
-      height={size}
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={strokeWidth}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={["lucide-dumbbell", className].filter(Boolean).join(" ")}
-      aria-hidden={props["aria-hidden"] ?? true}
-    >
-      <path d="M6 6v12" />
-      <path d="M2 9v6" />
-      <path d="M6 12h12" />
-      <path d="M18 6v12" />
-      <path d="M22 9v6" />
-    </svg>
-  );
-});
-SpaceDumbbell.displayName = "Dumbbell";
+// Space's own glyphs, drawn on the Lucide grid so every pack treats them like the rest.
+function spaceGlyph(name: string, className: string, children: ReactNode): LucideIcon {
+  const Glyph = forwardRef<SVGSVGElement, LucideProps>(function SpaceGlyph({ size = 24, strokeWidth = 2, className: extra, children: extraChildren, ...props }, ref) {
+    return (
+      <svg
+        {...props}
+        ref={ref}
+        viewBox="0 0 24 24"
+        width={size}
+        height={size}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={strokeWidth}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={["lucide", className, extra].filter(Boolean).join(" ")}
+        aria-hidden={props["aria-hidden"] ?? true}
+      >
+        {children}
+        {extraChildren}
+      </svg>
+    );
+  });
+  Glyph.displayName = name;
+  return Glyph as LucideIcon;
+}
+
+const SpaceDumbbell = spaceGlyph("Dumbbell", "lucide-dumbbell", <>
+  <path d="M6 6v12" />
+  <path d="M2 9v6" />
+  <path d="M6 12h12" />
+  <path d="M18 6v12" />
+  <path d="M22 9v6" />
+</>);
+// Agent Files: a folder holding what the agents made (the sparkle), never the File Manager's open folder.
+const SpaceAgentFiles = spaceGlyph("AgentFiles", "space-agent-files", <>
+  <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+  <path d="M12 9.5l1.1 2.9 2.9 1.1-2.9 1.1-1.1 2.9-1.1-2.9-2.9-1.1 2.9-1.1z" fill="currentColor" strokeWidth={1} />
+</>);
+// CLI floats: the controls that float over a CLI pane, a chip above the prompt.
+const SpaceCliFloats = spaceGlyph("CliFloats", "space-cli-floats", <>
+  <rect x="2" y="4" width="20" height="16" rx="2" />
+  <path d="m6 11 3 2.5L6 16" />
+  <rect x="13" y="7.5" width="5.5" height="3.5" rx="1" fill="currentColor" strokeWidth={1} />
+</>);
+// Nous, the mind of SpaceApp: a brain whose two halves hold a small 3D network of memory nodes (the nearest is the
+// largest), never Brain (memory) or BrainCircuit (the model).
+const SpaceNous = spaceGlyph("Nous", "space-nous", <>
+  <path d="M10.6 4.6C9.4 3.2 7.2 3.1 6.1 4.6C4.3 4.6 3.1 6.2 3.4 7.9C2.1 8.9 1.9 10.9 2.9 12.2C2.3 13.8 3.1 15.7 4.8 16.2C5.4 18.2 7.4 19.4 9.4 18.7C9.8 19 10.2 19.2 10.6 19.2Z" />
+  <path d="M13.4 4.6C14.6 3.2 16.8 3.1 17.9 4.6C19.7 4.6 20.9 6.2 20.6 7.9C21.9 8.9 22.1 10.9 21.1 12.2C21.7 13.8 20.9 15.7 19.2 16.2C18.6 18.2 16.6 19.4 14.6 18.7C14.2 19 13.8 19.2 13.4 19.2Z" />
+  <path d="M7.2 9.4H16.8L12 14.6Z" strokeWidth={1.25} />
+  <circle cx="7.2" cy="9.4" r="1.25" fill="currentColor" stroke="none" />
+  <circle cx="16.8" cy="9.4" r="1.25" fill="currentColor" stroke="none" />
+  <circle cx="12" cy="14.6" r="2" fill="currentColor" stroke="none" />
+</>);
 export const lucideIcons = {
   ArrowDown: LucideArrowDown,
   ArrowUpCircle: LucideArrowUpCircle,
@@ -274,7 +324,10 @@ export const lucideIcons = {
   Compass: LucideCompass,
   CornerLeftUp: LucideCornerLeftUp,
   CreditCard: LucideCreditCard,
-  Dumbbell: SpaceDumbbell as LucideIcon,
+  Dumbbell: SpaceDumbbell,
+  AgentFiles: SpaceAgentFiles,
+  CliFloats: SpaceCliFloats,
+  Nous: SpaceNous,
   FileAudio: LucideFileAudio,
   FileCode: LucideFileCode,
   FileJson: LucideFileJson,
@@ -364,6 +417,8 @@ export const lucideIcons = {
   Link: LucideLink,
   ListFilter: LucideListFilter,
   ListTodo: LucideListTodo,
+  Vault: LucideVault,
+  ShieldOff: LucideShieldOff,
   Loader2: LucideLoader2,
   Lock: LucideLock,
   LogOut: LucideLogOut,
@@ -388,7 +443,29 @@ export const lucideIcons = {
   Paperclip: LucidePaperclip,
   Pause: LucidePause,
   Pencil: LucidePencil,
+  Captions: LucideCaptions,
+  CaptionsOff: LucideCaptionsOff,
+  ChartColumn: LucideChartColumn,
+  MessageSquareText: LucideMessageSquareText,
+  MicOff: LucideMicOff,
+  PhoneOff: LucidePhoneOff,
+  Phone: LucidePhone,
+  Router: LucideRouter,
+  Maximize: LucideMaximize,
+  Minimize: LucideMinimize,
+  Presentation: LucidePresentation,
+  PenTool: LucidePenTool,
   Info: LucideInfo,
+  Briefcase: LucideBriefcase,
+  Megaphone: LucideMegaphone,
+  Handshake: LucideHandshake,
+  TabletSmartphone: LucideTabletSmartphone,
+  Gavel: LucideGavel,
+  NotebookPen: LucideNotebookPen,
+  Blend: LucideBlend,
+  ClipboardCheck: LucideClipboardCheck,
+  MessagesSquare: LucideMessagesSquare,
+  SquareCode: LucideSquareCode,
   TextCursorInput: LucideTextCursorInput,
   Pin: LucidePin,
   PinOff: LucidePinOff,
@@ -478,6 +555,9 @@ export const {
   CornerLeftUp,
   CreditCard,
   Dumbbell,
+  AgentFiles,
+  CliFloats,
+  Nous,
   FileAudio,
   FileCode,
   FileJson,
@@ -568,6 +648,8 @@ export const {
   Link,
   ListFilter,
   ListTodo,
+  Vault,
+  ShieldOff,
   Loader2,
   Lock,
   LogOut,
@@ -592,7 +674,29 @@ export const {
   Paperclip,
   Pause,
   Pencil,
+  Captions,
+  CaptionsOff,
+  ChartColumn,
+  MessageSquareText,
+  MicOff,
+  PhoneOff,
+  Phone,
+  Router,
+  Maximize,
+  Minimize,
+  Presentation,
+  PenTool,
   Info,
+  Briefcase,
+  Megaphone,
+  Handshake,
+  TabletSmartphone,
+  Gavel,
+  NotebookPen,
+  Blend,
+  ClipboardCheck,
+  MessagesSquare,
+  SquareCode,
   TextCursorInput,
   Pin,
   PinOff,
@@ -665,7 +769,6 @@ export const PenLine = LucidePenLine;
 export const Redo2 = LucideRedo2;
 export const Type = LucideType;
 // Dot pane header and info card (Space Dots Stage 8).
-export const Phone = LucidePhone;
 export const Slack = LucideSlack;
 export const SquarePen = LucideSquarePen;
 

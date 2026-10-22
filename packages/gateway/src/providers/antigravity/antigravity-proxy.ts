@@ -10,12 +10,13 @@ import { outputPolicyText, requestOutputPolicy, withGeminiOutputPolicy } from ".
 import { effectiveCompression, requestCompressionMode, type EffectiveCompression } from "../../compression/provider-settings.js";
 import { compressionDetail, compressionRows, compressionSignalRows } from "../../compression/recorder.js";
 import type { TokenizerKind } from "../../compression/tokenizer.js";
+import { geminiCostUsd } from "../../pricing/pricing.js";
 import { hashKey, header, readBounded } from "../../proxy-util.js";
 import type { RequestLogWriter } from "../../request-log-writer.js";
-import { selectAccount } from "../../router/balancer.js";
-import { CODE_ASSIST_BASE_URL, quotaGroupForModel, type AntigravityQuotaGroup } from "./code-assist.js";
+import { CODE_ASSIST_BASE_URL, quotaGroupForModel } from "./code-assist.js";
 import { ANTIGRAVITY_CLIENT_ID } from "./oauth.js";
-import { CodeAssistStreamInspector, parseResetsIn, type GeminiUsage } from "./stream.js";
+import { createAntigravityPoolAccess } from "./pool-access.js";
+import { CodeAssistStreamInspector, type GeminiUsage } from "./stream.js";
 
 /**
  * Antigravity through Space Gateway. The CLI is pointed here with `CLOUD_CODE_URL=http://127.0.0.1:4920/antigravity`.
@@ -95,6 +96,7 @@ export function registerAntigravityProxyRoutes(app: FastifyInstance, options: An
   const sticky = options.sticky ?? new StickyStore({ provider: "ANTIGRAVITY", kind: "PROMPT_CACHE" });
   const verify = options.verifyIdentity ?? ((token: string) => googleTokenInfo(token, fetchImpl));
   const identities = new Map<string, { at: number; allowed: boolean }>();
+  const { pick, ...access } = createAntigravityPoolAccess({ pool: options.pool, repository: options.repository, sticky, now });
 
   /** Whether the client's Google sign-in is one of the pool's accounts (and was issued to the Antigravity client). */
   async function pooled(token: string): Promise<boolean> {
@@ -110,7 +112,8 @@ export function registerAntigravityProxyRoutes(app: FastifyInstance, options: An
     return allowed;
   }
 
-  async function passthrough(request: FastifyRequest, reply: FastifyReply, upstreamPath: string, body: Buffer | undefined) {
+  async function passthrough(request: FastifyRequest, reply: FastifyReply, upstreamPath: string, body: Buffer | undefined, logCall = false) {
+    const startedAt = now();
     let upstream: Response;
     try {
       upstream = await fetchImpl(`${baseUrl}${upstreamPath}`, { method: request.method, headers: forwardHeaders(request.headers, null),
@@ -122,31 +125,35 @@ export function registerAntigravityProxyRoutes(app: FastifyInstance, options: An
     const headers: Record<string, string> = {};
     upstream.headers.forEach((value, name) => { if (!hopByHop.has(name) && name !== "content-encoding") headers[name] = value; });
     reply.raw.writeHead(upstream.status, headers);
+    const inspector = logCall ? new CodeAssistStreamInspector() : null;
+    let firstTokenAt: number | null = null;
     if (upstream.body) {
       const reader = upstream.body.getReader();
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (inspector?.push(value) && firstTokenAt === null) firstTokenAt = now();
         reply.raw.write(value);
       }
     }
     reply.raw.end();
-    return reply;
-  }
-
-  async function pick(group: AntigravityQuotaGroup, tried: Set<string>, stickyHash: string | null, settings: GatewaySettings): Promise<GatewayAccountRecord | undefined> {
-    const accounts = (await options.pool.accounts()).filter((account) => !tried.has(account.id));
-    const states = accounts.map((account) => options.pool.toBalancerState(account, group));
-    const stickyId = stickyHash ? await sticky.get(stickyHash) : undefined;
-    const stickyState = stickyId ? states.find((state) => state.accountId === stickyId) : undefined;
-    if (stickyState) {
-      const check = selectAccount([stickyState], { now: now() / 1000, routingStrategy: "SINGLE_ACCOUNT", allowUsageExhaustionError: false });
-      const used = Math.max(stickyState.usedPercent ?? 0, stickyState.secondaryUsedPercent ?? 0);
-      if (check.account && used < settings.stickyReallocationBudgetThresholdPercent) return accounts.find((account) => account.id === stickyState.accountId);
+    inspector?.end();
+    if (inspector) {
+      let requested: string | null = null;
+      try { const model = (JSON.parse(body!.toString("utf8")) as Json).model; requested = typeof model === "string" ? model : null; } catch { /* not JSON */ }
+      const model = inspector.model ?? requested ?? "unknown";
+      const usage = inspector.usage;
+      const failed = !upstream.ok || (inspector.errorStatus !== null && !inspector.outputStarted);
+      options.logs.add({
+        requestId: `req_${randomUUID().replace(/-/g, "")}`, requestedAt: new Date(startedAt).toISOString(), provider: "ANTIGRAVITY", accountId: null,
+        apiKeyId: null, model, reasoningEffort: null, serviceTier: null, transport: "http", status: failed ? "error" : "success",
+        errorCode: failed ? `http_${inspector.errorStatus ?? upstream.status}` : null, latencyMs: now() - startedAt,
+        firstTokenMs: firstTokenAt === null ? null : firstTokenAt - startedAt, inputTokens: usage?.promptTokens ?? null,
+        cachedInputTokens: usage?.cachedTokens ?? null, outputTokens: usage?.outputTokens ?? null, reasoningTokens: usage?.thoughtsTokens ?? null,
+        costUsd: geminiCostUsd(usage, model), compressionTokensSaved: null, stickyKind: null, stickyKeyHash: null, ...requestOrigin(request)
+      });
     }
-    const result = selectAccount(states, { now: now() / 1000, routingStrategy: settings.routingStrategy, preferEarlierReset: settings.preferEarlierReset });
-    for (const state of states) options.pool.absorb(state);
-    return result.account ? accounts.find((account) => account.id === result.account!.accountId) : undefined;
+    return reply;
   }
 
   /**
@@ -201,7 +208,9 @@ export function registerAntigravityProxyRoutes(app: FastifyInstance, options: An
     const upstreamPath = request.url.replace(/^\/antigravity/, "") || "/";
     const raw = Buffer.isBuffer(request.body) ? request.body : undefined;
     const method = /^\/v1internal:([A-Za-z]+)/.exec(upstreamPath)?.[1] ?? "";
-    if (request.method !== "POST" || !MODEL_METHODS.has(method) || !raw || !(await pooled(token))) return passthrough(request, reply, upstreamPath, raw);
+    if (request.method !== "POST" || !MODEL_METHODS.has(method) || !raw) return passthrough(request, reply, upstreamPath, raw);
+    // A model call on an account outside the pool goes through as it is, but is logged so its tokens still count.
+    if (!(await pooled(token))) return passthrough(request, reply, upstreamPath, raw, true);
 
     let body: Json;
     try { body = JSON.parse(raw.toString("utf8")) as Json; } catch { return passthrough(request, reply, upstreamPath, raw); }
@@ -222,7 +231,7 @@ export function registerAntigravityProxyRoutes(app: FastifyInstance, options: An
         model: extra.model ?? model ?? "unknown", reasoningEffort: null, serviceTier: null, transport: "http", upstreamTransport: "http", status, errorCode,
         errorMessage: extra.errorMessage ?? null, latencyMs: now() - startedAt, firstTokenMs: extra.firstTokenMs ?? null,
         inputTokens: usage?.promptTokens ?? null, cachedInputTokens: usage?.cachedTokens ?? null, outputTokens: usage?.outputTokens ?? null,
-        reasoningTokens: usage?.thoughtsTokens ?? null, costUsd: null, compressionTokensSaved: account ? compressed.saved : null, planType: account?.planType ?? null,
+        reasoningTokens: usage?.thoughtsTokens ?? null, costUsd: geminiCostUsd(usage, extra.model ?? model), compressionTokensSaved: account ? compressed.saved : null, planType: account?.planType ?? null,
         stickyKeySource: sessionId ? "request.sessionId" : null, stickyKind: stickyHash ? "PROMPT_CACHE" : null, stickyKeyHash: stickyHash ? stickyHash.slice(0, 16) : null,
         ...origin, compressionTokensBefore: compressed.measured?.before ?? null, compressionTokensAfter: compressed.measured?.after ?? null,
         compressionDetail: compressed.detail
@@ -297,6 +306,7 @@ export function registerAntigravityProxyRoutes(app: FastifyInstance, options: An
         return reply;
       }
       if (movedOn) continue;
+      inspector.end();
       if (!committed) commit();
       reply.raw.end();
       const failed = inspector.errorStatus !== null && !inspector.outputStarted;
@@ -317,35 +327,15 @@ export function registerAntigravityProxyRoutes(app: FastifyInstance, options: An
 
     /** Notes what the failure says about the account; returns whether another account may serve the request. */
     async function recordFailure(account: GatewayAccountRecord, status: number, text: string): Promise<boolean> {
-      let message = "";
-      try { message = String(((JSON.parse(text) as Json).error as Json | undefined)?.message ?? ""); } catch { message = text.slice(0, 300); }
-      if (status === 429) {
-        const resetIn = parseResetsIn(message);
-        const quota = /quota|RESOURCE_EXHAUSTED/i.test(message) || text.includes("RESOURCE_EXHAUSTED");
-        if (quota) {
-          await options.repository.saveUsageWindows(account.id, [{ quotaKey: group, window: "PRIMARY", usedPercent: 100,
-            resetAt: new Date(now() + (resetIn ?? 3600) * 1000).toISOString(), windowMinutes: 300 }]);
-          options.pool.invalidate();
-        } else {
-          options.pool.markTransientError(account.id);
-        }
-        return true;
-      }
-      if (status === 401) {
-        retryWith = await options.pool.refreshRejectedToken(account, "token_invalidated");
-        return true;
-      }
-      if (status === 403 || status >= 500) {
-        options.pool.markTransientError(account.id);
-        return true;
-      }
-      return false;
+      const outcome = await access.recordFailure(account, group, status, text);
+      if (outcome.retryWith !== undefined) retryWith = outcome.retryWith;
+      return outcome.failover;
     }
   }
 
   app.register(async (scope) => {
     scope.removeAllContentTypeParsers();
-    scope.addContentTypeParser("*", { parseAs: "buffer", bodyLimit: 64 * 1024 * 1024 }, (_request, payload, done) => done(null, payload));
+    scope.addContentTypeParser("*", { parseAs: "buffer", bodyLimit: 32 * 1024 * 1024 }, (_request, payload, done) => done(null, payload));
     scope.all("/antigravity/*", handle);
   });
 }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ import {
   inspectSystemResources,
   loadConfig,
   prepareInstallation,
+  writeRuntimeFiles,
   renderHostAccessCompose,
   resolveInstallAccessMode,
   resolveInstallProfile,
@@ -170,6 +171,19 @@ test("workspace registration accepts only existing absolute directories and avoi
   await assert.rejects(() => addWorkspace(config, "relative/project"), /absolute/i);
 });
 
+test("workspaces with the same folder name get distinct container paths, and dot names are not used", async () => {
+  const root = await mkdtemp(join(tmpdir(), "spaceapp-workspace-"));
+  await mkdir(join(root, "a", "project"), { recursive: true });
+  await mkdir(join(root, "b", "project"), { recursive: true });
+  await mkdir(join(root, "-..-"));
+  const config = await addWorkspace(await addWorkspace(createDefaultConfig({ version: "0.1.0" }), join(root, "a", "project")), join(root, "b", "project"));
+  const [first, second] = config.workspaces;
+  assert.equal(first.containerPath, "/workspaces/project");
+  assert.equal(second.containerPath, `/workspaces/${second.id}`);
+  const dots = await addWorkspace(createDefaultConfig({ version: "0.1.0" }), join(root, "-..-"));
+  assert.equal(dots.workspaces[0].containerPath, "/workspaces/workspace");
+});
+
 test("saved config rejects secret-shaped fields", async () => {
   const root = await mkdtemp(join(tmpdir(), "spaceapp-secret-config-"));
   const config = {
@@ -199,6 +213,7 @@ test("initialization creates idempotent secrets with container-readable POSIX pe
 
   assert.equal(first.setupToken?.length > 30, true);
   assert.equal(second.setupToken, null);
+  assert.match(await readFile(join(root, "seccomp-cli.json"), "utf8"), /"unshare"/);
   assert.equal(
     await readFile(join(root, "secrets", "postgres-password"), "utf8"),
     passwordBefore
@@ -267,6 +282,22 @@ test("initialization synchronizes an existing install to the launcher version an
     passwordBefore
   );
   assert.deepEqual(await loadConfig(root), result.config);
+});
+
+test("installation preparation makes a secrets folder that already existed owner-only (review INT5-C-F21)", {
+  skip: process.platform === "win32" ? "Windows has no POSIX modes" : false
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "spaceapp-prepare-secrets-mode-"));
+  await mkdir(join(root, "secrets"));
+  await chmod(join(root, "secrets"), 0o755);
+  const prepared = await prepareInstallation(root, { version: "1.1.7", profile: "light" });
+  assert.equal((await stat(join(root, "secrets"))).mode & 0o777, 0o700);
+  assert.equal((await stat(join(root, "secrets", "providers"))).mode & 0o777, 0o700);
+  await assertContainerSecretFile(join(root, "secrets", "postgres-password"));
+  // An existing installation is fixed by the next command that writes its runtime files (update, up, repair).
+  await chmod(join(root, "secrets"), 0o755);
+  await writeRuntimeFiles(root, prepared.config);
+  assert.equal((await stat(join(root, "secrets"))).mode & 0o777, 0o700);
 });
 
 test("installation preparation defers committed version and runtime changes", async () => {

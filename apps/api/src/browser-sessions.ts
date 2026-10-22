@@ -1,5 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawn } from "./safe-child-process.js";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { accessSync, constants, createReadStream, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, readlink, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -9,11 +10,14 @@ import { nanoid } from "nanoid";
 import type { BrowserHostActorContext, BrowserHostCaptureMetrics } from "@space/browser-host";
 import {
   browserFrameSchema,
+  freelanceEgressPac,
+  resolveFreelanceCopilotPaneMetadata,
   browserRecordingFrameSummarySchema,
   browserTimelineEventSummarySchema,
   browserToolActionResultSchema,
   paneBrowserSessionResponseSchema,
   type AcquireBrowserControlInput,
+  type FreelanceEgressRoute,
   type BrowserCaptureJob,
   type BrowserCaptureOptions,
   type BrowserCaptureSegment,
@@ -36,6 +40,9 @@ import {
   type PaneBrowserSession,
   type PaneBrowserSessionResponse
 } from "@space/contracts";
+import type { VaultHostFillResult, VaultHostTarget } from "@space/contracts";
+import { VAULT_BROKER_HOST_SOCKET_PATH, createSocketVaultBroker, sealedFillBroker } from "./vault/broker-client.js";
+import { readVaultTarget, runSealedFill, type SealedFillPage } from "./vault/sealed-fill.js";
 import { SpaceConflictError, SpaceFeatureDisabledError, SpaceNotFoundError, makeSpaceId, nowIso, redactMemoryText, type SpaceStore } from "@space/runtime";
 import { BrowserControlHeldError } from "./browser-errors.js";
 import type { SpaceApiConfig } from "./config.js";
@@ -64,6 +71,10 @@ interface ViewportSize {
 }
 
 const DEEPSEEK_HARNESS_BROWSER_ORIGIN = "http://10.254.240.21:3080";
+
+/** Chrome's saved-login stores in a profile (and their SQLite side files). */
+export const CHROME_SAVED_LOGIN_FILES = ["Login Data", "Login Data For Account"]
+  .flatMap(store => ["", "-journal", "-wal", "-shm"].map(suffix => store + suffix));
 
 export interface BrowserStreamProfile {
   requestedMode: BrowserStreamMode;
@@ -123,9 +134,9 @@ export class BrowserCapacityGate {
     this.sessions.delete(key);
   }
 
-  acquireLive(key: string): boolean {
+  acquireLive(key: string, limit = this.maxLiveWorkloads): boolean {
     if (this.liveWorkloads.has(key)) return true;
-    if (this.liveWorkloads.size >= this.maxLiveWorkloads) return false;
+    if (this.liveWorkloads.size >= limit) return false;
     this.liveWorkloads.add(key);
     return true;
   }
@@ -197,6 +208,8 @@ interface BrowserStreamSubscriber {
 }
 
 interface BrowserProfileRuntime {
+  /** The proxy routes this Chrome started with (Freelance Copilot per-platform egress); null: no proxy. */
+  egressKey?: string | null;
   process: ChildProcessWithoutNullStreams;
   xvfb?: ChildProcessWithoutNullStreams;
   display?: number;
@@ -226,7 +239,25 @@ interface BrowserRuntime {
   screencastActive: boolean;
   streamSequence: number;
   detachDiagnostics: () => void;
+  /** Chrome profiles of the pane's tabs in other Google accounts, by profile path. */
+  accountTabs: Map<string, BrowserAccountTab>;
+  /** Tab -> profile path of a tab in another account's Chrome; the pane's own tabs are absent. */
+  pageProfiles: Map<string, string>;
+  /** Serializes joining, switching and leaving account Chromes. */
+  accountWork: Promise<unknown>;
+  /** Set by a Vault sealed fill: this page keeps no console or network entries from then on (ADR-012). */
+  vaultProtected?: boolean;
 }
+
+/** Another Google account's Chrome (shared with the panes that use that account) holding some of a pane's tabs. */
+interface BrowserAccountTab {
+  profile: BrowserProfileRuntime;
+  account: { profileId: string; label: string | null };
+  detach: () => void;
+}
+
+/** Server-derived identity of an account tab's Chrome profile, kept so a restart reopens the tab in its account. */
+export type BrowserAccountTabIdentity = Pick<StartBrowserSessionInput, "googleAccount" | "sharedProfileKey" | "profileKey">;
 
 export interface BrowserSessionStatus {
   enabled: boolean;
@@ -252,6 +283,12 @@ export interface StartBrowserSessionInput {
   streamMode?: BrowserStreamMode;
   ownerAgentId?: string | null;
   includeInitialFrame?: boolean;
+  /**
+   * Moves a tab of the running pane into the Google account named by the identity fields above (profileId null:
+   * back to the pane's account) instead of starting the pane. It travels in the start input, so the Browser Host IPC
+   * is unchanged; a host that predates it ignores it, so callers check that page summaries carry `account` first.
+   */
+  accountTab?: { pageId: string; profileId: string | null; label: string | null; url?: string | null };
   traceId: string;
 }
 
@@ -323,6 +360,9 @@ export interface BrowserSessionManager {
   cancelCapture?(pane: Pane, jobId: string, traceId: string, context?: BrowserHostActorContext): Promise<BrowserCaptureJob>;
   recoverCaptureJobs?(): Promise<{ failedSegments: number; requeuedJobs: string[] }>;
   diagnostics?(pane: Pane, includeNetwork: boolean, limit: number): Promise<{ sessionId: string; events: Array<Record<string, unknown>> }>;
+  /** Vault sealed fill (ADR-012); only the Browser Host process implements them. */
+  vaultTarget?(pane: Pane): Promise<VaultHostTarget>;
+  vaultFill?(pane: Pane, request: unknown, traceId: string): Promise<VaultHostFillResult>;
   /** Verifies the account's profile with Google; launches it only when `launch` is true and no pane is using it. */
   checkGoogleAccount?(identity: GoogleAccountBrowserIdentity, launch: boolean, context?: BrowserHostActorContext): Promise<GoogleAccountBrowserCheckResult>;
   /**
@@ -340,7 +380,7 @@ const viewportSizes: Record<BrowserSessionViewport, ViewportSize> = {
 };
 
 const displayBase = 100;
-const displayCapacity = 8;
+const displayCapacity = 10;
 const usedDisplays = new Set<number>();
 
 export const browserSessionDisplayBase = displayBase;
@@ -435,6 +475,55 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   return Promise.race([promise, timeoutPromise]).finally(() => {
     if (timeout) clearTimeout(timeout);
   });
+}
+
+interface BrowserFrameTreeNode { frame: { id: string }; childFrames?: BrowserFrameTreeNode[] }
+// The masked screenshot's style (Vault fence, 2026-10-19): every form field, text area and editable area drawn as dots,
+// including a password field a "show password" toggle turned into text. Applied for one shot, then removed.
+const VAULT_MASK_CSS = "input,textarea,select,[contenteditable]:not([contenteditable=false]),[contenteditable]:not([contenteditable=false]) *"
+  + "{-webkit-text-security:disc!important}";
+export const VAULT_MASK_APPLY = `(() => { let s = document.getElementById("__space_vault_mask"); if (!s) { s = document.createElement("style");
+  s.id = "__space_vault_mask"; (document.head || document.documentElement).appendChild(s); } s.textContent = ${JSON.stringify(VAULT_MASK_CSS)};
+  return getComputedStyle(document.documentElement) !== null; })()`;
+export const VAULT_MASK_REMOVE = `(() => { document.getElementById("__space_vault_mask")?.remove(); return true; })()`;
+
+/**
+ * A PNG (base64) of the page with every form field, text area and editable area drawn as dots (Vault fence, 2026-10-19):
+ * the mask goes into an isolated world of every frame of this page for this one shot and is removed after it. Without the
+ * mask on the page's own frame nothing is captured; a frame of another process (out of this session) holds nothing a fill
+ * of this page typed.
+ */
+export async function captureMaskedScreenshot(send: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>): Promise<string> {
+  const tree = await send<{ frameTree: BrowserFrameTreeNode }>("Page.getFrameTree");
+  const frameIds: string[] = [];
+  const walk = (node: BrowserFrameTreeNode) => { frameIds.push(node.frame.id); for (const child of node.childFrames ?? []) walk(child); };
+  walk(tree.frameTree);
+  const contexts: number[] = [];
+  try {
+    for (const [index, frameId] of frameIds.entries()) {
+      try {
+        const world = await send<{ executionContextId: number }>("Page.createIsolatedWorld", { frameId, worldName: "space-vault-mask" });
+        const applied = await send<{ result?: { value?: unknown } }>("Runtime.evaluate", { contextId: world.executionContextId, returnByValue: true, expression: VAULT_MASK_APPLY });
+        if (applied.result?.value !== true) throw new Error("mask not applied");
+        contexts.push(world.executionContextId);
+      } catch (error) {
+        if (index === 0) throw new SpaceConflictError(`The masked screenshot could not mask the page: ${error instanceof Error ? error.message : "unknown"}.`);
+      }
+    }
+    return (await send<{ data: string }>("Page.captureScreenshot", { format: "png", captureBeyondViewport: false })).data;
+  } finally {
+    for (const contextId of contexts) await send("Runtime.evaluate", { contextId, expression: VAULT_MASK_REMOVE }).catch(() => undefined);
+  }
+}
+
+/** Enter (with its submit char), Tab or Shift+Tab as real key events in the page. */
+export async function pressBrowserKey(client: { send<T = unknown>(method: string, params?: Record<string, unknown>, sessionId?: string): Promise<T> }, sessionId: string,
+  key: "Enter" | "Tab" | "Shift+Tab"): Promise<void> {
+  const name = key === "Enter" ? "Enter" : "Tab";
+  const base = { key: name, code: name, windowsVirtualKeyCode: name === "Enter" ? 13 : 9, modifiers: key === "Shift+Tab" ? 8 : 0 };
+  await client.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, sessionId);
+  if (name === "Enter") await client.send("Input.dispatchKeyEvent", { type: "char", text: "\r", ...base }, sessionId);
+  await client.send("Input.dispatchKeyEvent", { type: "keyUp", ...base }, sessionId);
 }
 
 function sanitizeSegment(value: string): string {
@@ -1020,10 +1109,12 @@ export function browserSessionNeedsNavigation<TSession extends Pick<PaneBrowserS
 export function browserSessionRestoreUrls(
   session: Pick<PaneBrowserSession, "activePageId" | "currentUrl" | "pages" | "status">
 ): { activeUrl: string | null; backgroundUrls: string[] } {
+  // Tabs in another Google account reopen in that account's Chrome, never in the pane's.
   const persisted = session.pages
-    .filter((page): page is typeof page & { url: string } => Boolean(page.url && /^https?:\/\//i.test(page.url)))
+    .filter((page): page is typeof page & { url: string } => Boolean(!page.account && page.url && /^https?:\/\//i.test(page.url)))
     .slice(0, 100);
   const active = persisted.find((page) => page.pageId === session.activePageId || page.isActive);
+  const accountTabActive = session.pages.some((page) => page.account && (page.pageId === session.activePageId || page.isActive));
   // A navigation owns the active page: it is about to load it, or Chrome died
   // before the navigation committed (never reload a target that may crash it).
   // The background tabs are unrelated to the navigation and are still restored.
@@ -1033,7 +1124,8 @@ export function browserSessionRestoreUrls(
       backgroundUrls: Array.from(new Set(persisted.filter((page) => page !== active && page.url !== active?.url).map((page) => page.url)))
     };
   }
-  const activeUrl = active?.url ?? (session.currentUrl && /^https?:\/\//i.test(session.currentUrl) ? session.currentUrl : null);
+  const activeUrl = active?.url ?? (accountTabActive ? persisted[0]?.url ?? null
+    : session.currentUrl && /^https?:\/\//i.test(session.currentUrl) ? session.currentUrl : null);
   const backgroundUrls = Array.from(new Set(
     persisted.filter((page) => page !== active).map((page) => page.url).filter((url) => url !== activeUrl)
   ));
@@ -1357,6 +1449,16 @@ function windowsVirtualKeyCodeFor(key: string, code: string | undefined): number
   return 0;
 }
 
+/**
+ * The clock and languages of a Freelance route's exit country, so pages show the time and language the exit implies
+ * (English first: the operator's accounts are in English). Direct is this server's own zone.
+ * shortcut: Mullvad and Nord rotate cities, so they keep the server's zone; map them when a route pins one country.
+ */
+const egressLocales: Partial<Record<FreelanceEgressRoute, { timeZone: string; acceptLang: string }>> = {
+  thailand: { timeZone: "Asia/Bangkok", acceptLang: "en-US,en,th" },
+  greece: { timeZone: "Europe/Athens", acceptLang: "en-US,en,el" }
+};
+
 export function googleBrowserProfilePathFor(profileRoot: string, ownerUserId: string, accountId: string): string {
   if (!ownerUserId || !/^google_account:[A-Za-z0-9_-]+$/.test(accountId)) throw new SpaceConflictError("Invalid Google account profile identity.");
   const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -1374,6 +1476,35 @@ export function browserProfilePathFor(profileRoot: string, roomId: string, paneI
   if (profileKey == null) return root;
   if (!/^[a-f0-9]{64}$/.test(profileKey)) throw new Error("Invalid browser account profile scope.");
   return join(root, "accounts", profileKey);
+}
+
+/** The Chrome profile of an account identity: a Google account's, a shared CLI account's or one of the pane's own. */
+export function browserProfilePathForIdentity(profileRoot: string, pane: Pick<Pane, "id" | "roomId">, identity: BrowserAccountTabIdentity): string {
+  return identity.googleAccount
+    ? googleBrowserProfilePathFor(profileRoot, identity.googleAccount.ownerUserId, identity.googleAccount.accountId)
+    : identity.sharedProfileKey
+      ? sharedCliProfilePathFor(profileRoot, identity.sharedProfileKey)
+      : browserProfilePathFor(profileRoot, pane.roomId, pane.id, identity.profileKey);
+}
+
+// Server-only record of the account tabs' identities, outside every Chrome profile (a pane's own profile is its
+// directory, and adopting a sign-in moves that directory into a shared account).
+export const browserAccountTabsFile = (profileRoot: string, paneId: string) => join(profileRoot, "account-tabs", `${sanitizeSegment(paneId)}.json`);
+
+/** The identity behind each of a pane's account tabs, keyed by the tab's account profile id. */
+export async function readBrowserAccountTabIdentities(profileRoot: string, paneId: string): Promise<Record<string, BrowserAccountTabIdentity>> {
+  const raw = await readFile(browserAccountTabsFile(profileRoot, paneId), "utf8").catch(() => null);
+  const parsed = (() => { try { return raw ? JSON.parse(raw) as { accounts?: unknown } : null; } catch { return null; } })();
+  const result: Record<string, BrowserAccountTabIdentity> = {};
+  const key = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+  for (const [profileId, value] of Object.entries(parsed?.accounts && typeof parsed.accounts === "object" ? parsed.accounts : {})) {
+    const entry = value as Record<string, unknown> & { googleAccount?: Record<string, unknown> };
+    if (entry.googleAccount && typeof entry.googleAccount.ownerUserId === "string" && typeof entry.googleAccount.accountId === "string") {
+      result[profileId] = { googleAccount: { ownerUserId: entry.googleAccount.ownerUserId, accountId: entry.googleAccount.accountId } };
+    } else if (key(entry.sharedProfileKey)) result[profileId] = { sharedProfileKey: entry.sharedProfileKey as string };
+    else if (entry.profileKey === null || key(entry.profileKey)) result[profileId] = { profileKey: entry.profileKey as string | null };
+  }
+  return result;
 }
 
 export async function dispatchBrowserRuntimeInput(
@@ -1600,11 +1731,7 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     return next;
   }
   function profilePathForInput(input: StartBrowserSessionInput): string {
-    return input.googleAccount
-      ? googleBrowserProfilePathFor(config.browserSessionsProfileRoot, input.googleAccount.ownerUserId, input.googleAccount.accountId)
-      : input.sharedProfileKey
-        ? sharedCliProfilePathFor(config.browserSessionsProfileRoot, input.sharedProfileKey)
-        : browserProfilePathFor(config.browserSessionsProfileRoot, input.pane.roomId, input.pane.id, input.profileKey);
+    return browserProfilePathForIdentity(config.browserSessionsProfileRoot, input.pane, input);
   }
   /** Account identity of a start request; panes with the same identity share one Chrome. */
   function profileIdentityForInput(input: StartBrowserSessionInput): string | null {
@@ -1965,7 +2092,7 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
   // Sessions this process is navigating right now (a count, for overlapping navigations).
   const navigationsInFlight = new Map<string, number>();
   const tickets = new Map<string, { paneId: string; sessionId: string; expiresAt: number }>();
-  const capacity = new BrowserCapacityGate(8, 4);
+  const capacity = new BrowserCapacityGate(10, 4);
   const captureQueue: string[] = [];
   const captureCommands = new Map<string, "STOP" | "CANCEL">();
   const requestGuard = new BrowserRequestGuard([
@@ -1988,38 +2115,32 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     return metrics;
   }
 
+  // Every command is written before this returns (in order), but none is awaited one by one: a popup that
+  // waits for the debugger answers them only after Runtime.runIfWaitingForDebugger, which claimPage sends next.
   async function enablePageSecurity(client: CdpClient, cdpSessionId: string): Promise<void> {
-    await client.send("Page.enable", {}, cdpSessionId);
-    await client.send("Runtime.enable", {}, cdpSessionId);
-    await client.send("Network.enable", {}, cdpSessionId);
-    await client.send("Fetch.enable", {
-      patterns: [
-        { urlPattern: "http://*/*", requestStage: "Request" },
-        { urlPattern: "https://*/*", requestStage: "Request" }
-      ]
-    }, cdpSessionId);
-    await client.send("Page.addScriptToEvaluateOnNewDocument", {
-      source: [
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
-        "Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });",
-        "Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });",
-        "window.chrome = window.chrome || { runtime: {} };"
-      ].join(" ")
-    }, cdpSessionId).catch(() => undefined);
-    if (config.browserSessionsYouTubeAdBlockEnabled) {
-      await client.send("Page.addScriptToEvaluateOnNewDocument", {
-        source: youTubeAdBlockScript()
-      }, cdpSessionId).catch(() => undefined);
-    }
+    await Promise.all([
+      client.send("Page.enable", {}, cdpSessionId),
+      client.send("Runtime.enable", {}, cdpSessionId),
+      client.send("Network.enable", {}, cdpSessionId),
+      client.send("Fetch.enable", {
+        patterns: [
+          { urlPattern: "http://*/*", requestStage: "Request" },
+          { urlPattern: "https://*/*", requestStage: "Request" }
+        ]
+      }, cdpSessionId),
+      config.browserSessionsYouTubeAdBlockEnabled
+        ? client.send("Page.addScriptToEvaluateOnNewDocument", { source: youTubeAdBlockScript() }, cdpSessionId).catch(() => undefined)
+        : undefined
+    ]);
   }
 
-  async function handlePausedRequest(runtime: BrowserRuntime, event: CdpEvent): Promise<void> {
+  async function handlePausedRequest(runtime: BrowserRuntime, client: CdpClient, event: CdpEvent): Promise<void> {
     const requestId = event.params?.requestId;
     const request = event.params?.request as { url?: unknown } | undefined;
     if (typeof requestId !== "string" || typeof request?.url !== "string" || !event.sessionId) return;
     try {
       await requestGuard.assertAllowed(request.url);
-      await runtime.client.send("Fetch.continueRequest", { requestId }, event.sessionId);
+      await client.send("Fetch.continueRequest", { requestId }, event.sessionId);
     } catch (error) {
       const hostname = (() => {
         try { return new URL(request.url).hostname; } catch { return "invalid"; }
@@ -2032,7 +2153,7 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
         hostname,
         errorCode: error instanceof SpaceFeatureDisabledError ? error.errorCode : "BROWSER_TARGET_BLOCKED"
       }, 1_000);
-      await runtime.client.send("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" }, event.sessionId).catch(() => undefined);
+      await client.send("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" }, event.sessionId).catch(() => undefined);
     }
   }
 
@@ -2109,14 +2230,46 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     if (existing && existing.process.exitCode === null && existing.process.signalCode === null) return Promise.resolve(existing);
     const pending = runtimeStarts.get(session.sessionId);
     if (pending) return pending;
-    const starting = withProfileLock(session.profilePath, () => launchRuntime(session));
+    // A crashed pane Chrome leaves its account tabs open elsewhere; they close here and reopen with the relaunch.
+    const starting = (existing ? releaseAccountTabs(existing) : Promise.resolve()).then(() => withProfileLock(session.profilePath, () => launchRuntime(session))).then((runtime) => {
+      void restoreAccountTabs(session, runtime).catch(() => undefined);
+      return runtime;
+    });
     runtimeStarts.set(session.sessionId, starting);
     void starting.finally(() => { if (runtimeStarts.get(session.sessionId) === starting) runtimeStarts.delete(session.sessionId); }).catch(() => undefined);
     return starting;
   }
 
-  async function launchProfile(session: Pick<PaneBrowserSession, "profilePath" | "viewport">): Promise<BrowserProfileRuntime> {
+  /**
+   * The Chrome flags of a Freelance Copilot pane's per-platform egress (its PAC, WebRTC kept on the proxied routes, and
+   * the clock and languages of the pane's own route), with a key that names them; null for every other pane and for
+   * an all-direct pane. The PAC holds the pane's route, so a route change changes the key and relaunches Chrome.
+   */
+  async function egressFor(paneId: string): Promise<{ args: string[]; env: Record<string, string>; key: string } | null> {
+    const pane = await Promise.resolve(store.getPane(paneId)).catch(() => null);
+    if (pane?.mode !== "FREELANCE_COPILOT") return null;
+    const settings = resolveFreelanceCopilotPaneMetadata(pane.freelanceCopilotMetadata).settings;
+    const pac = freelanceEgressPac(settings);
+    if (!pac) return null;
+    const locale = egressLocales[settings.browserEgress];
+    return {
+      args: [`--proxy-pac-url=data:application/x-ns-proxy-autoconfig;base64,${Buffer.from(pac).toString("base64")}`, "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        ...(locale ? [`--accept-lang=${locale.acceptLang}`] : [])],
+      env: locale ? { TZ: locale.timeZone } : {},
+      key: createHash("sha256").update(pac).digest("hex")
+    };
+  }
+
+  // Chrome's own saved logins are removed before each launch of an agent-driven profile: a saved password is autofilled
+  // and reaches an agent's page snapshot (Freelance Copilot, 2026-10-19). The managed policy deploy/chrome-policies stops
+  // new saves and autofill; this removes logins saved earlier. Chrome is not running for the profile here.
+  async function forgetChromeSavedLogins(profilePath: string) {
+    await Promise.all(CHROME_SAVED_LOGIN_FILES.map(name => rm(join(profilePath, "Default", name), { force: true })));
+  }
+
+  async function launchProfile(session: Pick<PaneBrowserSession, "profilePath" | "viewport">, egress: { args: string[]; env: Record<string, string>; key: string } | null = null): Promise<BrowserProfileRuntime> {
     await mkdir(session.profilePath, { recursive: true, mode: 0o700 });
+    await forgetChromeSavedLogins(session.profilePath);
     const viewport = viewportSizes[session.viewport];
     const audioEnv = config.browserSessionsAudioEnabled
       ? {
@@ -2160,17 +2313,17 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
         "--use-angle=swiftshader",
         "--enable-unsafe-swiftshader",
         "--disable-features=Vulkan",
-        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        ...(egress?.args ?? []),
         "about:blank"
       ],
-      { env: { ...childProcessEnv(), HOME: session.profilePath, ...audioEnv, ...(xvfb ? { DISPLAY: `:${display}` } : {}) } }
+      { env: { ...childProcessEnv(), HOME: session.profilePath, ...audioEnv, ...egress?.env, ...(xvfb ? { DISPLAY: `:${display}` } : {}) } }
     );
     let client: CdpClient | undefined;
     try {
       const wsUrl = await waitForChromeWebSocket(chrome, 10_000);
       client = await CdpClient.connect(wsUrl, 10_000);
       const profile: BrowserProfileRuntime = {
-        process: chrome, client, ...(xvfb ? { xvfb } : {}), ...(display !== null ? { display } : {}),
+        egressKey: egress?.key ?? null, process: chrome, client, ...(xvfb ? { xvfb } : {}), ...(display !== null ? { display } : {}),
         owners: new Map(), attachments: new Map(), members: new Set(), detach: () => undefined
       };
       profile.detach = client.onEvent(event => {
@@ -2182,7 +2335,13 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
           if (info.openerId) pageOpeners.set(info.targetId, info.openerId);
           const owner = profile.owners.get(info.targetId) ?? (info.openerId ? profile.owners.get(info.openerId) : undefined);
           if (owner) {
-            void claimPage(owner, info.targetId, sid).catch(() => profile.client.send("Target.closeTarget", { targetId: info.targetId }).catch(() => undefined));
+            // A popup opened by the page the pane shows (Sign in with Google) takes the view, as in a desktop browser.
+            const focus = Boolean(info.openerId) && owner.targetId === info.openerId;
+            const targetId = info.targetId;
+            void claimPage(owner, targetId, sid, profile).then(
+              () => { if (focus) void focusPopup(owner, targetId).catch(() => undefined); },
+              () => profile.client.send("Target.closeTarget", { targetId }).catch(() => undefined)
+            );
           }
         } else if (event.method === "Page.frameNavigated" && event.sessionId) {
           const frame = event.params?.frame as { parentId?: string; url?: string } | undefined;
@@ -2196,11 +2355,13 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
             const owner = profile.owners.get(id);
             owner?.ownedPages.delete(id);
             owner?.pageSessions.delete(id);
+            owner?.pageProfiles.delete(id);
             profile.owners.delete(id);
             const opener = pageOpeners.get(id);
             pageOpeners.delete(id);
             // A page that closes itself (a sign-in popup) must not leave its pane on a dead target.
             if (owner && owner.targetId === id && !owner.closing) void reactivateOwnedPage(owner, opener).catch(() => undefined);
+            if (owner && owner.profile !== profile && !owner.closing) void pruneAccountTabs(owner).catch(() => undefined);
           }
         }
       });
@@ -2218,8 +2379,7 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     }
   }
 
-  async function claimPage(runtime: BrowserRuntime, targetId: string, attachedId?: string): Promise<string> {
-    const profile = runtime.profile;
+  async function claimPage(runtime: BrowserRuntime, targetId: string, attachedId?: string, profile = runtime.profile): Promise<string> {
     if (runtime.closing) {
       await profile.client.send("Target.closeTarget", { targetId }).catch(() => undefined);
       throw new SpaceConflictError("The browser pane is closing.");
@@ -2228,32 +2388,209 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     if (owner && owner !== runtime) throw new SpaceNotFoundError("Browser page was not found.");
     profile.owners.set(targetId, runtime);
     runtime.ownedPages.add(targetId);
+    const accountPath = profile === runtime.profile ? undefined : [...runtime.accountTabs].find(([, tab]) => tab.profile === profile)?.[0];
+    if (accountPath) runtime.pageProfiles.set(targetId, accountPath);
     const existing = runtime.pageSessions.get(targetId);
     if (existing) return existing;
     const sid = attachedId ?? profile.attachments.get(targetId) ??
       (await profile.client.send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true })).sessionId;
     profile.attachments.set(targetId, sid);
     runtime.pageSessions.set(targetId, sid);
-    await enablePageSecurity(profile.client, sid);
-    await profile.client.send("Runtime.runIfWaitingForDebugger", {}, sid);
+    // The guard (Fetch.enable) is written before the resume, so the page's first request still waits for it.
+    // Awaiting the guard first deadlocked noopener popups (Gmail links): their tab stayed blank and wedged the pane.
+    await Promise.all([enablePageSecurity(profile.client, sid), profile.client.send("Runtime.runIfWaitingForDebugger", {}, sid)]);
     return sid;
   }
 
-  async function reactivateOwnedPage(runtime: BrowserRuntime, openerId: string | undefined): Promise<void> {
+  /** The runtime's session while its pane is live, so background tab switches never touch a closing pane. */
+  async function liveSessionOf(runtime: BrowserRuntime): Promise<PaneBrowserSession | undefined> {
     const sessionId = [...runtimes].find(([, candidate]) => candidate === runtime)?.[0];
     const session = sessionId ? await store.getPaneBrowserSession(sessionId) : undefined;
-    if (!session?.isActive || closingAll || closingSessions.has(session.sessionId)) return;
+    return session?.isActive && !closingAll && !closingSessions.has(session.sessionId) && !runtime.closing ? session : undefined;
+  }
+
+  async function reactivateOwnedPage(runtime: BrowserRuntime, openerId: string | undefined): Promise<void> {
+    const session = await liveSessionOf(runtime);
+    if (!session) return;
     const next = openerId && runtime.ownedPages.has(openerId) ? openerId : [...runtime.ownedPages][0] ?? await createOwnedPage(runtime, "about:blank");
     await activateRuntimePage(session, runtime, next);
     await refreshPages(session, runtime);
   }
 
-  async function createOwnedPage(runtime: BrowserRuntime, url: string, background = false): Promise<string> {
-    // Claim and guard an inert page before any network navigation can run.
-    const { targetId } = await runtime.client.send<{ targetId: string }>("Target.createTarget", { url: "about:blank", background });
-    const sid = await claimPage(runtime, targetId);
-    if (url !== "about:blank") await runtime.client.send("Page.navigate", { url }, sid);
+  async function focusPopup(runtime: BrowserRuntime, pageId: string): Promise<void> {
+    const session = await liveSessionOf(runtime);
+    if (!session || !runtime.ownedPages.has(pageId)) return;
+    await activateRuntimePage(session, runtime, pageId);
+    await refreshPages(session, runtime);
+  }
+
+  async function createOwnedPage(runtime: BrowserRuntime, url: string, background = false, profile = runtime.profile): Promise<string> {
+    // Claim and guard an inert page before any network navigation can run. While another pane shares this
+    // Chrome, the page gets its own window: as a background tab of a shared window it would be hidden
+    // (no rendering, no input, hCaptcha on every submit) whenever another pane's tab is in front.
+    const newWindow = [...profile.members].some((member) => member !== runtime);
+    const { targetId } = await profile.client.send<{ targetId: string }>("Target.createTarget", { url: "about:blank", background, ...(newWindow ? { newWindow: true } : {}) });
+    const sid = await claimPage(runtime, targetId, undefined, profile);
+    if (url !== "about:blank") await profile.client.send("Page.navigate", { url }, sid);
     return targetId;
+  }
+
+  /** The Chrome a pane's tab lives in: its account tab's, else the pane's own. */
+  function pageProfile(runtime: BrowserRuntime, pageId: string): BrowserProfileRuntime {
+    const path = runtime.pageProfiles.get(pageId);
+    return (path && runtime.accountTabs.get(path)?.profile) || runtime.profile;
+  }
+
+  function withAccountWork<T>(runtime: BrowserRuntime, operation: () => Promise<T>): Promise<T> {
+    const next = runtime.accountWork.catch(() => undefined).then(operation);
+    runtime.accountWork = next;
+    return next;
+  }
+
+  const chromeAlive = (profile: BrowserProfileRuntime) => profile.process.exitCode === null && profile.process.signalCode === null;
+
+  /** Joins (or starts) another account's Chrome for a pane's tabs; its pages report to the pane like its own. */
+  async function joinAccountTab(runtime: BrowserRuntime, session: PaneBrowserSession, path: string, account: BrowserAccountTab["account"]): Promise<BrowserProfileRuntime> {
+    const joined = runtime.accountTabs.get(path);
+    if (joined && chromeAlive(joined.profile)) {
+      joined.account = account;
+      return joined.profile;
+    }
+    if (joined) await leaveAccountTab(runtime, path);
+    return withProfileLock(path, async () => {
+      if (runtime.closing) throw new SpaceConflictError("The browser pane is closing.");
+      let profile = profiles.get(path);
+      if (profile && !chromeAlive(profile)) {
+        await closeProfile(profile, path);
+        profile = undefined;
+      }
+      profile ??= await launchProfile({ profilePath: path, viewport: session.viewport });
+      profile.members.add(runtime);
+      // The listener comes first: the request guard holds every request of a claimed page until it answers.
+      runtime.accountTabs.set(path, { profile, account, detach: profile.client.onEvent(runtimeEventListener(runtime, profile.client, session.sessionId)) });
+      scheduleGoogleAccountCheck(path, 6_000, googleCheckStaleMs);
+      return profile;
+    });
+  }
+
+  async function leaveAccountTab(runtime: BrowserRuntime, path: string): Promise<void> {
+    const tab = runtime.accountTabs.get(path);
+    if (!tab) return;
+    runtime.accountTabs.delete(path);
+    tab.detach();
+    await withProfileLock(path, async () => {
+      tab.profile.members.delete(runtime);
+      if (!tab.profile.members.size && profiles.get(path) === tab.profile) await closeProfile(tab.profile, path);
+    });
+  }
+
+  /** Leaves the account Chromes where the pane has no tab left. */
+  function pruneAccountTabs(runtime: BrowserRuntime): Promise<void> {
+    return withAccountWork(runtime, async () => {
+      const used = new Set(runtime.pageProfiles.values());
+      for (const path of [...runtime.accountTabs.keys()]) if (!used.has(path)) await leaveAccountTab(runtime, path);
+    });
+  }
+
+  /** An account Chrome that died takes its tabs with it; the view returns to the pane's own tabs. */
+  async function dropDeadAccountTabs(session: PaneBrowserSession, runtime: BrowserRuntime): Promise<void> {
+    const dead = [...runtime.accountTabs].filter(([, tab]) => !chromeAlive(tab.profile)).map(([path]) => path);
+    if (!dead.length) return;
+    let activeLost = false;
+    for (const [id, path] of [...runtime.pageProfiles]) {
+      if (!dead.includes(path)) continue;
+      activeLost ||= runtime.targetId === id;
+      runtime.ownedPages.delete(id);
+      runtime.pageSessions.delete(id);
+      runtime.pageProfiles.delete(id);
+    }
+    for (const path of dead) await leaveAccountTab(runtime, path);
+    if (!activeLost) return;
+    // The live view restarts on the pane's tab (stopping it on the dead Chrome is skipped).
+    runtime.client = runtime.profile.client;
+    await activateRuntimePage(session, runtime, [...runtime.ownedPages][0] ?? await createOwnedPage(runtime, "about:blank"));
+  }
+
+  const readAccountTabIdentities = (paneId: string) => readBrowserAccountTabIdentities(config.browserSessionsProfileRoot, paneId);
+
+  async function saveAccountTabIdentity(paneId: string, profileId: string, identity: BrowserAccountTabIdentity): Promise<void> {
+    const file = browserAccountTabsFile(config.browserSessionsProfileRoot, paneId);
+    const accounts = { ...await readAccountTabIdentities(paneId), [profileId]: identity };
+    await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+    await writeFile(file, JSON.stringify({ version: 1, accounts }), { mode: 0o600 });
+  }
+
+  /** The Chrome profile of an account tab's identity, with the same checks as a pane start in that account. */
+  async function accountTabProfilePath(pane: Pane, identity: BrowserAccountTabIdentity, context?: BrowserHostActorContext): Promise<string> {
+    const input: StartBrowserSessionInput = { pane, ...identity, traceId: "account-tab" };
+    await assertGoogleAccount(input, context);
+    if (input.sharedProfileKey && (await store.getRoom(pane.roomId)).kind === "AGENT_PROOF") {
+      throw new SpaceConflictError("Shared account profiles are unavailable in proof rooms.");
+    }
+    const path = input.sharedProfileKey ? await prepareSharedCliProfile(input.sharedProfileKey) : profilePathForInput(input);
+    if (input.googleAccount) googleProfileIdentities.set(path, { ...input.googleAccount });
+    return path;
+  }
+
+  /** After a Chrome or host restart: the pane's tabs in other accounts reopen in those accounts, in the background. */
+  async function restoreAccountTabs(session: PaneBrowserSession, runtime: BrowserRuntime): Promise<void> {
+    const tabs = session.pages.filter((page) => page.account && page.url && /^https?:\/\//i.test(page.url)).slice(0, 20);
+    if (!tabs.length) return;
+    const pane = await store.getPane(session.paneId);
+    if (pane.mode === "FREELANCE_COPILOT") return;
+    const identities = await readAccountTabIdentities(pane.id);
+    await withAccountWork(runtime, async () => {
+      let active: string | null = null;
+      for (const page of tabs) {
+        const identity = identities[page.account!.profileId];
+        if (!identity) continue;
+        try {
+          const path = await accountTabProfilePath(pane, identity);
+          const chrome = path === runtime.profilePath ? runtime.profile : await joinAccountTab(runtime, session, path, page.account!);
+          const pageId = await createOwnedPage(runtime, await requestGuard.assertAllowed(page.url!), true, chrome);
+          if (page.pageId === session.activePageId || page.isActive) active = pageId;
+        } catch {
+          // A tab whose account is gone (or unavailable here) stays closed rather than opening in another account.
+        }
+      }
+      if (active) await activateRuntimePage(session, runtime, active);
+    });
+    await refreshPages(session, runtime);
+  }
+
+  /** Moves a tab into another Google account's Chrome (or back to the pane's): same place in the pane, other cookies. */
+  async function switchPageAccount(input: StartBrowserSessionInput, accountTab: NonNullable<StartBrowserSessionInput["accountTab"]>, context?: BrowserHostActorContext): Promise<PaneBrowserSessionResponse> {
+    const { pane } = input;
+    // Freelance Copilot tabs leave through the platform's egress route, which another account's Chrome does not use.
+    if (pane.mode === "FREELANCE_COPILOT") throw new SpaceConflictError("FREELANCE_EGRESS: Freelance Copilot tabs keep the pane's Google account.");
+    await paneStarts.get(pane.id)?.catch(() => undefined);
+    const session = await requireActiveSession(pane);
+    await assertCanMutate(session, context);
+    const identity: BrowserAccountTabIdentity = { googleAccount: input.googleAccount, sharedProfileKey: input.sharedProfileKey, profileKey: input.profileKey };
+    const path = accountTab.profileId === null ? null : await accountTabProfilePath(pane, identity, context);
+    const runtime = await ensureRuntime(session);
+    await withAccountWork(runtime, async () => {
+      const from = pageProfile(runtime, accountTab.pageId);
+      const targets = await from.client.send<{ targetInfos?: Array<{ targetId: string; type?: string; url?: string }> }>("Target.getTargets");
+      const page = (targets.targetInfos ?? []).find((target) => target.targetId === accountTab.pageId && target.type === "page");
+      if (!page || !runtime.ownedPages.has(accountTab.pageId)) throw new SpaceNotFoundError(`Browser page ${accountTab.pageId} was not found.`);
+      const home = path === null || path === runtime.profilePath;
+      const chrome = home ? runtime.profile : await joinAccountTab(runtime, session, path, { profileId: accountTab.profileId!, label: accountTab.label });
+      if (chrome === from) {
+        // Already in that account: a sign-in request opens Google sign-in in the tab.
+        if (accountTab.url) await from.client.send("Page.navigate", { url: await assertSafeBrowserTargetUrl(accountTab.url, config.browserEvidenceTargetOrigin) }, runtime.pageSessions.get(accountTab.pageId));
+        return;
+      }
+      const rawUrl = accountTab.url ?? (page.url && /^https?:\/\//i.test(page.url) ? page.url : "about:blank");
+      const url = rawUrl === "about:blank" ? rawUrl : await assertSafeBrowserTargetUrl(rawUrl, config.browserEvidenceTargetOrigin);
+      const pageId = await createOwnedPage(runtime, url, runtime.targetId !== accountTab.pageId, chrome);
+      // The new tab takes the view first, so the old one never closes while the pane shows it.
+      if (runtime.targetId === accountTab.pageId) await activateRuntimePage(session, runtime, pageId);
+      await from.client.send("Target.closeTarget", { targetId: accountTab.pageId }).catch(() => undefined);
+      if (!home) await saveAccountTabIdentity(pane.id, accountTab.profileId!, identity);
+    });
+    await refreshPages(session, runtime);
+    return responseFor(await store.getPaneBrowserSession(session.sessionId) ?? session, false);
   }
 
   async function closeProfile(profile: BrowserProfileRuntime, path: string): Promise<void> {
@@ -2264,8 +2601,24 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     if (profiles.get(path) === profile) profiles.delete(path);
   }
 
+  /** Closes a pane's tabs in other accounts and leaves those Chromes; never inside the pane's own profile lock. */
+  async function releaseAccountTabs(runtime: BrowserRuntime): Promise<void> {
+    for (const [id, path] of [...runtime.pageProfiles]) {
+      const chrome = runtime.accountTabs.get(path)?.profile;
+      await chrome?.client.send("Target.closeTarget", { targetId: id }).catch(() => undefined);
+      runtime.ownedPages.delete(id);
+      runtime.pageSessions.delete(id);
+      runtime.pageProfiles.delete(id);
+      chrome?.owners.delete(id);
+      chrome?.attachments.delete(id);
+    }
+    for (const path of [...runtime.accountTabs.keys()]) await leaveAccountTab(runtime, path);
+  }
+
   async function releaseRuntime(runtime: BrowserRuntime): Promise<void> {
     runtime.closing = true;
+    // Another account's lock is never taken inside the pane's own: two panes may use each other's accounts.
+    await releaseAccountTabs(runtime);
     await withProfileLock(runtime.profilePath, async () => {
       runtime.detachDiagnostics();
       const profile = runtime.profile;
@@ -2273,7 +2626,7 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
       while (runtime.ownedPages.size) {
         const ids = [...runtime.ownedPages];
         for (const id of ids) {
-          await runtime.client.send("Target.closeTarget", { targetId: id }).catch(() => undefined);
+          await profile.client.send("Target.closeTarget", { targetId: id }).catch(() => undefined);
           runtime.ownedPages.delete(id);
           runtime.pageSessions.delete(id);
           profile.owners.delete(id);
@@ -2283,6 +2636,55 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
       profile.members.delete(runtime);
       if (!profile.members.size && profiles.get(runtime.profilePath) === profile) await closeProfile(profile, runtime.profilePath);
     });
+  }
+
+  /** Live view frames, console, network and the request guard of a pane's pages in one Chrome (its own or an account tab's). */
+  function runtimeEventListener(runtime: BrowserRuntime, client: CdpClient, sessionId: string): (event: CdpEvent) => void {
+    return (event) => {
+      if (!event.sessionId || ![...runtime.pageSessions.values()].includes(event.sessionId)) return;
+      if (event.method === "Fetch.requestPaused") {
+        void handlePausedRequest(runtime, client, event);
+        return;
+      }
+      if (event.sessionId !== runtime.cdpSessionId || client !== runtime.client) return;
+      if (event.method === "Page.screencastFrame") {
+        const frameId = event.params?.sessionId;
+        if (typeof frameId === "number") {
+          void client.send("Page.screencastFrameAck", { sessionId: frameId }, runtime.cdpSessionId).catch(() => undefined);
+        }
+        const data = event.params?.data;
+        if (typeof data !== "string") return;
+        runtime.streamSequence += 1;
+        const capturedAt = nowIso();
+        const now = Date.now();
+        for (const subscriber of runtime.streamSubscribers.values()) {
+          if (subscriber.profile.framesPerSecond <= 0) continue;
+          const nextDeadline = nextBrowserFrameDeadline(now, subscriber.lastSentAt, subscriber.profile.framesPerSecond);
+          if (nextDeadline === null) continue;
+          subscriber.lastSentAt = nextDeadline;
+          void Promise.resolve(
+            subscriber.onFrame({
+              sessionId,
+              sequence: runtime.streamSequence,
+              data: Buffer.from(data, "base64"),
+              mimeType: "image/jpeg",
+              capturedAt,
+              metadata: { ...sanitizeValue(event.params?.metadata ?? {}) as Record<string, unknown>, viewportDimensions: runtime.viewportDimensions }
+            })
+          ).catch(() => undefined);
+        }
+        return;
+      }
+      if (runtime.vaultProtected) return;
+      if (event.method === "Runtime.consoleAPICalled" || event.method === "Runtime.exceptionThrown") {
+        pushBounded(runtime.consoleEntries, normalizeConsoleEvent(event), 500);
+        return;
+      }
+      if (event.method.startsWith("Network.")) {
+        const normalized = normalizeNetworkEvent(event);
+        if (normalized) pushBounded(runtime.networkEntries, normalized, 1_000);
+      }
+    };
   }
 
   async function launchRuntime(session: PaneBrowserSession): Promise<BrowserRuntime> {
@@ -2296,14 +2698,25 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     if (!fresh?.isActive || fresh.status === "CLOSED") throw new SpaceConflictError("The browser session is closed.");
     assertEnabled();
     if (!capacity.acquireSession(session.sessionId)) {
-      throw new SpaceFeatureDisabledError("BROWSER_SESSION_CAPACITY", "Managed browser session capacity is exhausted.", capacity.snapshot());
+      throw new SpaceFeatureDisabledError("BROWSER_SESSION_CAPACITY", `Browser limit reached: ${capacity.maxSessions} browsers can be open at once. Close another browser pane first.`, capacity.snapshot());
     }
     let profile = profiles.get(session.profilePath);
     if (profile && (profile.process.exitCode !== null || profile.process.signalCode !== null)) {
       await closeProfile(profile, session.profilePath);
       profile = undefined;
     }
-    try { profile ??= await launchProfile(session); }
+    // A Freelance Copilot pane only joins a Chrome started with its own routes: an idle one restarts with them, one
+    // that another pane uses is refused (the pane would otherwise leave from the wrong country).
+    let egress: Awaited<ReturnType<typeof egressFor>> = null;
+    try {
+      egress = await egressFor(session.paneId);
+      if (egress && profile && (profile.egressKey ?? null) !== egress.key) {
+        if (profile.members.size) throw new SpaceConflictError("FREELANCE_EGRESS: this browser account is open in another pane without the Freelance Copilot's routes; close it there or give the Freelance Copilot its own browser account.");
+        await closeProfile(profile, session.profilePath);
+        profile = undefined;
+      }
+    } catch (error) { capacity.releaseSession(session.sessionId); throw error; }
+    try { profile ??= await launchProfile(session, egress); }
     catch (error) { capacity.releaseSession(session.sessionId); throw error; }
     const { client, process: chrome, xvfb, display } = profile;
     let runtime: BrowserRuntime | undefined;
@@ -2322,57 +2735,15 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
         streamSubscribers: new Map(),
         screencastActive: false,
         streamSequence: 0,
-        detachDiagnostics: () => undefined
+        detachDiagnostics: () => undefined,
+        accountTabs: new Map(),
+        pageProfiles: new Map(),
+        accountWork: Promise.resolve()
       };
       profile.members.add(runtime);
-      const paneRuntime = runtime;
       runtime.targetId = await createOwnedPage(runtime, "about:blank");
       runtime.cdpSessionId = runtime.pageSessions.get(runtime.targetId)!;
-      runtime.detachDiagnostics = client.onEvent((event) => {
-        const runtime = paneRuntime;
-        if (!event.sessionId || ![...runtime.pageSessions.values()].includes(event.sessionId)) return;
-        if (event.method === "Fetch.requestPaused") {
-          void handlePausedRequest(runtime, event);
-          return;
-        }
-        if (event.sessionId !== runtime.cdpSessionId) return;
-        if (event.method === "Page.screencastFrame") {
-          const frameId = event.params?.sessionId;
-          if (typeof frameId === "number") {
-            void client.send("Page.screencastFrameAck", { sessionId: frameId }, runtime.cdpSessionId).catch(() => undefined);
-          }
-          const data = event.params?.data;
-          if (typeof data !== "string") return;
-          runtime.streamSequence += 1;
-          const capturedAt = nowIso();
-          const now = Date.now();
-          for (const subscriber of runtime.streamSubscribers.values()) {
-            if (subscriber.profile.framesPerSecond <= 0) continue;
-            const nextDeadline = nextBrowserFrameDeadline(now, subscriber.lastSentAt, subscriber.profile.framesPerSecond);
-            if (nextDeadline === null) continue;
-            subscriber.lastSentAt = nextDeadline;
-            void Promise.resolve(
-              subscriber.onFrame({
-                sessionId: session.sessionId,
-                sequence: runtime.streamSequence,
-                data: Buffer.from(data, "base64"),
-                mimeType: "image/jpeg",
-                capturedAt,
-                metadata: { ...sanitizeValue(event.params?.metadata ?? {}) as Record<string, unknown>, viewportDimensions: runtime.viewportDimensions }
-              })
-            ).catch(() => undefined);
-          }
-          return;
-        }
-        if (event.method === "Runtime.consoleAPICalled" || event.method === "Runtime.exceptionThrown") {
-          pushBounded(runtime.consoleEntries, normalizeConsoleEvent(event), 500);
-          return;
-        }
-        if (event.method.startsWith("Network.")) {
-          const normalized = normalizeNetworkEvent(event);
-          if (normalized) pushBounded(runtime.networkEntries, normalized, 1_000);
-        }
-      });
+      runtime.detachDiagnostics = client.onEvent(runtimeEventListener(runtime, client, session.sessionId));
       await setViewport(runtime, session.viewport);
       const restore = browserSessionRestoreUrls(session);
       if (restore.activeUrl) {
@@ -2417,8 +2788,10 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     }
     const runtime = await ensureRuntime(session);
     const workloadKey = `stream:${sessionId}`;
-    if (!capacity.acquireLive(workloadKey)) {
-      throw new SpaceFeatureDisabledError("BROWSER_LIVE_CAPACITY", "Live browser stream capacity is exhausted.", capacity.snapshot());
+    // One stream per session, so open (also minimized or hidden) browsers stream up to the session limit;
+    // recordings keep maxLiveWorkloads.
+    if (!capacity.acquireLive(workloadKey, capacity.maxSessions)) {
+      throw new SpaceFeatureDisabledError("BROWSER_LIVE_CAPACITY", `Live browser limit reached: ${capacity.maxSessions} browsers can stream at once. Close another browser pane or set it to Silent.`, capacity.snapshot());
     }
     const id = makeSpaceId("browser_stream");
     runtime.streamSubscribers.set(id, { id, profile, lastSentAt: 0, onFrame });
@@ -2550,10 +2923,14 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
   }
 
   async function refreshPages(session: PaneBrowserSession, runtime: BrowserRuntime): Promise<{ sessionId: string; activePageId: string | null; pages: BrowserPageSummary[] }> {
-    const result = await runtime.client.send<{
-      targetInfos?: Array<{ targetId: string; type?: string; title?: string; url?: string; openerId?: string }>;
-    }>("Target.getTargets");
-    const pages = (result.targetInfos ?? [])
+    await dropDeadAccountTabs(session, runtime);
+    type TargetInfo = { targetId: string; type?: string; title?: string; url?: string; openerId?: string };
+    const chromes = [runtime.profile, ...[...runtime.accountTabs.values()].map((tab) => tab.profile)];
+    const lists = await Promise.all(chromes.map((chrome, index) => {
+      const request = chrome.client.send<{ targetInfos?: TargetInfo[] }>("Target.getTargets").then((result) => result.targetInfos ?? []);
+      return index ? request.catch((): TargetInfo[] => []) : request;
+    }));
+    const pages = lists.flat()
       .filter((target) => target.type === "page" && runtime.ownedPages.has(target.targetId))
       .slice(0, 100)
       .map((target): BrowserPageSummary => ({
@@ -2564,7 +2941,8 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
         isActive: target.targetId === runtime.targetId,
         openerPageId: target.openerId ?? null,
         canGoBack: false,
-        canGoForward: false
+        canGoForward: false,
+        account: runtime.accountTabs.get(runtime.pageProfiles.get(target.targetId) ?? "")?.account ?? null
       }));
     const active = pages.find((page) => page.isActive) ?? null;
     if (active) {
@@ -2585,7 +2963,8 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
   }
 
   async function activateRuntimePage(session: PaneBrowserSession, runtime: BrowserRuntime, pageId: string): Promise<void> {
-    const targets = await runtime.client.send<{ targetInfos?: Array<{ targetId: string; type?: string }> }>("Target.getTargets");
+    const chrome = pageProfile(runtime, pageId);
+    const targets = await chrome.client.send<{ targetInfos?: Array<{ targetId: string; type?: string }> }>("Target.getTargets");
     if (!runtime.ownedPages.has(pageId) || !(targets.targetInfos ?? []).some((target) => target.targetId === pageId && target.type === "page")) {
       throw new SpaceNotFoundError(`Browser page ${pageId} was not found.`);
     }
@@ -2594,7 +2973,9 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     const existingSessionId = runtime.pageSessions.get(pageId);
     const attached = existingSessionId
       ? { sessionId: existingSessionId }
-      : await runtime.client.send<{ sessionId: string }>("Target.attachToTarget", { targetId: pageId, flatten: true });
+      : await chrome.client.send<{ sessionId: string }>("Target.attachToTarget", { targetId: pageId, flatten: true });
+    // Every active-page command (live view, input, navigation, screenshots) goes to the active tab's Chrome.
+    runtime.client = chrome.client;
     runtime.targetId = pageId;
     runtime.cdpSessionId = attached.sessionId;
     runtime.pageSessions.set(pageId, attached.sessionId);
@@ -2860,6 +3241,19 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
       }
     });
     return record.artifact.id;
+  }
+
+  /** The pane that filled a Vault page sees its labels and buttons, never a value (captureMaskedScreenshot). */
+  async function maskedScreenshot(session: PaneBrowserSession, runtime: BrowserRuntime): Promise<{ artifactId: string; path: string; masked: true }> {
+    const data = await captureMaskedScreenshot((method, params) => runtime.client.send(method, params, runtime.cdpSessionId));
+    const segment = sanitizeSegment(`masked-${randomUUID()}`);
+    const directory = join(config.browserEvidenceArtifactRoot, "browser-evidence", segment);
+    const filename = "masked-screenshot.png";
+    const path = join(directory, filename);
+    await mkdir(directory, { recursive: true, mode: 0o750 });
+    await writeFile(path, Buffer.from(data, "base64"), { mode: 0o640 });
+    const artifactId = await registerCaptureArtifact({ session, jobId: segment, filePath: path, filename, kind: "SCREENSHOT", mimeType: "image/png" });
+    return { artifactId, path, masked: true };
   }
 
   async function runScreenshotCapture(job: BrowserCaptureJob, session: PaneBrowserSession, runtime: BrowserRuntime): Promise<string[]> {
@@ -3176,7 +3570,7 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
       let restoreScrollY: number | null = null;
       let restoreVideoPaused: boolean | null = null;
       try {
-        if (runtime && runtime.process.exitCode === null && runtime.process.signalCode === null) {
+        if (runtime && runtime.process.exitCode === null && runtime.process.signalCode === null && !runtime.pageProfiles.has(runtime.targetId)) {
           const meta = await readPageMetadata(runtime.client, runtime.cdpSessionId);
           if (meta.currentUrl) lastKnownUrl = meta.currentUrl;
           restoreScrollX = meta.scrollX ?? null;
@@ -3242,6 +3636,23 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
     return browserTimelineEventSummarySchema.array().parse([...consoleEvents, ...networkEvents].slice(-limit));
   }
 
+  // Vault sealed fill (ADR-012): the pane's own tab, also in a shared Chrome (the API fences the filled browser, protection.ts).
+  function vaultPage(pane: Pane, runtime: BrowserRuntime): SealedFillPage {
+    return { cdp: runtime.client, sessionId: runtime.cdpSessionId, targetId: runtime.targetId, paneId: pane.id };
+  }
+  // H2 Option A: the Browser Host talks to the broker over its own socket, never through the API.
+  const vaultBroker = sealedFillBroker(createSocketVaultBroker(VAULT_BROKER_HOST_SOCKET_PATH));
+  async function vaultTargetForPane(pane: Pane): Promise<VaultHostTarget> {
+    return readVaultTarget(vaultPage(pane, await ensureRuntime(await requireActiveSession(pane))));
+  }
+  async function vaultFillForPane(pane: Pane, request: unknown): Promise<VaultHostFillResult> {
+    const runtime = await ensureRuntime(await requireActiveSession(pane));
+    runtime.vaultProtected = true;
+    runtime.consoleEntries.length = 0;
+    runtime.networkEntries.length = 0;
+    return runSealedFill(vaultPage(pane, runtime), vaultBroker, request);
+  }
+
   async function diagnosticsForPane(pane: Pane, includeNetwork: boolean, limit: number) {
     const session = await requireActiveSession(pane);
     const runtime = await ensureRuntime(session);
@@ -3257,6 +3668,7 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
       capacity: capacity.snapshot()
     }),
     startOrRestore(input, context) {
+      if (input.accountTab) return switchPageAccount(input, input.accountTab, context);
       const pending = paneStarts.get(input.pane.id);
       if (pending) return pending.then(async (response) => {
         await assertGoogleAccount(input, context);
@@ -3404,10 +3816,17 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
         const replacement = pages.pages.find((page) => page.pageId !== pageId);
         if (replacement) await activateRuntimePage(session, runtime, replacement.pageId);
       }
-      await runtime.client.send("Target.closeTarget", { targetId: pageId });
+      await pageProfile(runtime, pageId).client.send("Target.closeTarget", { targetId: pageId });
       return refreshPages(session, runtime);
     },
-    acquireControl: (pane, input, _traceId, context) => acquireControl(pane, input, context),
+    async acquireControl(pane, input, _traceId, context) {
+      const lease = await acquireControl(pane, input, context);
+      // The holder drives the pane's active tab; Chrome holds each input to a background tab for 5 s and streams
+      // no frames from it, and an agent's own tab switch can leave the pane's tab behind another one.
+      const runtime = runtimes.get(lease.sessionId);
+      await runtime?.client.send("Target.activateTarget", { targetId: runtime.targetId }).catch(() => undefined);
+      return lease;
+    },
     heartbeatControl: (pane, input, _traceId, context) => updateControlLease(pane, input, false, context),
     releaseControl: (pane, input, _traceId, context) => updateControlLease(pane, input, true, context),
     async dispatchInput(pane, input, _traceId, context) {
@@ -3417,6 +3836,8 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
       return responseFor(await dispatchRuntimeInput(pane, input, context), false);
     },
     diagnostics: diagnosticsForPane,
+    vaultTarget: vaultTargetForPane,
+    vaultFill: (pane, request) => vaultFillForPane(pane, request),
     async adoptPaneGoogleProfile(source, context) {
       if (context && (context.holderType !== "OPERATOR" || context.holderId !== source.ownerUserId)) {
         throw new SpaceConflictError("Only the account owner can move a pane's Google sign-in.");
@@ -3482,10 +3903,18 @@ export function createBrowserSessionManager(options: { store: SpaceStore; config
       if (input.type === "diagnostics") {
         text = browserDiagnosticsText(runtime, input);
       }
+      if (input.type === "press") {
+        await pressBrowserKey(runtime.client, runtime.cdpSessionId, input.key);
+        text = `Pressed ${input.key}.`;
+      }
+      if (input.type === "masked_screenshot") {
+        text = JSON.stringify(await maskedScreenshot(session, runtime));
+      }
       if (input.type === "record") {
         text = await executeActionRecording(session, runtime, input, context);
       }
-      const frame = await captureFrame(session.sessionId);
+      // A masked screenshot returns no unmasked live frame next to it.
+      const frame = input.type === "masked_screenshot" ? null : await captureFrame(session.sessionId);
       const fresh = await store.getPaneBrowserSession(session.sessionId);
       return browserToolActionResultSchema.parse({ session: fresh ?? session, frame, text });
     },

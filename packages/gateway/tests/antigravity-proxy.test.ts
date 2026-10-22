@@ -79,9 +79,33 @@ describe("Antigravity helpers", () => {
     inspector.push(new TextEncoder().encode(`data: ${JSON.stringify({ error: { code: 429, message: "quota" } })}\n\n`));
     expect(inspector).toMatchObject({ outputStarted: false, errorStatus: 429 });
   });
+
+  it("reads usage from a non-stream generateContent JSON body (an image call), split across chunks", () => {
+    const inspector = new CodeAssistStreamInspector();
+    const body = JSON.stringify({ response: { candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: "QUJD" } }] }, finishReason: "STOP" }],
+      usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 1290 }, modelVersion: "gemini-3.1-flash-image" }, traceId: "t" }, null, 2);
+    const bytes = new TextEncoder().encode(body);
+    expect(inspector.push(bytes.slice(0, 40))).toBe(false);
+    expect(inspector.push(bytes.slice(40))).toBe(false);
+    expect(inspector.usage).toBeNull();
+    inspector.end();
+    expect(inspector).toMatchObject({ outputStarted: true, finished: true, model: "gemini-3.1-flash-image",
+      usage: { promptTokens: 9, cachedTokens: null, outputTokens: 1290, thoughtsTokens: null } });
+  });
 });
 
 describe("Antigravity proxy", () => {
+  it("logs the usage of a non-stream model call (agy's image call)", async () => {
+    const { post, logs, repository } = await setup(() => json({ response: { candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: "QUJD" } }] },
+      finishReason: "STOP" }], usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 1290 }, modelVersion: "gemini-3.1-flash-image" } }));
+    const response = await post("/v1internal:generateContent", generate("gemini-3.1-flash-image"));
+    expect(response.statusCode).toBe(200);
+    expect(response.json().response.candidates[0].content.parts[0].inlineData.data).toBe("QUJD");
+    await logs.flush();
+    expect(await repository.listRequestLogs({ limit: 5 })).toEqual([expect.objectContaining({ model: "gemini-3.1-flash-image", inputTokens: 9, outputTokens: 1290,
+      status: "success" })]);
+  });
+
   it("sends model calls to the least-used account of the model's quota group with that account's project", async () => {
     const { post, calls, logs, repository } = await setup(() => reply("SPACE_AGY_OK"));
     const response = await post("/v1internal:streamGenerateContent?alt=sse", generate());
@@ -95,6 +119,8 @@ describe("Antigravity proxy", () => {
     const [, first] = await repository.listRequestLogs({ limit: 5 });
     expect(first).toMatchObject({ provider: "ANTIGRAVITY", accountId: accountA, model: "gemini-3.8-flash-high", inputTokens: 1200, cachedInputTokens: 800, outputTokens: 7,
       reasoningTokens: 3, status: "success" });
+    // Gemini 3.8 Flash list prices: thinking is billed as output.
+    expect(first!.costUsd).toBeCloseTo((400 * 0.75 + 800 * 0.075 + 10 * 3.75) / 1e6, 12);
   });
 
   it("moves to another account when one runs out of quota, and remembers the reset for that quota group only", async () => {
@@ -120,7 +146,7 @@ describe("Antigravity proxy", () => {
   });
 
   it("passes account calls, and clients outside the pool, through with the client's own sign-in", async () => {
-    const { post, calls, app } = await setup((_token, path) => (path.includes("loadCodeAssist") ? json({ cloudaicompanionProject: "project-a" }) : reply("own account")));
+    const { post, calls, app, logs, repository } = await setup((_token, path) => (path.includes("loadCodeAssist") ? json({ cloudaicompanionProject: "project-a" }) : reply("own account")));
     const response = await post("/v1internal:loadCodeAssist", { metadata: {} });
     expect(response.json()).toEqual({ cloudaicompanionProject: "project-a" });
     expect(calls[0]).toMatchObject({ token: "client-a-token", path: "/v1internal:loadCodeAssist", body: { metadata: {} } });
@@ -130,6 +156,10 @@ describe("Antigravity proxy", () => {
     expect(calls[1]).toMatchObject({ token: "stranger", body: { project: "project-x" } });
     expect((await app.inject({ method: "POST", url: "/antigravity/v1internal:loadCodeAssist", payload: {} })).statusCode).toBe(401);
     expect(calls).toHaveLength(2);
+    // Only the model call is logged (no pool account), so the token usage page still counts its tokens.
+    await logs.flush();
+    expect(await repository.listRequestLogs({ limit: 5 })).toEqual([expect.objectContaining({ provider: "ANTIGRAVITY", accountId: null,
+      model: "gemini-3.8-flash-high", inputTokens: 1200, outputTokens: 7, reasoningTokens: 3, status: "success", clientName: expect.any(String) })]);
   });
 });
 

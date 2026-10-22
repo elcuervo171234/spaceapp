@@ -9,15 +9,20 @@ import type {
   SystemAnalyticsProcessesResponse,
   SystemAnalyticsRange,
   SystemAnalyticsResourcesResponse,
-  SystemAnalyticsSeries
+  SystemAnalyticsSeries,
+  SystemAnalyticsTokenRoute
 } from "@space/contracts";
 import { api } from "../../api.js";
 import {
   Activity,
+  BrainCircuit,
+  ChartColumn,
   Clock3,
   Cpu,
   Database,
   Eye,
+  KeyRound,
+  Layers,
   MemoryStick,
   Network,
   RefreshCw,
@@ -30,7 +35,15 @@ import {
 import "./system-analytics.css";
 import { SpaceToggle } from "../ui-controls/SpaceToggle.js";
 import { modelColumns, sortModels, type ModelSortKey } from "./model-sort.js";
-import { groupModelTokens, recordedTotal, sumTokenCounts } from "./token-totals.js";
+import { formatUsd, groupModelTokens, recordedTotal, sumCost, sumTokenCounts } from "./token-totals.js";
+import { ShareBar, TokenCompositionBar, TokenTimelineChart } from "./TokenUsageCharts.js";
+import { AnthropicBillingPanel } from "./AnthropicBillingPanel.js";
+
+const tokenRoutes: Array<{ value: SystemAnalyticsTokenRoute; label: string }> = [
+  { value: "all", label: "All" },
+  { value: "gateway", label: "Space Gateway" },
+  { value: "direct", label: "Direct" }
+];
 
 export type SystemAnalyticsTab = "overview" | "models" | "resources" | "sessions" | "bench" | "installs";
 
@@ -107,6 +120,18 @@ function StatCard({ label, value, detail }: { label: string; value: string; deta
   return <article className="system-analytics-stat"><span>{label}</span><strong>{value}</strong>{detail ? <small>{detail}</small> : null}</article>;
 }
 
+type RouteTotals = NonNullable<SystemAnalyticsModelsResponse["routes"]>["gateway"];
+
+/** Space Gateway and direct side by side: one split bar in the chart's series colors, then each route's tokens and API value. */
+function RouteSplitCard({ gateway, direct }: { gateway: RouteTotals; direct: RouteTotals }) {
+  const parts = [{ key: "gateway", label: "Space Gateway", totals: gateway }, { key: "direct", label: "Direct", totals: direct }];
+  return <article className="system-analytics-stat token-route-split">
+    <span>Space Gateway · Direct</span>
+    <div className="token-split-bar" aria-hidden="true">{parts.map(part => <i key={part.key} className={`is-${part.key}`} style={{ flexGrow: recordedTotal(part.totals) ?? 0 }} />)}</div>
+    <dl>{parts.map(part => <div key={part.key}><dt><i className={`is-${part.key}`} />{part.label}</dt><dd>{formatNumber(recordedTotal(part.totals))}</dd><dd>{formatUsd(part.totals.costUsd)}</dd></div>)}</dl>
+  </article>;
+}
+
 function CoverageBadge({ value }: { value: "NATIVE" | "SESSION_ONLY" | "UNAVAILABLE" }) {
   return <span className={`system-analytics-coverage is-${value.toLocaleLowerCase().replace("_", "-")}`}>{value.replace("_", " ")}</span>;
 }
@@ -162,6 +187,8 @@ export function SystemAnalyticsWorkspace({
   const [tab, setTab] = useState<SystemAnalyticsTab>(initialTab);
   const [modelSort, setModelSort] = useState<{ key: ModelSortKey; direction: "asc" | "desc" }>({ key: "total", direction: "desc" });
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [tokenRoute, setTokenRoute] = useState<SystemAnalyticsTokenRoute>("all");
+  const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
   const [range, setRange] = useState<SystemAnalyticsRange>(modelsOnly ? "24h" : "10m");
   const [overview, setOverview] = useState<SystemAnalyticsOverviewResponse | null>(null);
   const [models, setModels] = useState<SystemAnalyticsModelsResponse | null>(null);
@@ -231,7 +258,7 @@ export function SystemAnalyticsWorkspace({
             setResources(resourcesPayload);
           })
       : tab === "models"
-        ? api.systemAnalyticsModels(range).then((payload) => { if (active) setModels(payload); })
+        ? api.systemAnalyticsModels(range, tokenRoute).then((payload) => { if (active) setModels(payload); })
         : tab === "resources"
           ? Promise.all([
               api.systemAnalyticsResources(range),
@@ -258,10 +285,16 @@ export function SystemAnalyticsWorkspace({
       if (active) setLoading(false);
     });
     return () => { active = false; };
-  }, [processPage, processQuery, processSort, range, refreshToken, tab]);
+  }, [processPage, processQuery, processSort, range, refreshToken, tab, tokenRoute]);
 
   const modelGroups = useMemo(() => groupModelTokens(models?.models ?? []).filter(model => recordedTotal(model) !== 0), [models]);
   const periodTotals = useMemo(() => sumTokenCounts(models?.models ?? []), [models]);
+  const periodCost = useMemo(() => sumCost(models?.models ?? []), [models]);
+  const unpricedTurns = (models?.models ?? []).reduce((total, model) => total + (model.unpricedTurns ?? 0), 0);
+  const accountDetail = models?.accounts?.find(account => `${account.route}:${account.accountKey}` === selectedAccount) ?? null;
+  const maxModelTotal = Math.max(0, ...modelGroups.map(model => recordedTotal(model) ?? 0));
+  const maxProviderTotal = Math.max(0, ...(models?.providers ?? []).map(provider => recordedTotal(provider) ?? 0));
+  const maxAccountTotal = Math.max(0, ...(models?.accounts ?? []).map(account => account.tokensIn + account.tokensOut));
   const visibleModels = sortModels(models?.models.filter(model => recordedTotal(model) !== 0 && (selectedModel === null || model.modelId === selectedModel)) ?? [], modelSort.key, modelSort.direction);
   const usagePeriod = ranges.find(item => item.value === range)?.label ?? range;
 
@@ -321,7 +354,7 @@ export function SystemAnalyticsWorkspace({
   return <section className="system-analytics-workspace" aria-label="System analytics workspace" data-shell-mode={shellMode}>
     <header className="system-analytics-header">
       <div className="system-analytics-heading">
-        <span><Activity aria-hidden="true" /> {modelsOnly ? "Historical usage" : "Live system telemetry"}</span>
+        <span aria-hidden="true"><Activity /></span>
         <div><h2>{modelsOnly ? "Token usage" : "System analytics"}</h2><p>{modelsOnly ? "Tokens by provider and model across the selected period" : "Global activity and resource history"}</p></div>
       </div>
       <div className="system-analytics-header-actions">
@@ -349,6 +382,9 @@ export function SystemAnalyticsWorkspace({
       <div className="system-analytics-ranges" role="group" aria-label="Analytics range">
         {ranges.map((item) => <button key={item.value} data-range={item.value} type="button" aria-pressed={range === item.value} onClick={() => { setRange(item.value); setProcessPage(1); }}>{item.label}</button>)}
       </div>
+      {tab === "models" && <div className="system-analytics-ranges" role="group" aria-label="Token route">
+        {tokenRoutes.map((item) => <button key={item.value} data-token-route={item.value} type="button" aria-pressed={tokenRoute === item.value} onClick={() => { setTokenRoute(item.value); setSelectedAccount(null); }}>{item.label}</button>)}
+      </div>}
     </div>
 
     {error ? <div className="system-analytics-error" role="alert"><span>{error}</span><button type="button" onClick={refresh}>Retry</button></div> : null}
@@ -376,7 +412,7 @@ export function SystemAnalyticsWorkspace({
         <BackfillNote data={overview.backfill} />
       </> : null}
 
-      {tab === "models" && models && models.range === range ? <>
+      {tab === "models" && models && models.range === range && (models.route ?? "all") === tokenRoute ? <>
         {modelGroups.length === 0 ? <p>No recorded token usage for this period.</p> : null}
         <section className="token-usage-summary" aria-label="Period token totals">
           <div className="system-analytics-stats">
@@ -384,21 +420,43 @@ export function SystemAnalyticsWorkspace({
             <StatCard label="Input tokens" value={formatNumber(periodTotals.tokensIn)} />
             <StatCard label="Output tokens" value={formatNumber(periodTotals.tokensOut)} />
             <StatCard label="Reasoning tokens" value={formatNumber(periodTotals.tokensReasoning)} detail="Reported separately" />
+            <StatCard label="API value" value={formatUsd(periodCost)} detail={unpricedTurns ? `${unpricedTurns.toLocaleString()} turns have no price` : "At the providers' API list prices"} />
+            {models.routes && <RouteSplitCard gateway={models.routes.gateway} direct={models.routes.direct} />}
           </div>
-          <p>Total tokens = recorded input + output. Reasoning is shown separately and is not added again. Unreported usage is excluded. Periods end now.</p>
+          <p>Total tokens = recorded input + output (input includes cache reads and writes). Reasoning is shown separately and is not added again. Each token counts once: calls through Space Gateway are counted from the gateway, direct calls from the CLI's own files. API value is what the same tokens would cost on the provider's API. Unreported usage is excluded. Periods end now.</p>
         </section>
+        <AnthropicBillingPanel range={range} refreshToken={refreshToken} />
+        {models.timeline && <article className="system-analytics-panel" aria-label="Tokens over time">
+          <header><ChartColumn aria-hidden="true" /><div><strong>Tokens over time</strong><small>Last {usagePeriod.toLowerCase()} · each token counted once</small></div></header>
+          <TokenTimelineChart timeline={models.timeline} range={range} />
+        </article>}
+        {models.composition && <article className="system-analytics-panel" aria-label="What the tokens are">
+          <header><Layers aria-hidden="true" /><div><strong>What the tokens are</strong><small>Input read from the prompt cache costs a fraction of fresh input</small></div></header>
+          <TokenCompositionBar composition={models.composition} />
+        </article>}
         <section className="system-analytics-panel" aria-label="Tokens by model">
-          <header><Database aria-hidden="true" /><div><strong>Tokens by model</strong><small>Last {usagePeriod.toLowerCase()} · All providers combined</small></div>{selectedModel !== null && <button type="button" onClick={() => setSelectedModel(null)}>All models</button>}</header>
+          <header><BrainCircuit aria-hidden="true" /><div><strong>Tokens by model</strong><small>Last {usagePeriod.toLowerCase()} · All providers combined</small></div>{selectedModel !== null && <button type="button" onClick={() => setSelectedModel(null)}>All models</button>}</header>
           <div className="token-model-grid">
             {modelGroups.filter(model => selectedModel === null || model.modelId === selectedModel).map(model => <button type="button" className="token-model-card" key={model.modelId} data-model-id={model.modelId} data-model-total={recordedTotal(model) ?? ""} aria-label={`View token usage for ${model.modelId}`} aria-pressed={selectedModel === model.modelId} onClick={() => setSelectedModel(model.modelId)}>
-              <span>{model.modelId}</span><strong>{formatNumber(recordedTotal(model))} tokens</strong><small>{model.providerCount} providers · {formatNumber(model.tokensIn)} in / {formatNumber(model.tokensOut)} out</small>{model.incomplete && <small>Some usage is not reported</small>}
+              <span>{model.modelId}</span><strong>{formatNumber(recordedTotal(model))} tokens</strong><ShareBar value={recordedTotal(model) ?? 0} max={maxModelTotal} /><small>{model.providerCount} providers · {formatNumber(model.tokensIn)} in / {formatNumber(model.tokensOut)} out</small>{model.costUsd !== null && <small>API value {formatUsd(model.costUsd)}</small>}{model.incomplete && <small>Some usage is not reported</small>}
             </button>)}
           </div>
           {selectedModel !== null && !modelGroups.some(model => model.modelId === selectedModel) ? <p>No recorded usage for {selectedModel} in this period.</p> : null}
         </section>
         <div className="system-analytics-provider-grid" hidden={selectedModel !== null}>
-          {models.providers.filter(provider => recordedTotal(provider) !== 0).map((provider) => <article key={provider.providerId} className="system-analytics-provider-card"><span>{provider.providerId}</span><strong>{formatNumber(recordedTotal(provider))} tokens</strong><small>{provider.modelCount} models · {provider.completedTurns} completed turns</small><small>{formatNumber(provider.tokensIn)} in / {formatNumber(provider.tokensOut)} out</small></article>)}
+          {models.providers.filter(provider => recordedTotal(provider) !== 0).sort((a, b) => (recordedTotal(b) ?? 0) - (recordedTotal(a) ?? 0)).map((provider) => <article key={provider.providerId} className="system-analytics-provider-card"><span>{provider.providerId}</span><strong>{formatNumber(recordedTotal(provider))} tokens</strong><ShareBar value={recordedTotal(provider) ?? 0} max={maxProviderTotal} /><small>{provider.modelCount} models · {provider.completedTurns} completed turns</small><small>{formatNumber(provider.tokensIn)} in / {formatNumber(provider.tokensOut)} out</small>{provider.costUsd !== null && provider.costUsd !== undefined && <small>API value {formatUsd(provider.costUsd)}</small>}</article>)}
         </div>
+        {models.accounts && models.accounts.length > 0 && <section className="system-analytics-panel" aria-label="Tokens by account" hidden={selectedModel !== null}>
+          <header><KeyRound aria-hidden="true" /><div><strong>Tokens by account</strong><small>Last {usagePeriod.toLowerCase()} · Space Gateway accounts and CLI profiles on a direct account</small></div>{selectedAccount !== null && <button type="button" onClick={() => setSelectedAccount(null)}>All accounts</button>}</header>
+          <div className="token-model-grid">
+            {models.accounts.filter(account => selectedAccount === null || `${account.route}:${account.accountKey}` === selectedAccount).map(account => <button type="button" className="token-model-card" key={`${account.route}:${account.accountKey}`} data-account-key={account.accountKey} aria-pressed={selectedAccount === `${account.route}:${account.accountKey}`} aria-label={`View token usage for ${account.label}`} onClick={() => setSelectedAccount(`${account.route}:${account.accountKey}`)}>
+              <span>{account.label}</span><strong>{formatNumber(account.tokensIn + account.tokensOut)} tokens</strong><ShareBar value={account.tokensIn + account.tokensOut} max={maxAccountTotal} tone={account.route === "GATEWAY" ? "gateway" : "direct"} /><small>{account.route === "GATEWAY" ? "Space Gateway" : "Direct"} · {account.costUsd === 0 && account.unpricedTurns > 0 ? "No API price" : `API value ${formatUsd(account.costUsd)}`}</small>{account.models[0] && <small>Most used: {account.models[0].modelId}</small>}
+            </button>)}
+          </div>
+          {accountDetail && <div className="system-analytics-table-scroll"><table aria-label={`Models of ${accountDetail.label}`}><thead><tr><th>Model</th><th>Provider</th><th>Tokens</th><th>Input / output</th><th>API value</th></tr></thead><tbody>
+            {accountDetail.models.map(model => <tr key={`${model.providerId}:${model.modelId}`}><td><strong>{model.modelId}</strong></td><td>{model.providerId}</td><td>{formatNumber(model.tokensIn + model.tokensOut)}</td><td>{formatNumber(model.tokensIn)} / {formatNumber(model.tokensOut)}</td><td>{formatUsd(model.costUsd)}</td></tr>)}
+          </tbody></table></div>}
+        </section>}
         <article className="system-analytics-panel system-analytics-table-panel"><header><Database aria-hidden="true" /><div><strong>Provider and model detail</strong><small>native metrics where the CLI exposes them</small></div></header><div className="system-analytics-table-scroll"><table><thead><tr>{modelColumns.map(([key, label]) => <th key={key} aria-sort={modelSort.key === key ? modelSort.direction === "asc" ? "ascending" : "descending" : "none"}><button type="button" className="model-sort-button" data-sort-key={key} onClick={() => setModelSort(current => ({ key, direction: current.key === key && current.direction === "asc" ? "desc" : "asc" }))}>{label}<span aria-hidden="true">{modelSort.key === key ? modelSort.direction === "asc" ? " ↑" : " ↓" : " ↕"}</span></button></th>)}</tr></thead><tbody>
           {visibleModels.map((model) => <tr key={`${model.providerId}:${model.modelId}`}><td><strong>{model.modelId}</strong><small>{model.providerId} · {model.runtimeIds.join(", ") || "runtime unknown"}</small></td><td><CoverageBadge value={model.coverage} /></td><td>{model.activeSessions} / {model.activeTurns}</td><td>{model.completedTurns} / {model.abortedTurns}</td><td>{formatNumber(recordedTotal(model))}</td><td>{formatNumber(model.tokensIn)} / {formatNumber(model.tokensOut)} / {formatNumber(model.tokensReasoning)}</td><td>{model.avgTtftMs === null ? "—" : `${Math.round(model.avgTtftMs)} ms`}</td><td>{model.avgDurationMs === null ? "—" : formatDuration(Math.round(model.avgDurationMs / 1000))}</td><td>{model.avgTokPerSec === null ? "—" : model.avgTokPerSec.toFixed(1)}</td><td>{formatDate(model.lastActivityAt)}</td></tr>)}
         </tbody></table></div></article>

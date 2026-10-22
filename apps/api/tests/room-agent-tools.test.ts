@@ -44,7 +44,7 @@ function fixture(screen = "Allow running npm test?\n❯ 1. Yes\n  2. No") {
 describe("Room Agent tools", () => {
   it("publishes plain JSON schemas for every tool", () => {
     expect(roomAgentToolDefinitions.map((tool) => tool.function.name)).toEqual(["room_status", "read_pane", "send_to_pane", "answer_pane_prompt",
-      "stop_pane", "open_panes", "close_pane", "reopen_pane", "restart_pane", "arrange_panes", "set_pane_model", "space_control", "search_web_in_browser", "confirm_action"]);
+      "stop_pane", "open_panes", "close_pane", "reopen_pane", "restart_pane", "arrange_panes", "set_pane_model", "space_control", "search_web_in_browser", "confirm_action", "space_room_release"]);
     for (const tool of roomAgentToolDefinitions) expect(tool.function.parameters).toMatchObject({ type: "object" });
   });
 
@@ -97,6 +97,18 @@ describe("Room Agent tools", () => {
     expect(self.ok).toBe(false);
   });
 
+  it("waits for a just-opened CLI's prompt before setting its model, and tells how to answer a pane that is not on a question", async () => {
+    const c = fixture();
+    const base = await c.deps.inspectPane(c.bob as never);
+    c.deps.inspectPane.mockResolvedValueOnce({ ...base, state: "UNKNOWN" as never }).mockResolvedValueOnce({ ...base, state: "IDLE" as never });
+    expect(await c.tools.execute("set_pane_model", { pane: "Bob", modelId: "gpt-5.5" }, c.ctx)).toMatchObject({ ok: true });
+    expect(c.deps.controlExecute).toHaveBeenCalledTimes(1);
+    c.deps.inspectPane.mockResolvedValueOnce({ ...base, state: "IDLE" as never });
+    const idle = await c.tools.execute("answer_pane_prompt", { pane: "Bob", answer: "yes" }, c.ctx);
+    expect(idle).toMatchObject({ ok: false });
+    expect(idle.result).toContain("send the answer as its next prompt (send_to_pane)");
+  });
+
   it("asks before closing, stopping or restarting and closes only when confirmed", async () => {
     const c = fixture();
     for (const [name, args] of [["close_pane", { panes: ["Bob"] }], ["restart_pane", { panes: ["Bob"] }], ["stop_pane", { pane: "Bob" }]] as const) {
@@ -130,7 +142,7 @@ describe("Room Agent tools", () => {
   it("guards Space Control: protected deploys are refused, destructive batches wait for a yes, reads go through", async () => {
     expect(roomAgentControlRisk("space_execute", { actions: [{ kind: "resource", operation: "ops.deploy" }] }).level).toBe("PROTECTED");
     expect(roomAgentControlRisk("space_execute", { actions: [{ kind: "pane", operation: "prompt" }, { kind: "pane", operation: "close" }] }))
-      .toEqual({ level: "DESTRUCTIVE", reason: "close panes" });
+      .toEqual({ level: "DESTRUCTIVE", category: "DESTRUCTIVE", reason: "close panes" });
     expect(roomAgentControlRisk("space_schedules", { command: { actions: [{ kind: "resource", operation: "files.delete" }] } }).level).toBe("DESTRUCTIVE");
     expect(roomAgentControlRisk("space_inspect", { section: "STATE" }).level).toBe("SAFE");
     const c = fixture();
@@ -143,6 +155,19 @@ describe("Room Agent tools", () => {
     expect(c.deps.controlCall).toHaveBeenCalledWith("user:operator", "space_inspect", { section: "STATE", roomId: c.room.id });
     await c.tools.execute("space_control", { tool: "space_execute", arguments: { actions: [{ kind: "pane", operation: "prompt", target: { paneNames: ["Bob"] }, text: "hi" }], requestId: "model-chosen" } }, c.ctx);
     expect(c.deps.controlCall).toHaveBeenLastCalledWith("user:operator", "space_execute", expect.objectContaining({ roomId: c.room.id, requestId: "room-agent:request-0001", waitForCompletion: false }));
+  });
+
+  it("changes the release train for a pane named in the room and passes refusals back", async () => {
+    const c = fixture();
+    const releaseTrain = vi.fn(async (input: { op: string }) => {
+      if (input.op === "open") throw new Error("run-spaceapp 1.1.5 is open (captain Bob): join it instead of cutting your own version.");
+      return "- run-spaceapp 1.1.5: OPEN";
+    });
+    const tools = createRoomAgentTools({ ...c.deps, releaseTrain });
+    expect(await tools.execute("space_room_release", { op: "join", pane: "dana", commit: "3707cca9af" }, c.ctx)).toMatchObject({ ok: true, result: "- run-spaceapp 1.1.5: OPEN" });
+    expect(releaseTrain).toHaveBeenCalledWith({ op: "join", product: "run-spaceapp", commit: "3707cca9af" }, { roomId: c.room.id, pane: { paneId: c.dana.id, name: "Dana" }, paneSelf: false });
+    expect(await tools.execute("space_room_release", { op: "open", version: "1.1.6", pane: "dana" }, c.ctx)).toMatchObject({ ok: false, result: expect.stringContaining("join it instead") });
+    expect(await tools.execute("space_room_release", { op: "join", pane: "zed", commit: "3707cca9af" }, c.ctx)).toMatchObject({ ok: false, result: expect.stringContaining('No pane named "zed"') });
   });
 
   it("rejects invalid arguments and acts only for an authenticated operator", async () => {
